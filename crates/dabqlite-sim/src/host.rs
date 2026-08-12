@@ -27,6 +27,16 @@ pub enum Driven {
     Crashed,
 }
 
+/// A firmware-style misdirected write: the device reports success but the
+/// bytes landed in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Misdirect {
+    /// Landed at `offset + shift` in the same file.
+    Shift(i64),
+    /// Landed at the same offset in the *other* file.
+    CrossFile,
+}
+
 pub struct SimHost {
     pub engine: Engine,
     pub disk: SimDisk,
@@ -34,6 +44,15 @@ pub struct SimHost {
     pub io_count: u64,
     /// Die immediately before performing I/O op with this index.
     pub crash_after: Option<u64>,
+    /// Report I/O op with this index as failed (EIO). A failed write still
+    /// dirties the page cache first — a failed syscall may have partially
+    /// succeeded; a failed fsync syncs nothing.
+    pub fail_after: Option<u64>,
+    /// Misdirect the write at this I/O index (non-write ops are unaffected;
+    /// see `misdirected` to check whether it actually fired).
+    pub misdirect_at: Option<(u64, Misdirect)>,
+    /// How many writes were actually misdirected.
+    pub misdirected: u64,
 }
 
 impl SimHost {
@@ -43,6 +62,9 @@ impl SimHost {
             disk,
             io_count: 0,
             crash_after,
+            fail_after: None,
+            misdirect_at: None,
+            misdirected: 0,
         }
     }
 
@@ -54,6 +76,19 @@ impl SimHost {
         false
     }
 
+    /// True if the op just counted by `at_crash_boundary` must fail.
+    /// (`io_count` was already advanced past it.)
+    fn this_op_fails(&self) -> bool {
+        Some(self.io_count - 1) == self.fail_after
+    }
+
+    fn this_op_misdirects(&self) -> Option<Misdirect> {
+        match self.misdirect_at {
+            Some((idx, kind)) if idx == self.io_count - 1 => Some(kind),
+            _ => None,
+        }
+    }
+
     fn drive(&mut self, first: Input<'_>) -> Driven {
         let mut out = self.engine.tick(first);
         loop {
@@ -62,6 +97,10 @@ impl SimHost {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
                     }
+                    if self.this_op_fails() {
+                        out = self.engine.tick(Input::IoFailed { file });
+                        continue;
+                    }
                     let data = self.disk.read(file, offset, len);
                     out = self.engine.tick(Input::ReadDone { file, data: &data });
                 }
@@ -69,12 +108,43 @@ impl SimHost {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
                     }
-                    self.disk.write(file, offset, data.as_slice());
+                    if self.this_op_fails() {
+                        // The syscall failed, but the pages may already be
+                        // dirty: model the worst case (write applied to the
+                        // cache, never acknowledged).
+                        self.disk.write(file, offset, data.as_slice());
+                        out = self.engine.tick(Input::IoFailed { file });
+                        continue;
+                    }
+                    match self.this_op_misdirects() {
+                        Some(Misdirect::Shift(shift)) if offset as i64 + shift >= 0 => {
+                            self.disk
+                                .write(file, (offset as i64 + shift) as u64, data.as_slice());
+                            self.misdirected += 1;
+                        }
+                        Some(Misdirect::CrossFile) => {
+                            let other = match file {
+                                FileId::Superblock => FileId::Rows,
+                                FileId::Rows => FileId::Superblock,
+                            };
+                            self.disk.write(other, offset, data.as_slice());
+                            self.misdirected += 1;
+                        }
+                        // A shift below offset zero cannot land anywhere:
+                        // write normally (the sweep counts real hits).
+                        Some(Misdirect::Shift(_)) | None => {
+                            self.disk.write(file, offset, data.as_slice());
+                        }
+                    }
                     out = self.engine.tick(Input::WriteDone { file });
                 }
                 Output::Fsync { file } => {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
+                    }
+                    if self.this_op_fails() {
+                        out = self.engine.tick(Input::IoFailed { file });
+                        continue;
                     }
                     self.disk.fsync(file);
                     out = self.engine.tick(Input::FsyncDone { file });

@@ -34,6 +34,7 @@ fn main() {
         max_inserts_per_cycle: 8,
         caps: dabqlite_core::Capacities { rows: 256 },
         recovery_crash_p: 0.25,
+        io_fail_p: 0.2,
     };
 
     if let Some(seed) = seed {

@@ -9,6 +9,7 @@
 use dabqlite_core::{Capacities, DbError, Output, SB_COPY_SIZE, SB_ZONE_SIZE, VALUE_LEN};
 use dabqlite_core::{FileId, ROW_SIZE};
 use dabqlite_sim::host::ClientOp;
+use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost};
 
 const CAPS: Capacities = Capacities { rows: 16 };
@@ -45,34 +46,30 @@ fn verify_all(host: &mut SimHost, ops: &[(u64, [u8; VALUE_LEN])]) {
 }
 
 #[test]
-fn single_superblock_copy_corruption_loses_nothing() {
-    for seed in 0..8u64 {
+fn exhaustive_bitrot_superblock_every_byte_is_survivable() {
+    // EVERY byte of the superblock zone, two bit positions each. A flip in
+    // a live copy falls back to its twin; a flip in a stale slot is inert;
+    // a flip in padding is caught by full-slot validation. In all cases:
+    // zero loss.
+    for seed in 0..4u64 {
         let (disk, ops) = build_db(seed);
-        // INSERTS commits after gen 1 => latest generation is INSERTS + 1.
-        let latest_gen = INSERTS as u64 + 1;
-
-        // Corrupt each byte-position class of each of the two live copies,
-        // one at a time: recovery must still find the other copy.
-        for slot in slots_for(latest_gen) {
-            for byte_in_slot in [0u64, 9, 17, 33] {
-                // magic, generation, row_count, crc regions
+        let zone_len = disk.len(FileId::Superblock);
+        assert_eq!(zone_len, SB_ZONE_SIZE as u64, "zone size drifted");
+        for offset in 0..zone_len {
+            for mask in [0x01u8, 0x80] {
                 let mut damaged = disk.clone();
-                damaged.corrupt(
-                    FileId::Superblock,
-                    slot * SB_COPY_SIZE as u64 + byte_in_slot,
-                    0x40,
-                );
+                damaged.corrupt(FileId::Superblock, offset, mask);
                 let mut host = SimHost::new(CAPS, damaged, None);
                 match host.open() {
                     Driven::Done(Output::OpenDone { result: Ok(n) }) => {
                         assert_eq!(
                             n, INSERTS as u64,
-                            "seed={seed} slot={slot} byte={byte_in_slot}: lost rows"
+                            "seed={seed} offset={offset} mask={mask:#x}: lost rows"
                         );
                     }
-                    other => panic!(
-                        "seed={seed} slot={slot} byte={byte_in_slot}: open failed: {other:?}"
-                    ),
+                    other => {
+                        panic!("seed={seed} offset={offset} mask={mask:#x}: open failed: {other:?}")
+                    }
                 }
                 verify_all(&mut host, &ops);
             }
@@ -81,27 +78,109 @@ fn single_superblock_copy_corruption_loses_nothing() {
 }
 
 #[test]
-fn corrupted_committed_row_is_detected_never_silent() {
-    for seed in 0..8u64 {
+fn exhaustive_bitrot_rows_every_byte_is_detected() {
+    // EVERY byte of every committed row, two bit positions each. With
+    // padding validated, there are no dead zones: any flip in live row data
+    // must be detected at open — serving a wrong value with a straight face
+    // is the one unforgivable outcome.
+    for seed in 0..4u64 {
         let (disk, _ops) = build_db(seed);
-        // Corrupt one byte in each committed row, one at a time. Recovery
-        // must fail loudly with Corrupt — the alternative (serving a wrong
-        // value with a straight face) is the one unforgivable outcome.
-        for row in 0..INSERTS as u64 {
-            for byte_in_row in [0u64, 8, 20] {
-                // id, value, value tail
+        let live_len = INSERTS as u64 * ROW_SIZE as u64;
+        for offset in 0..live_len {
+            for mask in [0x01u8, 0x80] {
                 let mut damaged = disk.clone();
-                damaged.corrupt(FileId::Rows, row * ROW_SIZE as u64 + byte_in_row, 0x04);
+                damaged.corrupt(FileId::Rows, offset, mask);
                 let mut host = SimHost::new(CAPS, damaged, None);
                 match host.open() {
                     Driven::Done(Output::OpenDone {
                         result: Err(DbError::Corrupt { .. }),
                     }) => {}
                     other => panic!(
-                        "seed={seed} row={row} byte={byte_in_row}: \
+                        "seed={seed} offset={offset} mask={mask:#x}: \
                          corruption not detected: {other:?}"
                     ),
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn truncation_at_rest_is_never_silently_wrong() {
+    // The tail of a file vanishes at rest (lost extent, fs repair, sloppy
+    // backup). Sweep every 8-byte truncation point of both files. Outcome
+    // must be: full recovery, an older-but-correct state, or a loud error.
+    // Never wrong data.
+    for seed in 0..4u64 {
+        let (disk, ops) = build_db(seed);
+        let oracle: std::collections::BTreeMap<u64, [u8; VALUE_LEN]> =
+            ops.iter().copied().collect();
+
+        // Superblock zone truncation.
+        for cut in (0..=SB_ZONE_SIZE as u64).step_by(8) {
+            let ctx = format!("seed={seed} sb truncated to {cut}");
+            let mut damaged = disk.clone();
+            damaged.truncate_at_rest(FileId::Superblock, cut);
+            let mut host = SimHost::new(CAPS, damaged, None);
+            match host.open() {
+                Driven::Done(Output::OpenDone { result: Ok(n) }) => {
+                    assert!(n <= INSERTS as u64, "[{ctx}] impossible row count {n}");
+                    for (&id, &value) in &oracle {
+                        match host.get(id) {
+                            None => {}
+                            Some(got) => assert_eq!(got, value, "[{ctx}] wrong bytes served"),
+                        }
+                    }
+                }
+                Driven::Done(Output::OpenDone {
+                    result: Err(DbError::Corrupt { .. }),
+                }) => {}
+                other => panic!("[{ctx}] unexpected outcome: {other:?}"),
+            }
+        }
+
+        // Rows-file truncation: the superblock still references the full
+        // set, so any cut below the live region must be detected.
+        let live_len = INSERTS as u64 * ROW_SIZE as u64;
+        for cut in (0..live_len).step_by(8) {
+            let ctx = format!("seed={seed} rows truncated to {cut}");
+            let mut damaged = disk.clone();
+            damaged.truncate_at_rest(FileId::Rows, cut);
+            let mut host = SimHost::new(CAPS, damaged, None);
+            assert!(
+                matches!(
+                    host.open(),
+                    Driven::Done(Output::OpenDone {
+                        result: Err(DbError::Corrupt { .. })
+                    })
+                ),
+                "[{ctx}] truncated rows file not detected"
+            );
+        }
+    }
+}
+
+#[test]
+fn garbage_extension_at_rest_is_inert() {
+    // Bytes past the manifest-referenced region are orphans and must be
+    // ignored, whatever they contain (§4.4: orphans are inert by
+    // construction).
+    for seed in 0..4u64 {
+        let (disk, ops) = build_db(seed);
+        let mut rng = crash_rng(seed, 0xEEEE);
+        for extra in [1usize, 7, 64, 4096] {
+            for file in [FileId::Rows, FileId::Superblock] {
+                let mut damaged = disk.clone();
+                damaged.extend_at_rest(file, extra, &mut rng);
+                let mut host = SimHost::new(CAPS, damaged, None);
+                assert!(
+                    matches!(
+                        host.open(),
+                        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == INSERTS as u64
+                    ),
+                    "seed={seed} {file:?}+{extra}B garbage tail must be inert"
+                );
+                verify_all(&mut host, &ops);
             }
         }
     }

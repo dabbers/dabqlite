@@ -83,6 +83,12 @@ pub enum DbError {
     CapacityBelowData { required: u64, configured: u64 },
     /// On-disk state violates an invariant the commit protocol guarantees.
     Corrupt { what: &'static str },
+    /// The host reported an I/O error on this file. The engine fail-stops
+    /// (TigerBeetle-style): the in-flight operation is failed, all further
+    /// operations are rejected, and the host must restart and re-open. The
+    /// partially-performed operation resolves to all-or-nothing at recovery,
+    /// exactly like a crash.
+    IoFailed { file: FileId },
 }
 
 /// An owned, bounded write payload. Rows are 32 bytes and superblock copies
@@ -126,6 +132,11 @@ pub enum Input<'a> {
     WriteDone { file: FileId },
     /// An fsync the core requested has completed.
     FsyncDone { file: FileId },
+    /// The read, write, or fsync the core requested FAILED (EIO and
+    /// friends). The write may or may not have reached the disk or page
+    /// cache — the engine assumes nothing. It fail-stops; restart to
+    /// recover.
+    IoFailed { file: FileId },
     /// Client: insert a row.
     Insert { id: u64, value: [u8; VALUE_LEN] },
     /// Client: fetch a row by primary key.
@@ -173,6 +184,14 @@ enum State {
     RecoverReadSb,
     /// Recovery: committed-rows read in flight.
     RecoverReadRows { generation: u64, row_count: u64 },
+    /// Recovery: rows-file fsync in flight. Recovery fsyncs both files
+    /// before OpenDone: after a fail-stop restart (process died, machine
+    /// did not), the page cache can show state that was never made durable.
+    /// Serving it without fsyncing would mean a later power loss erases
+    /// rows that this incarnation already showed the application.
+    RecoverFsyncRows { generation: u64, row_count: u64 },
+    /// Recovery: superblock fsync in flight (see `RecoverFsyncRows`).
+    RecoverFsyncSb { generation: u64, row_count: u64 },
     /// Open and idle.
     Ready,
     /// Insert: row-slot write in flight.
@@ -293,6 +312,7 @@ impl Engine {
             Input::ReadDone { file, data } => self.on_read_done(file, data),
             Input::WriteDone { file } => self.on_write_done(file),
             Input::FsyncDone { file } => self.on_fsync_done(file),
+            Input::IoFailed { file } => self.on_io_failed(file),
             Input::Insert { id, value } => self.on_insert(id, value),
             Input::Get { id } => self.on_get(id),
         }
@@ -378,12 +398,15 @@ impl Engine {
             };
             match decode_sb(chunk) {
                 Ok(copy) => {
-                    // Negative space: a generation only ever lands in its
-                    // own pair's slots.
-                    debug_assert!(
-                        Self::sb_slots_for(copy.generation).contains(&(slot as u8)),
-                        "generation found outside its pair slot"
-                    );
+                    // A copy's slot position is part of its validity: the
+                    // engine only ever writes generation g to pair g % 2, so
+                    // a checksum-valid copy in a foreign slot is the product
+                    // of a misdirected write. Distrust it. (Found by the
+                    // misdirected-write sweep: this was an assert, which
+                    // turned a survivable firmware fault into a panic.)
+                    if !Self::sb_slots_for(copy.generation).contains(&(slot as u8)) {
+                        continue;
+                    }
                     if best.is_none_or(|(_, b)| copy.generation > b.generation) {
                         best = Some((slot as u8, copy));
                     }
@@ -434,7 +457,7 @@ impl Engine {
         }
 
         if copy.row_count == 0 {
-            self.finish_open(copy.generation, 0)
+            self.stage_recovery_fsyncs(copy.generation, 0)
         } else {
             self.state = State::RecoverReadRows {
                 generation: copy.generation,
@@ -446,6 +469,17 @@ impl Engine {
                 len: copy.row_count * ROW_SIZE as u64,
             }
         }
+    }
+
+    /// Everything recovery is about to make visible must be durable first
+    /// (see `State::RecoverFsyncRows`). Fsync rows, then superblock, then
+    /// report OpenDone.
+    fn stage_recovery_fsyncs(&mut self, generation: u64, row_count: u64) -> Output {
+        self.state = State::RecoverFsyncRows {
+            generation,
+            row_count,
+        };
+        Output::Fsync { file: FileId::Rows }
     }
 
     fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
@@ -472,7 +506,7 @@ impl Engine {
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
             self.index_insert(id, row);
         }
-        self.finish_open(generation, row_count)
+        self.stage_recovery_fsyncs(generation, row_count)
     }
 
     fn finish_open(&mut self, generation: u64, row_count: u64) -> Output {
@@ -499,7 +533,9 @@ impl Engine {
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
             | State::RecoverReadSb
-            | State::RecoverReadRows { .. } => Some(DbError::NotOpen),
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
@@ -578,6 +614,28 @@ impl Engine {
     fn on_fsync_done(&mut self, file: FileId) -> Output {
         match (self.state, file) {
             (State::InitFsyncSb, FileId::Superblock) => self.finish_open(1, 0),
+            (
+                State::RecoverFsyncRows {
+                    generation,
+                    row_count,
+                },
+                FileId::Rows,
+            ) => {
+                self.state = State::RecoverFsyncSb {
+                    generation,
+                    row_count,
+                };
+                Output::Fsync {
+                    file: FileId::Superblock,
+                }
+            }
+            (
+                State::RecoverFsyncSb {
+                    generation,
+                    row_count,
+                },
+                FileId::Superblock,
+            ) => self.finish_open(generation, row_count),
             (State::InsertFsyncRows, FileId::Rows) => {
                 // The row is durable; now flip the superblock. The new
                 // generation goes to the *other* pair of slots, so the live
@@ -602,6 +660,46 @@ impl Engine {
         }
     }
 
+    // ---- I/O failure: fail-stop ----------------------------------------
+
+    /// The host reported an I/O error for the in-flight request. Fail-stop:
+    /// resolve the in-flight operation with an error, reject everything
+    /// afterwards. The host restarts and re-opens; the half-done operation
+    /// resolves to all-or-nothing at recovery, exactly like a crash.
+    fn on_io_failed(&mut self, file: FileId) -> Output {
+        let err = DbError::IoFailed { file };
+        // Negative space: the failure must name the file the in-flight
+        // request actually targeted; anything else is a confused host.
+        let expected = match self.state {
+            State::InitWriteSb { .. } | State::InitFsyncSb | State::RecoverReadSb => {
+                FileId::Superblock
+            }
+            State::RecoverReadRows { .. } | State::RecoverFsyncRows { .. } => FileId::Rows,
+            State::RecoverFsyncSb { .. } => FileId::Superblock,
+            State::InsertWriteRow | State::InsertFsyncRows => FileId::Rows,
+            State::InsertWriteSb { .. } | State::InsertFsyncSb => FileId::Superblock,
+            state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
+        };
+        assert!(
+            file == expected,
+            "protocol violation: IoFailed({file:?}) but in-flight request targets {expected:?}"
+        );
+        match self.state {
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb => {
+                let (id, _) = self.pending.take().expect("pending insert on failure");
+                self.state = State::Failed(err);
+                Output::InsertDone {
+                    id,
+                    result: Err(err),
+                }
+            }
+            _ => self.fail_open(err),
+        }
+    }
+
     // ---- get ---------------------------------------------------------
 
     fn on_get(&mut self, id: u64) -> Output {
@@ -611,7 +709,9 @@ impl Engine {
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
             | State::RecoverReadSb
-            | State::RecoverReadRows { .. } => Err(DbError::NotOpen),
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
@@ -917,5 +1017,129 @@ mod tests {
                 result: Err(DbError::NotOpen)
             }
         );
+    }
+
+    /// Get an engine into the middle of an insert (row write in flight).
+    fn engine_mid_insert() -> Engine {
+        let mut h = MiniHost::new(Capacities { rows: 8 });
+        h.open();
+        let out = h.engine.tick(Input::Insert {
+            id: 1,
+            value: val(1),
+        });
+        assert!(matches!(
+            out,
+            Output::Write {
+                file: FileId::Rows,
+                ..
+            }
+        ));
+        h.engine
+    }
+
+    #[test]
+    fn v1_serializes_everything_mid_insert() {
+        // Isolation (docs/DESIGN.md §5): single writer, serialized access.
+        // While an insert's I/O is in flight, everything else is Busy.
+        let mut e = engine_mid_insert();
+        assert_eq!(
+            e.tick(Input::Insert {
+                id: 2,
+                value: val(2)
+            }),
+            Output::InsertDone {
+                id: 2,
+                result: Err(DbError::Busy)
+            }
+        );
+        assert_eq!(
+            e.tick(Input::Get { id: 1 }),
+            Output::GetDone {
+                id: 1,
+                result: Err(DbError::Busy)
+            }
+        );
+    }
+
+    #[test]
+    fn io_failure_is_fail_stop() {
+        let mut e = engine_mid_insert();
+        // The row write fails: the insert errors, and the engine refuses
+        // everything from then on. Restart-and-recover is the only exit.
+        let err = DbError::IoFailed { file: FileId::Rows };
+        assert_eq!(
+            e.tick(Input::IoFailed { file: FileId::Rows }),
+            Output::InsertDone {
+                id: 1,
+                result: Err(err)
+            }
+        );
+        assert_eq!(
+            e.tick(Input::Insert {
+                id: 2,
+                value: val(2)
+            }),
+            Output::InsertDone {
+                id: 2,
+                result: Err(err)
+            }
+        );
+        assert_eq!(
+            e.tick(Input::Get { id: 1 }),
+            Output::GetDone {
+                id: 1,
+                result: Err(err)
+            }
+        );
+    }
+
+    // ---- the host-protocol seam: violations must be loud, not lenient ----
+
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn write_done_in_ready_panics() {
+        let mut h = MiniHost::new(Capacities { rows: 2 });
+        h.open();
+        h.engine.tick(Input::WriteDone { file: FileId::Rows });
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn fsync_done_before_open_panics() {
+        let mut e = Engine::new(Capacities { rows: 2 });
+        e.tick(Input::FsyncDone {
+            file: FileId::Superblock,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn double_open_panics() {
+        let mut h = MiniHost::new(Capacities { rows: 2 });
+        h.open();
+        h.engine.tick(Input::Open {
+            superblock_len: 0,
+            rows_len: 0,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn completion_for_wrong_file_panics() {
+        // Mid-insert the in-flight write targets Rows; a completion for the
+        // superblock is a sequencing bug in the host.
+        let mut e = engine_mid_insert();
+        e.tick(Input::WriteDone {
+            file: FileId::Superblock,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn io_failed_for_wrong_file_panics() {
+        let mut e = engine_mid_insert();
+        e.tick(Input::IoFailed {
+            file: FileId::Superblock,
+        });
     }
 }

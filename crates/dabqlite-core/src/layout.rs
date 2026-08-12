@@ -63,14 +63,19 @@ pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
     debug_assert!(matches!(decode_row(out), Some((i, v)) if i == id && v == *value));
 }
 
-/// Decode and verify a row slot. Returns `None` if the slot is too short or
-/// fails its checksum.
+/// Decode and verify a row slot. Returns `None` if the slot is too short,
+/// fails its checksum, or has damaged padding. Padding is validated so that
+/// *every* byte of a live slot is covered: a single-bit flip anywhere in a
+/// committed row must be detectable, with no dead zones.
 pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
     if bytes.len() < ROW_SIZE {
         return None;
     }
     let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
     if crc32(&bytes[0..24]) != stored {
+        return None;
+    }
+    if bytes[28..32] != [0u8; 4] {
         return None;
     }
     let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
@@ -126,6 +131,11 @@ pub fn decode_sb(bytes: &[u8]) -> Result<SbCopy, SbDecodeError> {
     if crc32(&bytes[0..32]) != stored {
         return Err(SbDecodeError::Invalid);
     }
+    // Padding validated for full-slot coverage: no byte of a superblock
+    // copy is exempt from corruption detection.
+    if bytes[36..SB_COPY_SIZE] != [0u8; SB_COPY_SIZE - 36] {
+        return Err(SbDecodeError::Invalid);
+    }
     let file_schema = u64::from_le_bytes(bytes[24..32].try_into().expect("fixed slice"));
     if file_schema != SCHEMA_HASH {
         return Err(SbDecodeError::SchemaMismatch { file_schema });
@@ -156,6 +166,37 @@ mod tests {
         assert_eq!(decode_row(&slot), None);
         // Negative space: an all-zero slot must not decode.
         assert_eq!(decode_row(&[0u8; ROW_SIZE]), None);
+    }
+
+    #[test]
+    fn every_single_bit_flip_in_a_slot_is_detected() {
+        // Full-coverage guarantee: no byte of a row or superblock copy is a
+        // dead zone. Flip every bit of every byte, one at a time.
+        let mut row = [0u8; ROW_SIZE];
+        encode_row(42, &[7u8; VALUE_LEN], &mut row);
+        for byte in 0..ROW_SIZE {
+            for bit in 0..8 {
+                let mut damaged = row;
+                damaged[byte] ^= 1 << bit;
+                assert_eq!(
+                    decode_row(&damaged),
+                    None,
+                    "row flip at byte {byte} bit {bit} undetected"
+                );
+            }
+        }
+        let mut sb = [0u8; SB_COPY_SIZE];
+        encode_sb(7, 123, &mut sb);
+        for byte in 0..SB_COPY_SIZE {
+            for bit in 0..8 {
+                let mut damaged = sb;
+                damaged[byte] ^= 1 << bit;
+                assert!(
+                    decode_sb(&damaged).is_err(),
+                    "superblock flip at byte {byte} bit {bit} undetected"
+                );
+            }
+        }
     }
 
     #[test]

@@ -31,6 +31,9 @@ pub struct LifetimeConfig {
     pub caps: Capacities,
     /// Probability that a recovery itself is crashed and re-recovered.
     pub recovery_crash_p: f64,
+    /// Probability that a cycle ends in an I/O *failure* (fail-stop, dirty
+    /// page cache carries into the restart) instead of a machine crash.
+    pub io_fail_p: f64,
 }
 
 impl Default for LifetimeConfig {
@@ -40,16 +43,19 @@ impl Default for LifetimeConfig {
             max_inserts_per_cycle: 6,
             caps: Capacities { rows: 64 },
             recovery_crash_p: 0.25,
+            io_fail_p: 0.2,
         }
     }
 }
 
-/// Statistics from one lifetime, for soak-run reporting.
-#[derive(Debug, Default, Clone, Copy)]
+/// Statistics from one lifetime, for soak-run reporting. `Eq` so two runs
+/// of the same seed can be compared for determinism.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LifetimeStats {
     pub cycles: usize,
     pub commits: u64,
     pub crashes: u64,
+    pub io_failures: u64,
     pub recovery_crashes: u64,
     pub in_flight_committed: u64,
     pub in_flight_lost: u64,
@@ -75,16 +81,23 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         let ctx = format!("seed={seed} cycle={cycle}");
         stats.cycles = cycle + 1;
 
-        // Plan this cycle: some inserts, a crash placed somewhere in (or
-        // occasionally beyond) their I/O.
+        // Plan this cycle: some inserts, ended by a machine crash, an I/O
+        // failure (fail-stop, dirty cache survives into the restart), or a
+        // clean restart. All three restart paths matter.
         let inserts = rng.gen_range(1..=cfg.max_inserts_per_cycle);
         // ~5 I/O ops per insert; sometimes the boundary lands past the end,
-        // meaning this cycle completes without crashing. Both paths matter.
-        let crash_delta = rng.gen_range(1..=(inserts as u64) * 5 + 3);
-        host.crash_after = Some(host.io_count + crash_delta);
+        // meaning this cycle completes without incident.
+        let fault_delta = rng.gen_range(1..=(inserts as u64) * 5 + 3);
+        let io_fail_cycle = rng.gen_bool(cfg.io_fail_p);
+        if io_fail_cycle {
+            host.fail_after = Some(host.io_count + fault_delta);
+        } else {
+            host.crash_after = Some(host.io_count + fault_delta);
+        }
 
         let mut in_flight: Option<(u64, [u8; VALUE_LEN])> = None;
         let mut crashed = false;
+        let mut io_failed = false;
         for _ in 0..inserts {
             let id: u64 = rng.gen();
             let mut value = [0u8; VALUE_LEN];
@@ -106,6 +119,15 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                     );
                     stats.full_rejections += 1;
                 }
+                Driven::Done(Output::InsertDone {
+                    result: Err(dabqlite_core::DbError::IoFailed { .. }),
+                    ..
+                }) => {
+                    // Fail-stop: the failed insert is the in-flight one.
+                    in_flight = Some((id, value));
+                    io_failed = true;
+                    break;
+                }
                 Driven::Done(other) => panic!("[{ctx}] unexpected insert result: {other:?}"),
                 Driven::Crashed => {
                     in_flight = Some((id, value));
@@ -120,10 +142,17 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             let mut disk = std::mem::take(&mut host.disk);
             disk.crash(&mut rng);
             host = recover(&ctx, cfg, disk, &mut rng, &mut stats);
+        } else if io_failed {
+            // Process restart WITHOUT machine crash: the dirty page cache
+            // carries over unsettled. A later cycle's crash will settle it.
+            stats.io_failures += 1;
+            let disk = std::mem::take(&mut host.disk);
+            host = recover(&ctx, cfg, disk, &mut rng, &mut stats);
         } else {
-            // No crash this cycle: restart cleanly instead (also a path
+            // No fault this cycle: restart cleanly instead (also a path
             // worth exercising — clean shutdown must obviously recover).
             host.crash_after = None;
+            host.fail_after = None;
             let disk = std::mem::take(&mut host.disk);
             host = recover(&ctx, cfg, disk, &mut rng, &mut stats);
         }

@@ -12,19 +12,30 @@ injection. The
 passes: crash at every I/O boundary, recover, state is exactly N or N+1
 committed inserts, never in between — reproducible from a single integer seed.
 
-What the harness currently proves:
+What the harness currently proves — the full fault matrix with suites and
+guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
 
-- **Crash faults**: every unsynced write independently survives, vanishes, or
-  tears at crash. Swept at every I/O boundary, plus multi-crash lifetimes
-  (crash → recover → keep writing → crash again, including crashes *during*
-  recovery).
-- **Media faults**: each superblock generation lives in two of four slots, so
-  any single corrupted copy loses nothing; a corrupted committed row is
-  *detected* and reported, never served silently wrong.
+- **Crash faults**: every unsynced write independently survives, vanishes,
+  tears to a prefix, tears to an arbitrary sector subset, or persists a
+  garbage sector. Swept at every I/O boundary with random fates, *and*
+  exhaustively enumerated (every boundary × every fate combination), plus
+  multi-crash lifetimes including crashes *during* recovery.
+- **I/O failures** (EIO, fail-stop): swept at every I/O index. Recovery
+  fsyncs before serving, so state visible after a restart never regresses
+  at the next power loss (mutation-verified).
+- **Media faults**: exhaustive per-byte bit rot over the superblock zone
+  (zero loss) and all committed rows (always detected, never served wrong);
+  truncation and garbage-extension sweeps of both files.
+- **Misdirected writes** (firmware lies): every write × shift/cross-file
+  grid — never silently wrong. This sweep found a real bug on first run.
+- **Sequencing faults**: host-protocol violations panic loudly; client ops
+  mid-I/O get `Busy` (v1 serializes everything).
 - **Capacity walls**: fill to N-1 / N / N+1, crash at the boundary of the
   last slot, recover — the wall holds and the error names the fix.
 - **Allocator invariants** (§7.5): no two live blocks overlap, byte
   accounting is exact, a full alloc-then-free cycle leaks zero.
+- **Harness self-checks**: coverage floors on every interesting path, and a
+  determinism meta-test (same seed → bit-for-bit identical lifetime).
 
 Read [docs/DESIGN.md](docs/DESIGN.md) first. The testing strategy is the
 primary objective of the project; the database is the vehicle.
