@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, wasm gate, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (determinism deny list, docs/DESIGN.md §7.1)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The gate that cannot be argued with (docs/DESIGN.md §7.1):
+      # wasm32-unknown-unknown has no clock, no randomness, and no
+      # filesystem, so ambient nondeterminism in the core fails to link.
+      - name: Determinism gate (core builds for wasm32-unknown-unknown)
+        run: cargo build -p dabqlite-core --target wasm32-unknown-unknown
+
+      - name: Tests (unit, model-based, crash-recovery sweep)
+        run: cargo test --workspace

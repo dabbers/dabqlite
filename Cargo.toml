@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/dabqlite-core", "crates/dabqlite-sim"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/dabbers/dabqlite"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Determinism deny list (docs/DESIGN.md §7.1). The real gate is the
+# wasm32-unknown-unknown build of the core, where these fail to link.
+disallowed-methods = "deny"
+disallowed-types = "deny"
+
+[profile.release]
+debug = true
+# Assertions are the detector (§7.4). They stay on in release.
+debug-assertions = true
+overflow-checks = true

@@ -1,0 +1,15 @@
+[package]
+name = "dabqlite-core"
+description = "Deterministic, allocation-free-after-init storage engine core (pure state machine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero dependencies, by design. The core must build for wasm32-unknown-unknown
+# (docs/DESIGN.md §7.1) and contain no I/O, clock, randomness, or allocation
+# after init.
+[dependencies]
+
+[lints]
+workspace = true

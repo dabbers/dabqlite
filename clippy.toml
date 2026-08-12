@@ -1,0 +1,15 @@
+# Determinism deny list for the native build (docs/DESIGN.md §7.1).
+# The wasm32-unknown-unknown build is the gate that cannot be argued with;
+# this list catches the same mistakes earlier, with a message.
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "no clock inside the deterministic boundary; time is an Input" },
+    { path = "std::time::Instant::now", reason = "no clock inside the deterministic boundary; time is an Input" },
+    { path = "rand::thread_rng", reason = "one ChaCha8Rng seeded from a u64, threaded through the simulator only" },
+    { path = "rand::random", reason = "one ChaCha8Rng seeded from a u64, threaded through the simulator only" },
+]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "default hasher iteration order is nondeterministic; use BTreeMap or a fixed-seed hasher (oracles in tests are exempted inline)" },
+    { path = "std::collections::HashSet", reason = "default hasher iteration order is nondeterministic; use BTreeSet or a fixed-seed hasher (oracles in tests are exempted inline)" },
+]
