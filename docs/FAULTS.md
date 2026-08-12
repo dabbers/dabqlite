@@ -1,7 +1,17 @@
 # Fault model and coverage matrix
 
 Every fault the simulator can express, what guarantee the engine makes
-against it, and which suite validates it. Two modes everywhere:
+against it, and which suite validates it.
+
+The model is deliberately aligned with TigerBeetle's published storage
+fault model (see their [safety docs](https://docs.tigerbeetle.com/concepts/safety/)):
+disks silently corrupt data, misdirect **both writes and reads**, lose
+writes entirely, and lie about fsync. Where TigerBeetle *repairs* these
+faults from other replicas, a single-node store can only detect, survive
+via redundancy, or fail honestly — each row below names which. TigerBeetle
+also found that single-**byte** fault injection reproduced bugs that
+whole-sector corruption missed, which is why tears and flips here are
+byte-granular. Two modes everywhere:
 
 - **Exhaustive** — every point in the fault space is enumerated. Predictable:
   a pass means the whole space, not a sample.
@@ -54,6 +64,25 @@ state is visible but not durable. Failed writes still dirty the cache
 | **Truncation** of either file at every 8-byte point | exhaustive | `faults.rs` | full recovery, honest older state, or `Corrupt` — never wrong data |
 | **Garbage extension** of either file | sampled sizes × seeds | `faults.rs` | inert: the manifest defines the live region |
 
+## Read-path faults (in flight; the disk itself is clean)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Transient bit flip in the superblock read, **every byte** | exhaustive (×2 bit positions) | `read_faults.rs` | zero loss: the live pair's twin is in the same buffer |
+| Transient bit flip in the rows read, **every byte** | exhaustive (×2 bit positions) | `read_faults.rs` | detected (`Corrupt`) — never served; detection over availability |
+| **Misdirected read**: valid bytes from the wrong offset (checksums pass) | shift grid × both reads × seeds | `read_faults.rs` | never silently wrong: positional validation (a copy is only trusted in its own pair slot) + structural checks |
+
+## Lying fsync (fsyncgate: success reported, nothing persisted)
+
+The one fault where single-disk acked-durability genuinely cannot hold
+(TigerBeetle survives it via replicated repair). What is guaranteed instead:
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Lie at **every fsync index**, then power loss × several settles | exhaustive × seeded | `fsync_lies.rs` | **prefix consistency**: exactly the first N acked commits survive — in order, correct bytes, no holes, no phantoms — and the survivor is writable |
+| Lie leaves the superblock referencing a never-persisted row | (subset of above) | `fsync_lies.rs` | detected (`Corrupt`), not served |
+| Lie followed by a later honest fsync of the same file | (subset of above) | `fsync_lies.rs` | self-heals, zero loss |
+
 ## Misdirected writes (firmware lies: success reported, bytes landed elsewhere)
 
 | Scenario | Mode | Suite | Guarantee |
@@ -83,17 +112,27 @@ bugs in the host and must be loud, not lenient.
   survivable and detected).
 - Determinism: `run_lifetime(seed)` twice → identical stats, bit-for-bit.
 - Mutation-verified detectors: breaking fsync-before-superblock ordering,
-  or serving recovered state without fsyncing it, makes the suites fail
-  (checked by hand; candidates for automated `cargo-mutants` later).
+  or serving recovered state without fsyncing it, makes the suites fail —
+  checked by hand during development, and systematically by the weekly
+  `cargo-mutants` workflow (`.github/workflows/mutants.yml`), which mutates
+  the core and fails if any mutant survives the full suite.
+- **Swarm testing**: the `vopr` soak derives its entire lifetime
+  configuration (cycle count, capacity, fault probabilities) from the seed,
+  so the fleet explores config corners — tiny arenas living at the capacity
+  wall, fault storms, long quiet runs — and one integer still reproduces
+  everything.
 
 ## Known limits (deliberate, documented)
 
-- **fsync that lies silently** (reports success, persists nothing) is not
-  modeled: undetectable-by-construction at write time; the guarantee
-  degrades to detection-at-next-open via checksums.
+- **Lying fsync** voids single-disk acked-durability; the tested guarantee
+  degrades to prefix consistency + detection (see the section above).
+  Repairing through it requires replication (design §4.9, deferred).
 - Double media faults on both live superblock copies lose exactly the last
   commit (tested, documented above); triple faults and worse degrade to
   `Corrupt`.
+- **Gray failure** (a disk that is merely slow) is unmodeled: the core has
+  no clock by design, so there is no timeout to test yet. Becomes relevant
+  with concurrent readers or replication.
 - Timing/concurrency faults beyond completion-ordering do not exist yet:
   v1 serializes all access by design (docs/DESIGN.md §5). When concurrent
   readers arrive, this matrix grows a new section.

@@ -1,0 +1,36 @@
+name: mutants
+
+# Automated mutation testing (cargo-mutants): mutate the core, run the whole
+# suite, and fail if any mutant survives — the systematic version of the
+# hand-run mutation checks (skip an fsync, drop a recovery step) that were
+# used to prove the harness has teeth. Scheduled rather than per-PR because
+# it rebuilds and retests per mutant.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants
+
+      - name: Mutate the core against the full suite
+        run: cargo mutants --package dabqlite-core --timeout 300 --no-shuffle -vV
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out

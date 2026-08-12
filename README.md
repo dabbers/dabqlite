@@ -28,6 +28,11 @@ guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
   truncation and garbage-extension sweeps of both files.
 - **Misdirected writes** (firmware lies): every write × shift/cross-file
   grid — never silently wrong. This sweep found a real bug on first run.
+- **Read-path faults**: transient bit flips in read buffers (exhaustive,
+  every byte of both recovery reads) and misdirected reads returning valid
+  bytes from the wrong offset — positional validation keeps them honest.
+- **Lying fsyncs** (fsyncgate): swept at every fsync; the guarantee honestly
+  degrades to prefix consistency + detection, and is tested to exactly that.
 - **Sequencing faults**: host-protocol violations panic loudly; client ops
   mid-I/O get `Busy` (v1 serializes everything).
 - **Capacity walls**: fill to N-1 / N / N+1, crash at the boundary of the

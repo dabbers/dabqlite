@@ -53,6 +53,24 @@ pub struct SimHost {
     pub misdirect_at: Option<(u64, Misdirect)>,
     /// How many writes were actually misdirected.
     pub misdirected: u64,
+    /// Corrupt the read at this I/O index *in flight*: flip `mask` into the
+    /// returned buffer at `byte`, leaving the disk untouched (bus/DMA/cache
+    /// corruption — a retry would see clean data, but the engine never gets
+    /// one). `(io_index, byte, mask)`.
+    pub read_corrupt_at: Option<(u64, usize, u8)>,
+    /// How many reads were corrupted in flight.
+    pub reads_corrupted: u64,
+    /// Misdirect the read at this I/O index: return bytes from
+    /// `offset + shift` instead (firmware read from the wrong sector). The
+    /// data is *valid data from the wrong place* — the hardest case.
+    pub read_misdirect_at: Option<(u64, i64)>,
+    /// How many reads were misdirected.
+    pub reads_misdirected: u64,
+    /// The fsync at this I/O index LIES: reports success, persists nothing
+    /// (fsyncgate). Unsynced writes silently remain unsynced.
+    pub lie_fsync_at: Option<u64>,
+    /// How many fsyncs lied.
+    pub fsyncs_lied: u64,
 }
 
 impl SimHost {
@@ -65,6 +83,12 @@ impl SimHost {
             fail_after: None,
             misdirect_at: None,
             misdirected: 0,
+            read_corrupt_at: None,
+            reads_corrupted: 0,
+            read_misdirect_at: None,
+            reads_misdirected: 0,
+            lie_fsync_at: None,
+            fsyncs_lied: 0,
         }
     }
 
@@ -101,7 +125,21 @@ impl SimHost {
                         out = self.engine.tick(Input::IoFailed { file });
                         continue;
                     }
-                    let data = self.disk.read(file, offset, len);
+                    let idx = self.io_count - 1;
+                    let eff_offset = match self.read_misdirect_at {
+                        Some((at, shift)) if at == idx && offset as i64 + shift >= 0 => {
+                            self.reads_misdirected += 1;
+                            (offset as i64 + shift) as u64
+                        }
+                        _ => offset,
+                    };
+                    let mut data = self.disk.read(file, eff_offset, len);
+                    if let Some((at, byte, mask)) = self.read_corrupt_at {
+                        if at == idx && byte < data.len() {
+                            data[byte] ^= mask;
+                            self.reads_corrupted += 1;
+                        }
+                    }
                     out = self.engine.tick(Input::ReadDone { file, data: &data });
                 }
                 Output::Write { file, offset, data } => {
@@ -146,7 +184,12 @@ impl SimHost {
                         out = self.engine.tick(Input::IoFailed { file });
                         continue;
                     }
-                    self.disk.fsync(file);
+                    if Some(self.io_count - 1) == self.lie_fsync_at {
+                        // fsyncgate: success reported, nothing persisted.
+                        self.fsyncs_lied += 1;
+                    } else {
+                        self.disk.fsync(file);
+                    }
                     out = self.engine.tick(Input::FsyncDone { file });
                 }
                 terminal => return Driven::Done(terminal),
