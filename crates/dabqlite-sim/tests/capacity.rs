@@ -75,8 +75,9 @@ fn fill_to_the_wall_and_over_it() {
 #[test]
 fn crash_at_every_boundary_of_the_last_slot() {
     // Crash while inserting the row that exactly fills the zone, at every
-    // I/O boundary of that insert (4 ops: write row, fsync, write sb, fsync).
-    for boundary_in_insert in 0..4u64 {
+    // I/O boundary of that insert (5 ops: write row, fsync rows, write both
+    // superblock copies, fsync superblock).
+    for boundary_in_insert in 0..5u64 {
         for seed in 0..8u64 {
             let ctx = format!("seed={seed} boundary_in_insert={boundary_in_insert}");
 

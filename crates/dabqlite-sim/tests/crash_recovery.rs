@@ -140,13 +140,14 @@ fn crash_at_every_io_boundary_recovers_to_n_or_n_plus_1() {
 #[test]
 fn crash_during_fresh_init_recovers() {
     for seed in 0..SEEDS {
-        // First: crash a fresh open at each of its boundaries (write, fsync).
-        for boundary in 0..2 {
+        // First: crash a fresh open at each of its boundaries (two copy
+        // writes, then the fsync).
+        for boundary in 0..3 {
             let ctx = format!("seed={seed} boundary={boundary}");
             let mut host = SimHost::new(CAPS, SimDisk::new(), Some(boundary));
             assert!(
                 matches!(host.open(), Driven::Crashed),
-                "[{ctx}] fresh open has 2 I/O ops; must crash"
+                "[{ctx}] fresh open has 3 I/O ops; must crash"
             );
             let mut disk = std::mem::take(&mut host.disk);
             disk.crash(&mut crash_rng(seed, boundary));

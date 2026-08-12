@@ -120,4 +120,19 @@ impl SimDisk {
         self.superblock.crash(rng);
         self.rows.crash(rng);
     }
+
+    /// Simulate media corruption (bit rot): flip bits in the durable image.
+    /// Call on a quiescent disk (no unsynced writes) — this models damage
+    /// discovered at the next restart.
+    pub fn corrupt(&mut self, id: FileId, offset: u64, mask: u8) {
+        assert!(mask != 0, "corruption must change something");
+        let f = self.file_mut(id);
+        assert!(
+            f.unsynced.is_empty(),
+            "corrupt() models at-rest damage; settle or fsync first"
+        );
+        assert!((offset as usize) < f.durable.len(), "corrupting past EOF");
+        f.durable[offset as usize] ^= mask;
+        f.current = f.durable.clone();
+    }
 }

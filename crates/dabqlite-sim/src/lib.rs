@@ -10,8 +10,10 @@
 
 pub mod disk;
 pub mod host;
+pub mod lifetime;
 pub mod workload;
 
 pub use disk::SimDisk;
 pub use host::{Driven, SimHost};
+pub use lifetime::{run_lifetime, LifetimeConfig, LifetimeStats};
 pub use workload::gen_workload;

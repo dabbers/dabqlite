@@ -10,13 +10,26 @@
 //! ```text
 //! state:   Ready ──Insert──▶ InsertWriteRow ──▶ InsertFsyncRows
 //!                                                     │
-//!          Ready ◀── InsertFsyncSb ◀── InsertWriteSb ◀┘
+//!          Ready ◀── InsertFsyncSb ◀── InsertWriteSb{0,1} ◀┘
 //! ```
 //!
-//! The row slot is written and fsynced *before* the superblock copy that
-//! references it (docs/DESIGN.md §4.4), so a surviving superblock always
+//! The row slot is written and fsynced *before* the superblock copies that
+//! reference it (docs/DESIGN.md §4.4), so a surviving superblock always
 //! names fully-durable data. The generation flip in the superblock is the
 //! sole atomicity point.
+//!
+//! ## Superblock copy-set rotation
+//!
+//! Generation `g` is written to the two slots of pair `g % 2` (slots 0,1 or
+//! 2,3). This buys two properties at once:
+//!
+//! - **Crash safety**: a commit never touches the previous generation's
+//!   pair, so even if every unsynced write tears, the previous generation
+//!   survives intact.
+//! - **Media-fault tolerance**: every generation exists in two slots, so a
+//!   single corrupted copy (bit rot, torn sector discovered later) cannot
+//!   lose a committed generation. Recovery takes the highest valid copy
+//!   found in either slot.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -151,26 +164,23 @@ pub enum Output {
 enum State {
     /// Constructed, no `Open` input yet.
     New,
-    /// Fresh database: initial superblock write in flight.
-    InitWriteSb,
+    /// Fresh database: initial superblock write in flight (copy 0 or 1 of
+    /// the generation's pair).
+    InitWriteSb { copy: u8 },
     /// Fresh database: initial superblock fsync in flight.
     InitFsyncSb,
     /// Recovery: superblock zone read in flight.
     RecoverReadSb,
     /// Recovery: committed-rows read in flight.
-    RecoverReadRows {
-        generation: u64,
-        row_count: u64,
-        slot: u8,
-    },
+    RecoverReadRows { generation: u64, row_count: u64 },
     /// Open and idle.
     Ready,
     /// Insert: row-slot write in flight.
     InsertWriteRow,
     /// Insert: rows-file fsync in flight (durability point for the row).
     InsertFsyncRows,
-    /// Insert: superblock-copy write in flight.
-    InsertWriteSb,
+    /// Insert: superblock-copy write in flight (copy 0 or 1 of the pair).
+    InsertWriteSb { copy: u8 },
     /// Insert: superblock fsync in flight (the commit point).
     InsertFsyncSb,
     /// Unrecoverable (corrupt or schema-mismatched file). All ops fail.
@@ -181,10 +191,9 @@ enum State {
 pub struct Engine {
     state: State,
     caps: Capacities,
-    /// Superblock generation currently committed. 0 = none yet.
+    /// Superblock generation currently committed. 0 = none yet. The slots
+    /// holding a generation are derived from it: pair `g % 2`.
     generation: u64,
-    /// Slot holding the committed generation; commits write the next slot.
-    sb_slot: u8,
     /// Committed row count. Rows `0..row_count` in the arena are live.
     row_count: u64,
     /// The insert currently in flight, if any.
@@ -223,7 +232,6 @@ impl Engine {
             state: State::New,
             caps,
             generation: 0,
-            sb_slot: 0,
             row_count: 0,
             pending: None,
             opened_rows_len: 0,
@@ -265,13 +273,12 @@ impl Engine {
             "index moved: allocation after init is forbidden"
         );
         debug_assert!(self.row_count <= self.caps.rows);
-        debug_assert!((self.sb_slot as usize) < SB_COPIES);
         // Pending insert exists exactly in the insert-in-flight states.
         let inserting = matches!(
             self.state,
             State::InsertWriteRow
                 | State::InsertFsyncRows
-                | State::InsertWriteSb
+                | State::InsertWriteSb { .. }
                 | State::InsertFsyncSb
         );
         debug_assert_eq!(self.pending.is_some(), inserting);
@@ -318,15 +325,30 @@ impl Engine {
         }
     }
 
-    fn stage_initial_superblock(&mut self) -> Output {
-        let mut copy = [0u8; SB_COPY_SIZE];
-        encode_sb(1, 0, &mut copy);
-        self.state = State::InitWriteSb;
+    /// The two slots holding generation `g`: pair `g % 2`.
+    fn sb_slots_for(generation: u64) -> [u8; 2] {
+        debug_assert!(generation > 0);
+        debug_assert_eq!(SB_COPIES, 4, "pair rotation assumes 4 slots");
+        let pair = (generation % 2) as u8;
+        [pair * 2, pair * 2 + 1]
+    }
+
+    /// Build the write request for copy `copy` (0 or 1) of a generation.
+    fn sb_copy_write(generation: u64, row_count: u64, copy: u8) -> Output {
+        debug_assert!(copy < 2);
+        let mut bytes = [0u8; SB_COPY_SIZE];
+        encode_sb(generation, row_count, &mut bytes);
+        let slot = Self::sb_slots_for(generation)[copy as usize];
         Output::Write {
             file: FileId::Superblock,
-            offset: 0,
-            data: WriteBuf::from_slice(&copy),
+            offset: slot as u64 * SB_COPY_SIZE as u64,
+            data: WriteBuf::from_slice(&bytes),
         }
+    }
+
+    fn stage_initial_superblock(&mut self) -> Output {
+        self.state = State::InitWriteSb { copy: 0 };
+        Self::sb_copy_write(1, 0, 0)
     }
 
     fn on_read_done(&mut self, file: FileId, data: &[u8]) -> Output {
@@ -336,10 +358,9 @@ impl Engine {
                 State::RecoverReadRows {
                     generation,
                     row_count,
-                    slot,
                 },
                 FileId::Rows,
-            ) => self.recover_from_rows(generation, row_count, slot, data),
+            ) => self.recover_from_rows(generation, row_count, data),
             (state, file) => {
                 panic!("protocol violation: ReadDone({file:?}) in state {state:?}")
             }
@@ -357,6 +378,12 @@ impl Engine {
             };
             match decode_sb(chunk) {
                 Ok(copy) => {
+                    // Negative space: a generation only ever lands in its
+                    // own pair's slots.
+                    debug_assert!(
+                        Self::sb_slots_for(copy.generation).contains(&(slot as u8)),
+                        "generation found outside its pair slot"
+                    );
                     if best.is_none_or(|(_, b)| copy.generation > b.generation) {
                         best = Some((slot as u8, copy));
                     }
@@ -368,7 +395,7 @@ impl Engine {
             }
         }
 
-        let Some((slot, copy)) = best else {
+        let Some((_slot, copy)) = best else {
             if let Some(file_schema) = schema_mismatch {
                 return self.fail_open(DbError::SchemaMismatch {
                     file_schema,
@@ -407,12 +434,11 @@ impl Engine {
         }
 
         if copy.row_count == 0 {
-            self.finish_open(copy.generation, 0, slot)
+            self.finish_open(copy.generation, 0)
         } else {
             self.state = State::RecoverReadRows {
                 generation: copy.generation,
                 row_count: copy.row_count,
-                slot,
             };
             Output::Read {
                 file: FileId::Rows,
@@ -422,13 +448,7 @@ impl Engine {
         }
     }
 
-    fn recover_from_rows(
-        &mut self,
-        generation: u64,
-        row_count: u64,
-        slot: u8,
-        data: &[u8],
-    ) -> Output {
+    fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
         if data.len() != (row_count as usize) * ROW_SIZE {
             return self.fail_open(DbError::Corrupt {
                 what: "short read of committed rows",
@@ -452,14 +472,13 @@ impl Engine {
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
             self.index_insert(id, row);
         }
-        self.finish_open(generation, row_count, slot)
+        self.finish_open(generation, row_count)
     }
 
-    fn finish_open(&mut self, generation: u64, row_count: u64, slot: u8) -> Output {
+    fn finish_open(&mut self, generation: u64, row_count: u64) -> Output {
         assert!(generation > 0, "committed generation must be positive");
         self.generation = generation;
         self.row_count = row_count;
-        self.sb_slot = slot;
         self.state = State::Ready;
         Output::OpenDone {
             result: Ok(row_count),
@@ -477,13 +496,13 @@ impl Engine {
         let err = match self.state {
             State::Ready => None,
             State::New
-            | State::InitWriteSb
+            | State::InitWriteSb { .. }
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. } => Some(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
-            | State::InsertWriteSb
+            | State::InsertWriteSb { .. }
             | State::InsertFsyncSb => Some(DbError::Busy),
             State::Failed(e) => Some(e),
         };
@@ -526,7 +545,11 @@ impl Engine {
 
     fn on_write_done(&mut self, file: FileId) -> Output {
         match (self.state, file) {
-            (State::InitWriteSb, FileId::Superblock) => {
+            (State::InitWriteSb { copy: 0 }, FileId::Superblock) => {
+                self.state = State::InitWriteSb { copy: 1 };
+                Self::sb_copy_write(1, 0, 1)
+            }
+            (State::InitWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::InitFsyncSb;
                 Output::Fsync {
                     file: FileId::Superblock,
@@ -536,7 +559,11 @@ impl Engine {
                 self.state = State::InsertFsyncRows;
                 Output::Fsync { file: FileId::Rows }
             }
-            (State::InsertWriteSb, FileId::Superblock) => {
+            (State::InsertWriteSb { copy: 0 }, FileId::Superblock) => {
+                self.state = State::InsertWriteSb { copy: 1 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+            }
+            (State::InsertWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::InsertFsyncSb;
                 Output::Fsync {
                     file: FileId::Superblock,
@@ -550,25 +577,18 @@ impl Engine {
 
     fn on_fsync_done(&mut self, file: FileId) -> Output {
         match (self.state, file) {
-            (State::InitFsyncSb, FileId::Superblock) => self.finish_open(1, 0, 0),
+            (State::InitFsyncSb, FileId::Superblock) => self.finish_open(1, 0),
             (State::InsertFsyncRows, FileId::Rows) => {
-                // The row is durable; now flip the superblock. Write the
-                // *stale* copy slot so a torn write cannot touch the live one.
-                let next_slot = ((self.sb_slot as usize + 1) % SB_COPIES) as u8;
-                let mut copy = [0u8; SB_COPY_SIZE];
-                encode_sb(self.generation + 1, self.row_count + 1, &mut copy);
-                self.state = State::InsertWriteSb;
-                Output::Write {
-                    file: FileId::Superblock,
-                    offset: next_slot as u64 * SB_COPY_SIZE as u64,
-                    data: WriteBuf::from_slice(&copy),
-                }
+                // The row is durable; now flip the superblock. The new
+                // generation goes to the *other* pair of slots, so the live
+                // generation's copies are untouched no matter what tears.
+                self.state = State::InsertWriteSb { copy: 0 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
             }
             (State::InsertFsyncSb, FileId::Superblock) => {
                 // Commit point: the new generation is durable.
                 let (id, value) = self.pending.take().expect("pending insert at commit");
                 self.generation += 1;
-                self.sb_slot = ((self.sb_slot as usize + 1) % SB_COPIES) as u8;
                 self.index_insert(id, self.row_count);
                 self.row_count += 1;
                 self.state = State::Ready;
@@ -588,13 +608,13 @@ impl Engine {
         let result = match self.state {
             State::Ready => Ok(self.lookup_value(id)),
             State::New
-            | State::InitWriteSb
+            | State::InitWriteSb { .. }
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
-            | State::InsertWriteSb
+            | State::InsertWriteSb { .. }
             | State::InsertFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };

@@ -36,3 +36,8 @@ jobs:
 
       - name: Tests (unit, model-based, crash-recovery sweep)
         run: cargo test --workspace
+
+      # A short randomized soak on top of the deterministic sweeps. Any
+      # failure prints the seed that reproduces it.
+      - name: VOPR soak (200 random lifetimes)
+        run: cargo run --release -p dabqlite-sim --bin vopr -- --runs 200

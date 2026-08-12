@@ -38,9 +38,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod blob;
 pub mod crc32;
 pub mod engine;
 pub mod layout;
 
+pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{Capacities, DbError, Engine, FileId, Input, Output, WriteBuf};
 pub use layout::{ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN};
