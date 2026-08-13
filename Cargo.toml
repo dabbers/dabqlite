@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/dabqlite-core", "crates/dabqlite-host", "crates/dabqlite-sim"]
+members = [
+    "crates/dabqlite-codegen",
+    "crates/dabqlite-core",
+    "crates/dabqlite-host",
+    "crates/dabqlite-sim",
+]
 
 [workspace.package]
 version = "0.1.0"

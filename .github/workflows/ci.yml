@@ -37,6 +37,13 @@ jobs:
       - name: Tests (unit, model-based, crash-recovery sweep)
         run: cargo test --workspace
 
+      # The generated codec is checked in; regenerating must be a no-op.
+      - name: Codegen drift check
+        run: |
+          cargo run -p dabqlite-codegen -- schema/records.sql \
+            crates/dabqlite-codegen/generated/records.rs
+          git diff --exit-code
+
       # A short randomized soak on top of the deterministic sweeps. Any
       # failure prints the seed that reproduces it.
       - name: VOPR soak (200 random lifetimes)

@@ -46,10 +46,13 @@ pub const SB_ZONE_SIZE: usize = SB_COPY_SIZE * SB_COPIES;
 /// Magic bytes identifying a superblock copy.
 pub const SB_MAGIC: [u8; 8] = *b"DABQSB01";
 
-/// Hash of the compiled schema. In the full system this is derived by the
-/// codegen pipeline; for the vertical slice it versions the hand-written
-/// layout above. Bump on any layout change.
-pub const SCHEMA_HASH: u64 = 0xDAB1_0001_0000_0001;
+/// Hash of the compiled schema, derived by `dabqlite-codegen` from
+/// `schema/records.sql` (FNV-1a 64 over the canonical schema rendering).
+/// Never edit by hand: the codegen test suite pins this constant against
+/// the schema file, so a schema change that alters layout fails the build
+/// here until this value — and any needed migration — is consciously
+/// updated (docs/DESIGN.md §4.8).
+pub const SCHEMA_HASH: u64 = 0x181F_56C6_632B_C4E3;
 
 /// Encode a row into a 32-byte slot.
 pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {

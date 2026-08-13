@@ -1,0 +1,17 @@
+[package]
+name = "dabqlite-codegen"
+description = "Schema compiler: Postgres DDL in, record layout + typed Rust codec out"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero dependencies: a hand-rolled parser for the small DDL subset keeps the
+# toolchain deterministic and the parse errors ours to shape.
+[dependencies]
+
+[dev-dependencies]
+dabqlite-core = { path = "../dabqlite-core" }
+
+[lints]
+workspace = true

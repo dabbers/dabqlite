@@ -57,12 +57,19 @@ primary objective of the project; the database is the vehicle.
 ## Layout
 
 ```
+schema/
+  records.sql     The schema: Postgres DDL + annotations. Single source of
+                  truth for layout and SCHEMA_HASH.
 crates/
   dabqlite-core   The pure state machine: tick(input) -> output. No I/O, no
                   clock, no randomness, no allocation after init. Zero
                   dependencies; must always build for wasm32-unknown-unknown.
                   Also home of the blob-zone allocator (power-of-two classes,
                   intrusive LIFO free lists, O(1) alloc/free).
+  dabqlite-codegen The schema compiler: DDL in, layout + typed Rust codec
+                  out. The generated codec is proven byte-identical to the
+                  hand codec the fault matrix validated; SCHEMA_HASH is
+                  derived, pinned by test, drift-checked in CI.
   dabqlite-host   The storage seam (trait shaped by OPFS sync access
                   handles) plus the generic host driver and the real POSIX
                   file backend. Equivalence tests prove the simulator and
