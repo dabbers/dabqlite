@@ -206,6 +206,22 @@ enum State {
     Failed(DbError),
 }
 
+/// What recovery observed. See [`Engine::recovery_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Committed rows recovered.
+    pub row_count: u64,
+    /// Checksum-valid rows found beyond the manifest. Exactly one is the
+    /// normal artifact of an insert that was in flight (never acknowledged)
+    /// at a crash. Two or more cannot arise that way.
+    pub orphan_valid_rows: u64,
+    /// True when the orphan count proves at least one *acknowledged* commit
+    /// was rolled back by an out-of-budget fault (lying fsync). The
+    /// recovered prefix is still exactly correct; what follows it is gone,
+    /// and this flag is the loud version of that fact.
+    pub rollback_evidence: bool,
+}
+
 /// The engine. See module docs for the protocol.
 pub struct Engine {
     state: State,
@@ -219,6 +235,8 @@ pub struct Engine {
     pending: Option<(u64, [u8; VALUE_LEN])>,
     /// Rows file length reported at open; used to cross-check recovery.
     opened_rows_len: u64,
+    /// Checksum-valid rows found beyond the manifest during recovery.
+    orphan_valid_rows: u64,
     /// Row-slot arena: one allocation at init, never grown (§4.2).
     arena: Vec<u8>,
     /// Open-addressing primary-key index: slot -> row index + 1 (0 = empty).
@@ -254,6 +272,7 @@ impl Engine {
             row_count: 0,
             pending: None,
             opened_rows_len: 0,
+            orphan_valid_rows: 0,
             arena,
             index,
             arena_addr,
@@ -270,6 +289,20 @@ impl Engine {
     /// Committed superblock generation (0 before open completes).
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// What recovery found, beyond the row count. Hosts SHOULD check
+    /// `rollback_evidence` after every open and alarm on it: it means
+    /// acknowledged commits were rolled back by a fault outside the declared
+    /// budget (e.g. a lying fsync) and the on-disk evidence survived to
+    /// prove it. The recovered data itself is still exactly correct — an
+    /// in-order prefix — but newer commits existed and are gone.
+    pub fn recovery_report(&self) -> RecoveryReport {
+        RecoveryReport {
+            row_count: self.row_count,
+            orphan_valid_rows: self.orphan_valid_rows,
+            rollback_evidence: self.orphan_valid_rows >= 2,
+        }
     }
 
     /// Advance the state machine by one input.
@@ -456,7 +489,14 @@ impl Engine {
             });
         }
 
-        if copy.row_count == 0 {
+        // Read the committed rows AND everything beyond them, up to the
+        // configured capacity: bytes past the manifest are scanned for
+        // rollback evidence (valid rows the superblock no longer
+        // references). Bounded by the arena capacity, so the read cannot
+        // exceed what the engine could ever have written.
+        let scan_len = self.opened_rows_len.min(self.caps.rows * ROW_SIZE as u64);
+        if scan_len == 0 {
+            debug_assert_eq!(copy.row_count, 0, "checked against rows_len above");
             self.stage_recovery_fsyncs(copy.generation, 0)
         } else {
             self.state = State::RecoverReadRows {
@@ -466,7 +506,7 @@ impl Engine {
             Output::Read {
                 file: FileId::Rows,
                 offset: 0,
-                len: copy.row_count * ROW_SIZE as u64,
+                len: scan_len,
             }
         }
     }
@@ -483,7 +523,8 @@ impl Engine {
     }
 
     fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
-        if data.len() != (row_count as usize) * ROW_SIZE {
+        let live = (row_count as usize) * ROW_SIZE;
+        if data.len() < live {
             return self.fail_open(DbError::Corrupt {
                 what: "short read of committed rows",
             });
@@ -506,6 +547,22 @@ impl Engine {
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
             self.index_insert(id, row);
         }
+        // Rollback-evidence scan: checksum-valid rows beyond the manifest.
+        // ONE is the normal artifact of an in-flight, never-acknowledged
+        // insert. TWO OR MORE cannot arise that way (writes are serialized;
+        // slot N+1 is only written after commit N+1 was acknowledged as
+        // durable) — they are surviving evidence that acknowledged commits
+        // were rolled back by an out-of-budget fault such as a lying fsync.
+        // Silent loss becomes loud whenever the evidence physically exists.
+        let mut orphans = 0u64;
+        let mut off = live;
+        while off + ROW_SIZE <= data.len() {
+            if decode_row(&data[off..off + ROW_SIZE]).is_some() {
+                orphans += 1;
+            }
+            off += ROW_SIZE;
+        }
+        self.orphan_valid_rows = orphans;
         self.stage_recovery_fsyncs(generation, row_count)
     }
 

@@ -11,7 +11,43 @@ faults from other replicas, a single-node store can only detect, survive
 via redundancy, or fail honestly — each row below names which. TigerBeetle
 also found that single-**byte** fault injection reproduced bugs that
 whole-sector corruption missed, which is why tears and flips here are
-byte-granular. Two modes everywhere:
+byte-granular.
+
+## The contract: perfection in budget, honesty beyond it
+
+**Fault budget** (what a single disk can absorb outright): machine crashes
+with arbitrary settle of unsynced writes; EIO fail-stops with dirty page
+caches; crashes during recovery; at most one unrepaired superblock media
+fault per two generations; transient read corruption. **Within the budget
+the store is perfect: zero loss, zero drift.** Every acknowledged insert
+survives bit-exact, every read is exactly right, recovery always succeeds.
+Validated by every sweep below and, critically, by `storm.rs`, which layers
+ALL in-budget faults into single lifetimes and treats any loss — however
+small — as failure.
+
+**Beyond the budget** (lying fsyncs, simultaneous multi-faults), no
+single-disk system can recover bits the hardware never stored. The contract
+degrades in a fixed, tested order — never to silence:
+
+1. **Never wrong**: data served is always exactly what was acknowledged.
+   There is no fault, in or out of budget, that produces drift. (Every
+   suite asserts this; it has no exception class.)
+2. **Ordered, bounded loss**: what survives is an exact in-order prefix of
+   acknowledged commits. A single lying fsync loses at most the final
+   commit (`fsync_lies.rs` asserts the bound).
+3. **Loud whenever evidence exists**: recovery scans past the manifest for
+   checksum-valid orphan rows. One is the normal in-flight artifact; two or
+   more are proof of rolled-back acknowledged commits, and
+   `Engine::recovery_report()` raises `rollback_evidence` (deep-rollback
+   test: 6 lost commits with surviving rows ⇒ flagged, mutation-verified).
+   Hosts should treat that flag as an alarm.
+4. **Silent only when physics wins**: a rollback is undetectable only when
+   *no* distinguishing bit survives on the platter — at which point the
+   state is indistinguishable, by any observer, from the commits never
+   having happened. Repairing through even that requires a second copy of
+   the truth: replication (design §4.9).
+
+Two modes everywhere:
 
 - **Exhaustive** — every point in the fault space is enumerated. Predictable:
   a pass means the whole space, not a sample.
@@ -80,8 +116,16 @@ The one fault where single-disk acked-durability genuinely cannot hold
 | Scenario | Mode | Suite | Guarantee |
 |---|---|---|---|
 | Lie at **every fsync index**, then power loss × several settles | exhaustive × seeded | `fsync_lies.rs` | **prefix consistency**: exactly the first N acked commits survive — in order, correct bytes, no holes, no phantoms — and the survivor is writable |
+| Single lie: loss depth | (same sweep) | `fsync_lies.rs` | **bounded**: at most the final commit; when it is lost, the evidence scan sees the orphan row its honest rows-fsync left behind |
 | Lie leaves the superblock referencing a never-persisted row | (subset of above) | `fsync_lies.rs` | detected (`Corrupt`), not served |
 | Lie followed by a later honest fsync of the same file | (subset of above) | `fsync_lies.rs` | self-heals, zero loss |
+| **Persistent lies** (all fsyncs no-op from some point; deep rollback) | targeted + seeded settles | `fsync_lies.rs` | exact prefix always; when row evidence survives, `rollback_evidence` fires (mutation-verified); evidence flag never fires without real loss |
+
+## The storm (all in-budget faults at once)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Crashes + EIO fail-stops + recovery crashes + budget-gated media faults + transient read faults, interleaved across whole lifetimes | seeded random, coverage-floored | `storm.rs` | **perfection**: zero loss, zero drift, recovery always converges, no rollback evidence ever appears |
 
 ## Misdirected writes (firmware lies: success reported, bytes landed elsewhere)
 

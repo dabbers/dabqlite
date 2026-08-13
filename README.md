@@ -31,8 +31,17 @@ guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
 - **Read-path faults**: transient bit flips in read buffers (exhaustive,
   every byte of both recovery reads) and misdirected reads returning valid
   bytes from the wrong offset — positional validation keeps them honest.
-- **Lying fsyncs** (fsyncgate): swept at every fsync; the guarantee honestly
-  degrades to prefix consistency + detection, and is tested to exactly that.
+- **Lying fsyncs** (fsyncgate): swept at every fsync; loss is bounded to the
+  final commit for a single lie, survivors are always an exact in-order
+  prefix, and recovery scans past the manifest for orphaned rows —
+  rolled-back acknowledged commits are *flagged* (`rollback_evidence`)
+  whenever their evidence survives. Silent only when no distinguishing bit
+  exists on disk.
+- **The storm** (`storm.rs`): every in-budget fault class layered into
+  single lifetimes — crashes, EIO fail-stops, recovery crashes, media
+  faults, transient read faults — under a strict perfection invariant:
+  zero loss, zero drift, always. The fault-budget contract is spelled out
+  in [docs/FAULTS.md](docs/FAULTS.md).
 - **Sequencing faults**: host-protocol violations panic loudly; client ops
   mid-I/O get `Busy` (v1 serializes everything).
 - **Capacity walls**: fill to N-1 / N / N+1, crash at the boundary of the

@@ -69,6 +69,10 @@ pub struct SimHost {
     /// The fsync at this I/O index LIES: reports success, persists nothing
     /// (fsyncgate). Unsynced writes silently remain unsynced.
     pub lie_fsync_at: Option<u64>,
+    /// EVERY fsync from this I/O index on lies — the full fsyncgate
+    /// scenario, where one swallowed error turns all subsequent fsyncs
+    /// into silent no-ops. Enables arbitrarily deep rollback.
+    pub lie_fsync_from: Option<u64>,
     /// How many fsyncs lied.
     pub fsyncs_lied: u64,
 }
@@ -88,6 +92,7 @@ impl SimHost {
             read_misdirect_at: None,
             reads_misdirected: 0,
             lie_fsync_at: None,
+            lie_fsync_from: None,
             fsyncs_lied: 0,
         }
     }
@@ -184,7 +189,10 @@ impl SimHost {
                         out = self.engine.tick(Input::IoFailed { file });
                         continue;
                     }
-                    if Some(self.io_count - 1) == self.lie_fsync_at {
+                    let idx = self.io_count - 1;
+                    let lying = Some(idx) == self.lie_fsync_at
+                        || self.lie_fsync_from.is_some_and(|from| idx >= from);
+                    if lying {
                         // fsyncgate: success reported, nothing persisted.
                         self.fsyncs_lied += 1;
                     } else {
