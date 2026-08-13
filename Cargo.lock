@@ -13,6 +13,14 @@ name = "dabqlite-core"
 version = "0.1.0"
 
 [[package]]
+name = "dabqlite-host"
+version = "0.1.0"
+dependencies = [
+ "dabqlite-core",
+ "dabqlite-sim",
+]
+
+[[package]]
 name = "dabqlite-sim"
 version = "0.1.0"
 dependencies = [

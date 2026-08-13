@@ -1,0 +1,16 @@
+[package]
+name = "dabqlite-host"
+description = "Storage backends and the generic host driver for dabqlite-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dabqlite-core = { path = "../dabqlite-core" }
+
+[dev-dependencies]
+dabqlite-sim = { path = "../dabqlite-sim" }
+
+[lints]
+workspace = true

@@ -63,6 +63,11 @@ crates/
                   dependencies; must always build for wasm32-unknown-unknown.
                   Also home of the blob-zone allocator (power-of-two classes,
                   intrusive LIFO free lists, O(1) alloc/free).
+  dabqlite-host   The storage seam (trait shaped by OPFS sync access
+                  handles) plus the generic host driver and the real POSIX
+                  file backend. Equivalence tests prove the simulator and
+                  real disk produce byte-identical files and identical
+                  fault outcomes — the simulation is not a fiction.
   dabqlite-sim    The deterministic simulator: simulated disk with crash and
                   bit-rot fault models, crash-boundary injection, seeded
                   workloads, model-based oracles, whole-lifetime runs, and

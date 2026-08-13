@@ -147,6 +147,17 @@ bugs in the host and must be loud, not lenient.
 | Client ops mid-I/O (Insert/Get while inserting) | targeted | core tests | `Busy` — v1 serializes everything |
 | Ops before open / after fail-stop | targeted | core tests | `NotOpen` / `IoFailed` |
 
+## Simulator/reality equivalence (the simulation is not a fiction)
+
+Every fault above is injected against a simulated disk. These tests anchor
+the simulation to real hardware behavior:
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Same seeded workload, same generic driver, sim vs. real POSIX files | seeds | `dabqlite-host/tests/equivalence.rs` | **byte-for-byte identical files** — any divergence means the storage contract differs and simulated results are suspect |
+| Identical at-rest damage (flips, truncations) applied to both | fault grid | same | identical recovery outcomes, row for row, error for error |
+| Close and reopen real files (real fsync path) | seeds | same | full recovery, no rollback evidence |
+
 ## Harness self-checks (a passing sweep must mean something)
 
 - Coverage floors: crash counts, fail-stop counts, recovery-crash counts,

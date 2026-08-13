@@ -187,6 +187,12 @@ impl SimDisk {
         self.file(id).read(offset, len)
     }
 
+    /// The full current (page-cache view) contents of a file, for
+    /// byte-for-byte comparison against real storage backends.
+    pub fn contents(&self, id: FileId) -> Vec<u8> {
+        self.file(id).current.clone()
+    }
+
     pub fn write(&mut self, id: FileId, offset: u64, data: &[u8]) {
         self.file_mut(id).write(offset, data);
     }
