@@ -25,8 +25,11 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants
 
+      # --test-workspace true is load-bearing: without it cargo-mutants runs
+      # only the mutated package's own tests, and the killing power of this
+      # project lives in the dabqlite-sim / dabqlite-host integration suites.
       - name: Mutate the core against the full suite
-        run: cargo mutants --package dabqlite-core --timeout 300 --no-shuffle -vV
+        run: cargo mutants --package dabqlite-core --test-workspace true --timeout 300 --no-shuffle -vV
 
       - name: Upload results
         if: always()
