@@ -219,6 +219,31 @@ the simulation to real hardware behavior:
 | Identical at-rest damage (flips, truncations) applied to both | fault grid | same | identical recovery outcomes, row for row, error for error |
 | Close and reopen real files (real fsync path) | seeds | same | full recovery, no rollback evidence |
 
+## Single-writer enforcement (design §2: one writer, always)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Second open of a locked directory, same process | targeted | `dabqlite-host/tests/locking.rs` | refused (`WouldBlock`), error explains the policy; release-then-open works |
+| A **real second OS process** while the database is in active use | spawned-process | same | refused at the door before it can touch data; the refusal harms nothing |
+| Lock holder is **killed** (crashed writer) | spawned-and-killed process | same | the kernel releases `flock` with the process — no stale lock, no recovery step, the lock is crash-safe by construction |
+
+## The schema version gate (safe brick until migration lands, §4.8)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| File written under a foreign schema (forged valid superblocks) | seeds | `version_gate.rs` | refused with `SchemaMismatch` naming BOTH hashes; engine fail-stopped |
+| The rejected open's side effects | byte pin | same | **zero bytes changed** — a correct binary later finds the file pristine |
+| Repeated confused retries | targeted | same | identical refusal every time, zero cumulative harm |
+| Stray foreign copy in a stale slot (even with a higher generation) | targeted | same | ignored; healthy same-schema copies win |
+| Direction / magnitude of the hash difference | grid | same | any difference refuses, both directions |
+
+## Scale (the extrapolation, checked)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| **1,000,000 rows** through the full engine (interleaved keys → splits everywhere) | release-mode CI step | `scale.rs` | wall exact and zero-I/O at 1M; full 32 MB recovery re-verifying every checksum; ordered windows at start/middle/end; crash boundaries of the millionth insert: N/N+1 |
+| **100,000 rows on real files** (200k genuine fsyncs) | release-mode CI step | `scale_posix.rs` | byte-identical to the simulator at volume; real recovery + sampled reads exact |
+
 ## Harness self-checks (a passing sweep must mean something)
 
 - Coverage floors: crash counts, fail-stop counts, recovery-crash counts,

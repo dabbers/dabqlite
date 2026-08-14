@@ -8,6 +8,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -17,10 +18,16 @@ use crate::Storage;
 
 pub const SUPERBLOCK_FILE: &str = "superblock.dabq";
 pub const ROWS_FILE: &str = "rows.dabq";
+pub const LOCK_FILE: &str = "lock.dabq";
 
 pub struct PosixStorage {
     superblock: File,
     rows: File,
+    /// The single-writer lock (docs/DESIGN.md §2: "one writer, always").
+    /// Held for the storage's lifetime; `flock` is released by the kernel
+    /// when the process dies, so a crash can never leave a stale lock —
+    /// the lock itself is crash-safe by construction.
+    _lock: File,
 }
 
 impl PosixStorage {
@@ -37,13 +44,34 @@ impl PosixStorage {
                 .truncate(false)
                 .open(dir.join(name))
         };
+        // Take the single-writer lock BEFORE touching data files: a second
+        // process must be refused before it can do any harm at all.
+        let lock = open(LOCK_FILE)?;
+        // FFI is the only way to flock; the unsafety is confined to this
+        // one syscall on an owned fd.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "dabqlite: {} is locked by another process; the store is \
+                     single-writer (design §2) — close the other handle first",
+                    dir.display()
+                ),
+            ));
+        }
         let superblock = open(SUPERBLOCK_FILE)?;
         let rows = open(ROWS_FILE)?;
         // Directory fsync: the least portable operation in the design,
         // written once, here (§4.4). macOS needs F_FULLFSYNC for real
         // guarantees — tracked for when that target is wired up.
         File::open(dir)?.sync_all()?;
-        Ok(PosixStorage { superblock, rows })
+        Ok(PosixStorage {
+            superblock,
+            rows,
+            _lock: lock,
+        })
     }
 
     fn file(&self, id: FileId) -> &File {

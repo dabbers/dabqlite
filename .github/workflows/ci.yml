@@ -47,6 +47,14 @@ jobs:
             crates/dabqlite-core/src/generated/queries.rs
           git diff --exit-code
 
+      # Scale suites run in release (the profile keeps debug-assertions on,
+      # so no assertion coverage is lost): 1M rows simulated, 100k on real
+      # files with real fsyncs.
+      - name: Scale (1M rows sim, 100k rows real files)
+        run: |
+          cargo test -p dabqlite-sim --test scale --release -- --ignored
+          cargo test -p dabqlite-host --test scale_posix --release -- --ignored
+
       # A short randomized soak on top of the deterministic sweeps. Any
       # failure prints the seed that reproduces it.
       - name: VOPR soak (200 random lifetimes)

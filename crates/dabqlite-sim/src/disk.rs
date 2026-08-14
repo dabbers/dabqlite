@@ -84,8 +84,16 @@ impl SimFile {
     }
 
     fn fsync(&mut self) {
-        self.durable = self.current.clone();
-        self.unsynced.clear();
+        // Apply-pending rather than clone-the-file. Identical semantics —
+        // `current` only ever differs from `durable` by the unsynced writes,
+        // so applying them converges the two — but O(pending bytes) instead
+        // of O(file size), which is what lets the scale suite drive
+        // million-row databases. The sim/real byte-equivalence tests are
+        // the guard on this claim.
+        for (offset, data) in self.unsynced.drain(..) {
+            apply(&mut self.durable, offset, &data);
+        }
+        debug_assert_eq!(self.durable.len(), self.current.len());
     }
 
     fn settle_one(durable: &mut Vec<u8>, offset: u64, data: &[u8], fate: WriteFate) {

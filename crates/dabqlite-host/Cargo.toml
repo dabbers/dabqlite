@@ -9,6 +9,12 @@ repository.workspace = true
 [dependencies]
 dabqlite-core = { path = "../dabqlite-core" }
 
+[target.'cfg(unix)'.dependencies]
+# flock only: the single-writer lock (docs/DESIGN.md §2: "one writer,
+# always") needs an advisory lock that the kernel releases on process
+# death, which std does not expose.
+libc = "0.2"
+
 [dev-dependencies]
 dabqlite-sim = { path = "../dabqlite-sim" }
 

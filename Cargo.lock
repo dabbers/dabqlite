@@ -25,6 +25,7 @@ version = "0.1.0"
 dependencies = [
  "dabqlite-core",
  "dabqlite-sim",
+ "libc",
 ]
 
 [[package]]
