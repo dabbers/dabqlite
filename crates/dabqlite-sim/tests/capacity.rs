@@ -3,7 +3,7 @@
 //! the boundary and recover. The arena is set absurdly small so every run
 //! hits the wall.
 
-use dabqlite_core::{Capacities, DbError, Output, VALUE_LEN};
+use dabqlite_core::{Capacities, DbError, FileId, Input, Output, VALUE_LEN};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{Driven, SimDisk, SimHost};
@@ -133,4 +133,233 @@ fn crash_at_every_boundary_of_the_last_slot() {
             );
         }
     }
+}
+
+/// §6: "batches are rejected atomically; partial application turns a
+/// capacity limit into a corruption bug." The mechanical version: a Full
+/// rejection must perform ZERO I/O — no write, no fsync, no read — and
+/// leave every on-disk byte untouched.
+#[test]
+fn full_rejection_performs_zero_io_and_changes_nothing() {
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    for id in 0..CAPS.rows {
+        assert_eq!(insert(&mut host, id), Ok(()));
+    }
+    let io_before = host.io_count;
+    let sb_before = host.disk.contents(FileId::Superblock);
+    let rows_before = host.disk.contents(FileId::Rows);
+
+    // Hammer the wall: every rejection is pure, none touches the disk.
+    for attempt in 0..25u64 {
+        assert_eq!(
+            insert(&mut host, CAPS.rows + attempt),
+            Err(DbError::Full {
+                entity: "records",
+                capacity: CAPS.rows
+            })
+        );
+    }
+    assert_eq!(host.io_count, io_before, "Full rejection performed I/O");
+    assert_eq!(host.disk.contents(FileId::Superblock), sb_before);
+    assert_eq!(host.disk.contents(FileId::Rows), rows_before);
+
+    // The generation is untouched too: no phantom commits at the wall.
+    assert_eq!(host.engine.generation(), CAPS.rows + 1);
+}
+
+/// EIO landing exactly at the wall: each of the 5 I/O ops of the insert
+/// that fills the final slot fails; fail-stop, dirty-cache restart, and
+/// the wall must still be exact — N-1 with a working retry, or N with
+/// DuplicateId on retry. Then a machine crash on top: state stable.
+#[test]
+fn eio_at_the_wall_leaves_the_wall_exact() {
+    for fail_op in 0..5u64 {
+        let ctx = format!("fail_op={fail_op}");
+        let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+        host.open();
+        for id in 0..CAPS.rows - 1 {
+            assert_eq!(insert(&mut host, id), Ok(()));
+        }
+        host.fail_after = Some(host.io_count + fail_op);
+        let last = CAPS.rows - 1;
+        assert_eq!(
+            insert(&mut host, last),
+            Err(DbError::IoFailed {
+                file: match fail_op {
+                    0 | 1 => FileId::Rows,
+                    _ => FileId::Superblock,
+                }
+            }),
+            "[{ctx}]"
+        );
+
+        // Restart on the dirty cache.
+        let disk = std::mem::take(&mut host.disk);
+        let mut second = SimHost::new(CAPS, disk, None);
+        let n1 = match second.open() {
+            Driven::Done(Output::OpenDone { result: Ok(n) }) => n,
+            other => panic!("[{ctx}] reopen: {other:?}"),
+        };
+        assert!(
+            n1 == CAPS.rows - 1 || n1 == CAPS.rows,
+            "[{ctx}] reopened with {n1} rows at the wall"
+        );
+        if n1 == CAPS.rows - 1 {
+            assert_eq!(insert(&mut second, last), Ok(()), "[{ctx}] retry");
+        } else {
+            assert_eq!(
+                insert(&mut second, last),
+                Err(DbError::DuplicateId { id: last }),
+                "[{ctx}]"
+            );
+        }
+        // Either way the zone is now exactly full.
+        assert_eq!(second.engine.usage(), (CAPS.rows, CAPS.rows), "[{ctx}]");
+        assert_eq!(
+            insert(&mut second, CAPS.rows),
+            Err(DbError::Full {
+                entity: "records",
+                capacity: CAPS.rows
+            }),
+            "[{ctx}]"
+        );
+
+        // Machine crash on top: the full state is durable and exact.
+        let mut disk = std::mem::take(&mut second.disk);
+        disk.crash(&mut crash_rng(0xEA11, fail_op));
+        let mut third = SimHost::new(CAPS, disk, None);
+        assert!(
+            matches!(
+                third.open(),
+                Driven::Done(Output::OpenDone { result: Ok(n) }) if n == CAPS.rows
+            ),
+            "[{ctx}] full database regressed after crash"
+        );
+        for id in 0..CAPS.rows {
+            assert_eq!(third.get(id), Some(val(id as u8)), "[{ctx}] id={id}");
+        }
+    }
+}
+
+/// The reopen capacity boundary must be exact: capacity == data succeeds
+/// (immediately full), capacity == data - 1 fails naming both numbers,
+/// capacity == data + 1 gives exactly one slot of runway.
+#[test]
+fn reopen_capacity_boundaries_are_exact() {
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    for id in 0..CAPS.rows {
+        assert_eq!(insert(&mut host, id), Ok(()));
+    }
+    let disk = std::mem::take(&mut host.disk);
+
+    // Exactly-equal capacity: opens, and is already at the wall.
+    let mut exact = SimHost::new(Capacities { rows: CAPS.rows }, disk.clone(), None);
+    assert!(matches!(
+        exact.open(),
+        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == CAPS.rows
+    ));
+    assert_eq!(exact.engine.usage(), (CAPS.rows, CAPS.rows));
+    assert_eq!(
+        insert(&mut exact, 99),
+        Err(DbError::Full {
+            entity: "records",
+            capacity: CAPS.rows
+        })
+    );
+
+    // One below: refused, and the error is the config change needed.
+    let mut small = SimHost::new(
+        Capacities {
+            rows: CAPS.rows - 1,
+        },
+        disk.clone(),
+        None,
+    );
+    assert!(matches!(
+        small.open(),
+        Driven::Done(Output::OpenDone {
+            result: Err(DbError::CapacityBelowData {
+                required,
+                configured,
+            })
+        }) if required == CAPS.rows && configured == CAPS.rows - 1
+    ));
+
+    // One above: exactly one slot of runway, then the wall again.
+    let mut grown = SimHost::new(
+        Capacities {
+            rows: CAPS.rows + 1,
+        },
+        disk,
+        None,
+    );
+    assert!(matches!(
+        grown.open(),
+        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == CAPS.rows
+    ));
+    assert_eq!(insert(&mut grown, 100), Ok(()));
+    assert_eq!(
+        insert(&mut grown, 101),
+        Err(DbError::Full {
+            entity: "records",
+            capacity: CAPS.rows + 1
+        })
+    );
+}
+
+/// A 100%-full database must serve every read path perfectly: point gets,
+/// full ordered paged scans, singleton and empty ranges.
+#[test]
+fn full_database_serves_every_query_path() {
+    let caps = Capacities { rows: 16 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    for id in 0..caps.rows {
+        match host.run(ClientOp::Insert {
+            id: id * 3,
+            value: val(id as u8),
+        }) {
+            Driven::Done(Output::InsertDone { result: Ok(()), .. }) => {}
+            other => panic!("fill: {other:?}"),
+        }
+    }
+    assert_eq!(host.engine.usage(), (caps.rows, caps.rows));
+
+    // Point gets: every row, plus honest absence between rows.
+    for id in 0..caps.rows {
+        assert_eq!(host.get(id * 3), Some(val(id as u8)));
+        assert_eq!(host.get(id * 3 + 1), None);
+    }
+
+    // Full ordered paged scan at 100% fill.
+    let mut seen = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let page = match host.run_input(Input::Range {
+            lo: cursor,
+            hi: u64::MAX,
+        }) {
+            Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+            other => panic!("range: {other:?}"),
+        };
+        seen.extend_from_slice(&page.items[..page.count as usize]);
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    assert_eq!(seen.len() as u64, caps.rows);
+    assert!(
+        seen.windows(2).all(|w| w[0].0 < w[1].0),
+        "scan out of order"
+    );
+
+    // Empty and singleton ranges at the wall.
+    let empty = match host.run_input(Input::Range { lo: 7, hi: 5 }) {
+        Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((empty.count, empty.next), (0, None));
 }

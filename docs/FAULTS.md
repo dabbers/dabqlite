@@ -76,6 +76,20 @@ Each unsynced write independently receives a fate:
 | **Many crash/recover/continue cycles** in one lifetime | seeded random | `lifetime.rs`, `vopr` | oracle-exact after every recovery |
 | Crash at the **capacity wall** (filling the last slot) | exhaustive boundaries × seeds | `capacity.rs` | wall holds; retry gives DuplicateId or succeeds, never double-applies |
 
+## Capacity exhaustion (the declared ceiling, §6)
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Fill to N-1 / N / N+1 | targeted | `capacity.rs` | `Full {{ entity, capacity }}` — the error names the config change needed; database unharmed, all rows readable |
+| **Full rejection purity** | mechanical pin | `capacity.rs` | rejection performs ZERO I/O: `io_count` unchanged, every on-disk byte identical, generation untouched — nothing is ever partially applied |
+| Crash at every I/O boundary of the final slot | exhaustive × seeds | `capacity.rs` | recovers to N-1 (retry succeeds) or N (retry = DuplicateId), then Full — never between, never double-applied |
+| **EIO exactly at the wall** (each of the final insert's 5 ops) | exhaustive | `capacity.rs` | fail-stop, dirty-cache restart to an exact wall, then machine crash on top: full state durable |
+| Reopen capacity boundaries | targeted | `capacity.rs` | capacity == data opens already-full; data-1 refuses with `CapacityBelowData {{ required, configured }}`; data+1 gives exactly one slot |
+| 100%-full database serves reads | targeted | `capacity.rs` | every get, full ordered paged scan, empty/singleton ranges — all exact at the wall |
+| Whole lifetimes lived at the wall, under crash/EIO schedules | seeded (floor-asserted) + swarm vopr (rows=4 configs) | `lifetime.rs`, `vopr` | Full interleaved with faults never corrupts; oracle-exact every cycle |
+| Blob zone exhaustion | targeted + fuzz (arena sized to fill) | core `blob.rs`, `blob.rs` fuzz | `Full {{ block_bytes, capacity }}`; freed blocks reusable; zero leak |
+| B+tree node pool | adversarial fill | core + `btree_oracle.rs` | derived bound never approached — index capacity can't be hit before row capacity |
+
 ## I/O failures (EIO on read/write/fsync; process restarts, machine does not)
 
 The page cache (`current`) survives into the next incarnation — unsynced
