@@ -107,9 +107,8 @@ fn atomicity_no_observer_ever_sees_a_partial_write() {
                 };
                 let via_scan = scanned.iter().find(|&&(k, _)| k == id).map(|&(_, v)| v);
                 assert_eq!(via_get, via_scan, "[{ctx}] observers disagree");
-                match via_get {
-                    Some(v) => assert_eq!(v, value, "[{ctx}] partial in-flight value"),
-                    None => {}
+                if let Some(v) = via_get {
+                    assert_eq!(v, value, "[{ctx}] partial in-flight value");
                 }
             }
             for (&id, &value) in &acked {
