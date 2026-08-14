@@ -191,7 +191,12 @@ impl BTreeIndex {
             let len = n.len as usize;
             let mut child = len;
             for (i, &k) in n.keys[..len].iter().enumerate() {
-                if start < k {
+                // Same routing predicate as insert: start == separator
+                // descends RIGHT, straight to the leaf that owns the key.
+                // (Routing left would still be correct — the chain walk
+                // filters — just one leaf slower, which is why only the
+                // shared pinned predicate can hold the strictness.)
+                if routes_before(start, k) {
                     child = i;
                     break;
                 }

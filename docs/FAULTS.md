@@ -293,6 +293,26 @@ the simulation to real hardware behavior:
     while the lookup-side guard exists, was merged into one shared
     `probe_next` with an exact `!=` guard that any operator flip trips
     immediately. **Zero mutants are excluded from the sweep.**
+- **The verification sweep audited its own verdicts — and found false
+  kills.** The full re-run after the closures (455 mutants) reported 401
+  caught + 15 timeout-kills + 1 miss, but the miss was a mutant the FIRST
+  run had "caught" — impossible if verdicts are sound. The first run's log
+  showed the truth: that "kill" (and three verdicts in the re-run) came
+  from an unrelated flaky test, not from the mutation. The flake was real
+  and worth the trip: `Command::spawn` forks, and between fork and exec
+  the child holds duplicates of every parent fd — including a flock'd
+  lock file another locking test had just dropped, so a concurrent
+  drop-then-reopen saw a phantom `WouldBlock`. The locking suite is now
+  serialized with a documented mutex, verified stable across repeated
+  runs. The lesson is structural: **a mutation kill is only as trustworthy
+  as the determinism of the suite that produced it**, so any surviving or
+  newly-appearing mutant across runs gets its log read, not just its
+  verdict counted. The one true miss (range-descent `<` vs `<=`: routing
+  `start == separator` left walks one extra leaf but yields identical
+  output) was dissolved by routing the scan descent through the same
+  pinned `routes_before` predicate as insert, and the three false-kill
+  sites (range-page arena offset arithmetic) were re-verified with the
+  flake fixed.
 - **Swarm testing**: the `vopr` soak derives its entire lifetime
   configuration (cycle count, capacity, fault probabilities) from the seed,
   so the fleet explores config corners — tiny arenas living at the capacity

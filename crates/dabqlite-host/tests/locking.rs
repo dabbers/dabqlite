@@ -8,11 +8,29 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 use dabqlite_core::{Capacities, Output, VALUE_LEN};
 use dabqlite_host::{Host, PosixStorage};
 
 const CAPS: Capacities = Capacities { rows: 8 };
+
+/// These tests must not overlap in time, even though they use separate
+/// directories: `Command::spawn` forks, and between fork and exec the
+/// child holds duplicates of EVERY parent fd — including a flock'd lock
+/// file some other test just dropped. flock is held by the open file
+/// description, so the lock outlives the drop until the child execs and
+/// its O_CLOEXEC copies close. A concurrent drop-then-reopen assertion
+/// sees a phantom WouldBlock in that window. (Found as a false mutant
+/// kill: the first cargo-mutants sweep "caught" an unrelated core mutant
+/// because this suite flaked in its run.)
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-lock-{}-{tag}", std::process::id()));
@@ -26,6 +44,7 @@ fn probe_exe() -> &'static str {
 
 #[test]
 fn second_open_in_same_process_is_refused() {
+    let _serial = serial();
     let dir = scratch_dir("same-process");
     let first = PosixStorage::open_dir(&dir).expect("first open");
 
@@ -45,6 +64,7 @@ fn second_open_in_same_process_is_refused() {
 
 #[test]
 fn a_real_second_process_is_refused_while_the_database_is_open() {
+    let _serial = serial();
     let dir = scratch_dir("second-process");
     let storage = PosixStorage::open_dir(&dir).expect("open");
     // Not just held — actively in use.
@@ -86,6 +106,7 @@ fn a_real_second_process_is_refused_while_the_database_is_open() {
 
 #[test]
 fn killing_the_lock_holder_never_leaves_a_stale_lock() {
+    let _serial = serial();
     let dir = scratch_dir("kill-holder");
 
     // A real process takes the lock and holds it.
