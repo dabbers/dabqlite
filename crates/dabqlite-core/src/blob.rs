@@ -365,4 +365,36 @@ mod tests {
         assert_eq!(a.data(h), b"hello world");
         assert_eq!(a.data(h).len(), 11);
     }
+
+    // ---- mutation-gap closures ------------------------------------------
+
+    /// The conservation tripwire must fire when the books are cooked: a
+    /// checker that can be no-op'd without any test noticing guards
+    /// nothing.
+    #[test]
+    #[should_panic(expected = "byte accounting leaked")]
+    fn conservation_tripwire_has_teeth() {
+        let mut a = BlobAllocator::new(1 << 16);
+        let _ = a.alloc(100).unwrap();
+        a.live_block_bytes += 1;
+        a.assert_invariants();
+    }
+
+    /// The free-block walk must actually walk: freed blocks appear, live
+    /// blocks do not, exactly once each.
+    #[test]
+    fn free_walk_yields_exactly_the_freed_blocks() {
+        let mut a = BlobAllocator::new(1 << 16);
+        let h1 = a.alloc(100).unwrap();
+        let h2 = a.alloc(100).unwrap();
+        let h3 = a.alloc(2000).unwrap();
+        a.free(h1);
+        a.free(h3);
+        let mut seen = alloc::vec::Vec::new();
+        a.for_each_free_block(|offset, class| seen.push((offset, class)));
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&(h1.offset, h1.class)));
+        assert!(seen.contains(&(h3.offset, h3.class)));
+        assert!(!seen.contains(&(h2.offset, h2.class)));
+    }
 }

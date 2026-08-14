@@ -257,6 +257,42 @@ the simulation to real hardware behavior:
   checked by hand during development, and systematically by the weekly
   `cargo-mutants` workflow (`.github/workflows/mutants.yml`), which mutates
   the core and fails if any mutant survives the full suite.
+- **First full mutation sweep, and what it taught**: 462 mutants across the
+  core, each run against the entire workspace suite (`--test-workspace
+  true` — load-bearing: cargo-mutants otherwise runs only the mutated
+  package's own tests, and the killing power lives in the sim/host
+  suites). First run: 387 caught outright, 11 killed by timeout (the
+  mutant hangs a test — detection, just slower), 38 unviable, **26
+  missed**. Every miss was closed the same day, by category:
+  - *The one real hole*: a non-empty rows file with no valid superblock
+    copy anywhere must be refused as `Corrupt` — the mutant flipped that
+    check into a silent re-initialization over committed rows, and no test
+    noticed. Now pinned (`mutation_gaps.rs`), including zero-byte harm on
+    the refusal.
+  - *An unpinned recovery semantic*: two checksum-valid copies of the same
+    generation that disagree (out-of-model forgery) now deterministically
+    resolve to the first slot of the pair (`mutation_gaps.rs`).
+  - *Checker teeth* (the largest class): the invariant checkers themselves
+    — btree structural validation, blob conservation accounting, engine
+    tripwires, cycle/probe-termination guards — could be no-op'd without
+    any test failing. Each checker now has tests that corrupt state with
+    surgically exactly one defect and demand the panic (`should_panic`
+    with the specific message), plus legal-boundary states that must NOT
+    panic, so checkers can neither go blind nor go paranoid.
+  - *Golden pins*: `pool_nodes_for`, `is_empty`/`nodes_used`, the
+    `hash_slot` mixing function (mutations only degrade distribution, so
+    the values themselves are the spec), and codec length gates in both
+    directions (short refused, longer-than-slot decodes its prefix,
+    generated and reference codecs agreeing).
+  - *Two mutants were equivalent-under-contract, so the contract was made
+    testable instead of excluding them*: strict-less descent routing
+    (`key < sep`) only differs from `<=` on duplicate keys, which the
+    engine rejects upstream — the comparison was extracted into a named
+    predicate (`routes_before`) and pinned directly, equality included.
+    Likewise the insert-side probe-termination guard, provably unreachable
+    while the lookup-side guard exists, was merged into one shared
+    `probe_next` with an exact `!=` guard that any operator flip trips
+    immediately. **Zero mutants are excluded from the sweep.**
 - **Swarm testing**: the `vopr` soak derives its entire lifetime
   configuration (cycle count, capacity, fault probabilities) from the seed,
   so the fleet explores config corners — tiny arenas living at the capacity

@@ -199,6 +199,46 @@ mod tests {
         assert_eq!(decode_row(&slot), Some((42, value)));
     }
 
+    /// The length gates are exact in both directions: a short buffer is
+    /// refused without touching bytes it doesn't have, and a LONGER buffer
+    /// decodes from its prefix (callers slice exactly, but the gate's
+    /// contract is `>= size`, and both codecs — generated and reference —
+    /// must agree on it).
+    #[test]
+    fn length_gates_are_exact_in_both_codecs() {
+        let value = *b"0123456789abcdef";
+        let mut slot = [0u8; ROW_SIZE];
+        encode_row(42, &value, &mut slot);
+        let mut long_row = [0u8; ROW_SIZE + 1];
+        long_row[..ROW_SIZE].copy_from_slice(&slot);
+        for short in 0..ROW_SIZE {
+            assert_eq!(decode_row(&slot[..short]), None, "generated, len {short}");
+            assert_eq!(
+                reference::decode_row(&slot[..short]),
+                None,
+                "reference, len {short}"
+            );
+        }
+        assert_eq!(decode_row(&long_row), Some((42, value)));
+        assert_eq!(reference::decode_row(&long_row), Some((42, value)));
+
+        let mut sb = [0u8; SB_COPY_SIZE];
+        encode_sb(7, 123, &mut sb);
+        let mut long_sb = [0u8; SB_COPY_SIZE + 1];
+        long_sb[..SB_COPY_SIZE].copy_from_slice(&sb);
+        assert_eq!(
+            decode_sb(&sb[..SB_COPY_SIZE - 1]),
+            Err(SbDecodeError::Invalid)
+        );
+        assert_eq!(
+            decode_sb(&long_sb),
+            Ok(SbCopy {
+                generation: 7,
+                row_count: 123
+            })
+        );
+    }
+
     #[test]
     fn row_rejects_corruption() {
         let mut slot = [0u8; ROW_SIZE];

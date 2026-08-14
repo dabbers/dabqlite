@@ -902,12 +902,27 @@ impl Engine {
         (h as usize) & (self.index.len() - 1)
     }
 
+    /// Advance to the next probe slot. The termination guard is exact
+    /// (`!=`, not an inequality with slack): `probes` counts advances one
+    /// by one, so equality is the first and only moment the table has been
+    /// fully probed — unreachable while the load factor stays <= 0.5.
+    /// Shared by lookup and insert so the guard exists exactly once;
+    /// insert's loop inspects a subset of the slots lookup would, so a
+    /// second private guard there could never fire and could never be
+    /// tested.
+    fn probe_next(&self, slot: usize, probes: &mut usize) -> usize {
+        *probes += 1;
+        assert!(
+            *probes != self.index.len(),
+            "index probe loop must terminate"
+        );
+        (slot + 1) & (self.index.len() - 1)
+    }
+
     fn index_lookup(&self, id: u64) -> Option<u64> {
         let mut slot = self.hash_slot(id);
         let mut probes = 0usize;
         loop {
-            // Termination: load factor <= 0.5 guarantees an empty slot.
-            assert!(probes < self.index.len(), "index probe loop must terminate");
             match self.index[slot] {
                 0 => return None,
                 entry => {
@@ -917,8 +932,7 @@ impl Engine {
                     }
                 }
             }
-            slot = (slot + 1) & (self.index.len() - 1);
-            probes += 1;
+            slot = self.probe_next(slot, &mut probes);
         }
     }
 
@@ -930,9 +944,7 @@ impl Engine {
         let mut slot = self.hash_slot(id);
         let mut probes = 0usize;
         while self.index[slot] != 0 {
-            assert!(probes < self.index.len(), "index probe loop must terminate");
-            slot = (slot + 1) & (self.index.len() - 1);
-            probes += 1;
+            slot = self.probe_next(slot, &mut probes);
         }
         self.index[slot] = row + 1;
         // Pair assertion: inserted entry must be findable.
@@ -1301,5 +1313,102 @@ mod tests {
         e.tick(Input::IoFailed {
             file: FileId::Superblock,
         });
+    }
+
+    // ---- mutation-gap closures ------------------------------------------
+
+    /// The engine's own invariant tripwire must fire: an engine whose
+    /// arena pointer changed (allocation after init — forbidden) must
+    /// refuse to tick.
+    #[test]
+    #[should_panic(expected = "arena moved")]
+    fn invariant_tripwire_has_teeth() {
+        let mut h = MiniHost::new(Capacities { rows: 8 });
+        h.open();
+        h.engine.arena_addr ^= 1;
+        h.engine.tick(Input::Get { id: 1 });
+    }
+
+    /// hash_slot pinned against an independent restatement of the mixing
+    /// function. Every mutation of the mix (xor→or, xor→and, shift flip,
+    /// constant-zero) degrades to "still correct, just clustered" — no
+    /// behavioral test can see it, so the values themselves are the spec.
+    #[test]
+    fn hash_slot_matches_reference_mix() {
+        let e = Engine::new(Capacities { rows: 8 });
+        assert_eq!(e.index.len(), 16);
+        for id in [
+            0u64,
+            1,
+            7,
+            0xDEAD_BEEF_1234_5678,
+            0x0123_4567_89AB_CDEF,
+            u64::MAX,
+        ] {
+            let mixed = (id ^ (id >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let expected = (mixed as usize) & (e.index.len() - 1);
+            assert_eq!(e.hash_slot(id), expected, "id={id:#x}");
+        }
+    }
+
+    /// The probe-termination guard must fire on a full table. Unreachable
+    /// through the public API (load factor is capped at 0.5), so the state
+    /// is forged directly. Under the mutant that disables the counter this
+    /// hangs — a timeout kill.
+    #[test]
+    #[should_panic(expected = "probe loop must terminate")]
+    fn probe_guard_has_teeth() {
+        let mut e = Engine::new(Capacities { rows: 8 });
+        for slot in e.index.iter_mut() {
+            *slot = 1; // every slot claims row 0; arena is zeroed, id 0
+        }
+        e.index_lookup(7); // never matches, never finds an empty slot
+    }
+
+    /// Colliding keys must probe through occupied slots and still resolve
+    /// exactly — exercises multi-step probing on the REAL insert/get path,
+    /// which no uniform workload guarantees.
+    #[test]
+    fn colliding_keys_probe_correctly() {
+        let mut h = MiniHost::new(Capacities { rows: 8 });
+        h.open();
+        // Find three ids sharing one hash slot in the 16-slot table.
+        let target = h.engine.hash_slot(0);
+        let ids: StdVec<u64> = (0..2000u64)
+            .filter(|&id| h.engine.hash_slot(id) == target)
+            .take(3)
+            .collect();
+        assert_eq!(ids.len(), 3, "collision search must find a full chain");
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                h.drive(Input::Insert {
+                    id,
+                    value: val(i as u8 + 1)
+                }),
+                Output::InsertDone { id, result: Ok(()) }
+            );
+        }
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                h.drive(Input::Get { id }),
+                Output::GetDone {
+                    id,
+                    result: Ok(Some(val(i as u8 + 1)))
+                }
+            );
+        }
+        // A missing id hashing to the same slot walks the chain to a
+        // genuine empty slot: None, not a false positive.
+        let absent = (0..5000u64)
+            .filter(|&id| h.engine.hash_slot(id) == target)
+            .find(|id| !ids.contains(id))
+            .expect("a fourth colliding id exists");
+        assert_eq!(
+            h.drive(Input::Get { id: absent }),
+            Output::GetDone {
+                id: absent,
+                result: Ok(None)
+            }
+        );
     }
 }

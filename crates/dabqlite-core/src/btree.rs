@@ -66,6 +66,16 @@ pub fn pool_nodes_for(rows: u64) -> u64 {
     rows / 3 + 16
 }
 
+/// Descent routing: does `key` belong strictly before separator `sep`?
+/// STRICTLY — equality routes right, toward the leaf that owns the
+/// separator's key. Through `insert` the equal case is unreachable
+/// (duplicates are rejected before the index), which makes the strictness
+/// untestable from the outside; naming the predicate lets the tests pin
+/// it directly instead of excluding the mutant as "equivalent".
+fn routes_before(key: u64, sep: u64) -> bool {
+    key < sep
+}
+
 impl BTreeIndex {
     /// One pool allocation for the declared capacity (docs/DESIGN.md §4.2).
     pub fn new(rows: u64) -> Self {
@@ -212,7 +222,7 @@ impl BTreeIndex {
         let len = self.node(id).len as usize;
         let mut child_idx = len;
         for i in 0..len {
-            if key < self.node(id).keys[i] {
+            if routes_before(key, self.node(id).keys[i]) {
                 child_idx = i;
                 break;
             }
@@ -270,7 +280,7 @@ impl BTreeIndex {
         let len = self.node(id).len as usize;
         let pos = self.node(id).keys[..len]
             .iter()
-            .position(|&k| key < k)
+            .position(|&k| routes_before(key, k))
             .unwrap_or(len);
         if len < ORDER {
             let n = self.node_mut(id);
@@ -508,5 +518,185 @@ mod tests {
             t.nodes_used(),
             pool_nodes_for(rows)
         );
+    }
+
+    // ---- mutation-gap closures ------------------------------------------
+    //
+    // Each test below kills a mutant that survived the first full
+    // cargo-mutants run: constants and accessors pinned to exact values,
+    // and — the larger class — proof that the invariant CHECKERS have
+    // teeth. A checker that silently stops checking is worse than no
+    // checker, because everything else in this project leans on it.
+
+    #[test]
+    fn pool_sizing_and_checker_constants_are_exact() {
+        assert_eq!(pool_nodes_for(0), 16);
+        assert_eq!(pool_nodes_for(1), 16);
+        assert_eq!(pool_nodes_for(3), 17);
+        assert_eq!(pool_nodes_for(96), 48);
+        assert_eq!(pool_nodes_for(1_000_000), 333_349);
+        // ORDER=8: ceil(8/2) - 1 = 3 keys minimum in a non-root leaf.
+        assert_eq!(HALF_MIN, 3);
+    }
+
+    #[test]
+    fn routing_is_strictly_less() {
+        // Equality routes RIGHT: the separator's key lives in the right
+        // subtree. Unreachable via insert (duplicates rejected upstream),
+        // so pinned here directly.
+        assert!(routes_before(1, 2));
+        assert!(!routes_before(2, 2));
+        assert!(!routes_before(3, 2));
+    }
+
+    #[test]
+    fn emptiness_and_node_accounting_are_observable() {
+        let mut t = BTreeIndex::new(64);
+        assert!(t.is_empty());
+        assert_eq!(t.nodes_used(), 1, "a fresh tree is exactly its root");
+        t.insert(1, 0);
+        assert!(!t.is_empty());
+        // ORDER+1 keys force the first split: root + two leaves.
+        for k in 2..=9u64 {
+            t.insert(k, k);
+        }
+        assert_eq!(t.nodes_used(), 3, "first split must cost exactly 2 nodes");
+    }
+
+    /// Hand-build a tree whose ONLY defect is an under-occupied non-root
+    /// internal node — every other invariant (order, bounds, depth up to
+    /// the panic point) holds, so nothing but the occupancy check can
+    /// catch it.
+    #[test]
+    #[should_panic(expected = "under-occupied")]
+    fn checker_catches_under_occupied_internal() {
+        let mut t = BTreeIndex::new(64);
+        let leaf = |keys: &[u64], next: u32| {
+            let mut n = Node::empty_leaf();
+            for (i, &k) in keys.iter().enumerate() {
+                n.keys[i] = k;
+            }
+            n.len = keys.len() as u8;
+            n.next = next;
+            n
+        };
+        // root(internal) -> [under-occupied internal, leaf]
+        t.pool[0] = Node {
+            keys: [100, 0, 0, 0, 0, 0, 0, 0],
+            vals: [0; ORDER],
+            children: [1, 2, NIL, NIL, NIL, NIL, NIL, NIL, NIL],
+            next: NIL,
+            len: 1,
+            leaf: false,
+        };
+        t.pool[1] = Node {
+            keys: [40, 0, 0, 0, 0, 0, 0, 0],
+            vals: [0; ORDER],
+            children: [3, 4, NIL, NIL, NIL, NIL, NIL, NIL, NIL],
+            next: NIL,
+            len: 1, // the defect: internals need >= ORDER/2 separators
+            leaf: false,
+        };
+        t.pool[2] = leaf(&[100, 110, 120, 130], NIL);
+        t.pool[3] = leaf(&[10, 20, 30], 4);
+        t.pool[4] = leaf(&[40, 50, 60], 2);
+        t.root = 0;
+        t.used = 5;
+        t.len = 10;
+        t.check_invariants();
+    }
+
+    /// Hand-build a tree whose ONLY defect is leaves at unequal depth —
+    /// occupancy, ordering, bounds, count, and the leaf chain are all
+    /// consistent, so only the depth-uniformity check can catch it.
+    #[test]
+    #[should_panic(expected = "unequal depth")]
+    fn checker_catches_unequal_leaf_depth() {
+        let mut t = BTreeIndex::new(64);
+        let leaf = |keys: &[u64], next: u32| {
+            let mut n = Node::empty_leaf();
+            for (i, &k) in keys.iter().enumerate() {
+                n.keys[i] = k;
+            }
+            n.len = keys.len() as u8;
+            n.next = next;
+            n
+        };
+        // root -> [leaf at depth 1, internal at depth 1 -> 5 leaves at 2]
+        t.pool[0] = Node {
+            keys: [100, 0, 0, 0, 0, 0, 0, 0],
+            vals: [0; ORDER],
+            children: [1, 2, NIL, NIL, NIL, NIL, NIL, NIL, NIL],
+            next: NIL,
+            len: 1,
+            leaf: false,
+        };
+        t.pool[1] = leaf(&[10, 20, 30], 3);
+        t.pool[2] = Node {
+            keys: [200, 300, 400, 500, 0, 0, 0, 0],
+            vals: [0; ORDER],
+            children: [3, 4, 5, 6, 7, NIL, NIL, NIL, NIL],
+            next: NIL,
+            len: 4,
+            leaf: false,
+        };
+        t.pool[3] = leaf(&[110, 120, 130], 4);
+        t.pool[4] = leaf(&[210, 220, 230], 5);
+        t.pool[5] = leaf(&[310, 320, 330], 6);
+        t.pool[6] = leaf(&[410, 420, 430], 7);
+        t.pool[7] = leaf(&[510, 520, 530], NIL);
+        t.root = 0;
+        t.used = 8;
+        t.len = 18;
+        t.check_invariants();
+    }
+
+    /// A legal 3-key non-root leaf must PASS: the checker's minimum is
+    /// HALF_MIN = 3, and a checker that rejects legal trees is as broken
+    /// as one that accepts corrupt ones.
+    #[test]
+    fn checker_accepts_minimum_occupancy_leaf() {
+        let mut t = BTreeIndex::new(64);
+        let leaf = |keys: &[u64], next: u32| {
+            let mut n = Node::empty_leaf();
+            for (i, &k) in keys.iter().enumerate() {
+                n.keys[i] = k;
+            }
+            n.len = keys.len() as u8;
+            n.next = next;
+            n
+        };
+        t.pool[0] = Node {
+            keys: [100, 0, 0, 0, 0, 0, 0, 0],
+            vals: [0; ORDER],
+            children: [1, 2, NIL, NIL, NIL, NIL, NIL, NIL, NIL],
+            next: NIL,
+            len: 1,
+            leaf: false,
+        };
+        t.pool[1] = leaf(&[10, 20, 30], 2); // exactly HALF_MIN keys
+        t.pool[2] = leaf(&[100, 110, 120, 130], NIL);
+        t.root = 0;
+        t.used = 3;
+        t.len = 7;
+        t.check_invariants();
+    }
+
+    /// The leaf-chain cycle guard must fire on an actual cycle. (Under the
+    /// mutant that disables the counter this test hangs instead of
+    /// panicking, which the mutation runner counts as a timeout kill.)
+    #[test]
+    #[should_panic(expected = "leaf chain cycle")]
+    fn chain_walk_detects_cycles() {
+        let mut t = BTreeIndex::new(64);
+        for k in 0..30u64 {
+            t.insert(k, k);
+        }
+        for id in 0..t.used {
+            if t.pool[id as usize].leaf {
+                t.pool[id as usize].next = id; // every leaf now self-loops
+            }
+        }
+        t.for_each_from(0, |_, _| true);
     }
 }
