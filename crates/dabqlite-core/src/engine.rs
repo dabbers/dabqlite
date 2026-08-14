@@ -46,8 +46,15 @@ use crate::layout::{
 pub enum FileId {
     /// The superblock copy set: the sole atomicity point.
     Superblock,
-    /// Fixed-width row slots for the `records` table.
+    /// Fixed-width row slots for the `records` table, in the schema this
+    /// binary was compiled against.
     Rows,
+    /// The LEGACY rows file (previous schema). Only the migration engine
+    /// ever touches it, and only to READ: migration writes the new rows
+    /// file and flips the superblock, leaving this file byte-identical —
+    /// an inert orphan after the flip (docs/DESIGN.md §4.4, §4.8). The
+    /// row engine itself never emits this id.
+    RowsOld,
 }
 
 /// Capacities supplied at open (docs/DESIGN.md §4.2). Layout is a
@@ -103,7 +110,7 @@ pub struct WriteBuf {
 }
 
 impl WriteBuf {
-    fn from_slice(src: &[u8]) -> Self {
+    pub(crate) fn from_slice(src: &[u8]) -> Self {
         assert!(src.len() <= SB_COPY_SIZE, "write exceeds bounded buffer");
         assert!(!src.is_empty(), "empty write is a protocol bug");
         let mut buf = [0u8; SB_COPY_SIZE];
@@ -175,6 +182,11 @@ pub enum Output {
     },
     /// Range page finished (pure in-memory, always immediate).
     RangeDone { result: Result<RangePage, DbError> },
+    /// Offline migration finished (docs/DESIGN.md §4.8). `Ok(n)` = the
+    /// file now carries this binary's schema with `n` rows — either
+    /// migrated just now or found already current (idempotent no-op).
+    /// Emitted only by [`crate::migration::MigrationEngine`].
+    MigrateDone { result: Result<u64, DbError> },
 }
 
 /// Rows per range page. Results are bounded buffers (docs/DESIGN.md §4.5):
@@ -310,6 +322,11 @@ impl Engine {
         (self.row_count, self.caps.rows)
     }
 
+    /// The capacities this engine was opened with.
+    pub fn caps(&self) -> Capacities {
+        self.caps
+    }
+
     /// Committed superblock generation (0 before open completes).
     pub fn generation(&self) -> u64 {
         self.generation
@@ -417,7 +434,7 @@ impl Engine {
     }
 
     /// The two slots holding generation `g`: pair `g % 2`.
-    fn sb_slots_for(generation: u64) -> [u8; 2] {
+    pub(crate) fn sb_slots_for(generation: u64) -> [u8; 2] {
         debug_assert!(generation > 0);
         debug_assert_eq!(SB_COPIES, 4, "pair rotation assumes 4 slots");
         let pair = (generation % 2) as u8;
@@ -425,7 +442,7 @@ impl Engine {
     }
 
     /// Build the write request for copy `copy` (0 or 1) of a generation.
-    fn sb_copy_write(generation: u64, row_count: u64, copy: u8) -> Output {
+    pub(crate) fn sb_copy_write(generation: u64, row_count: u64, copy: u8) -> Output {
         debug_assert!(copy < 2);
         let mut bytes = [0u8; SB_COPY_SIZE];
         encode_sb(generation, row_count, &mut bytes);
@@ -985,6 +1002,7 @@ mod tests {
             match id {
                 FileId::Superblock => &mut self.superblock,
                 FileId::Rows => &mut self.rows,
+                FileId::RowsOld => unreachable!("the row engine never touches the legacy file"),
             }
         }
 

@@ -160,8 +160,13 @@ pub fn encode_sb(generation: u64, row_count: u64, out: &mut [u8; SB_COPY_SIZE]) 
     ));
 }
 
-/// Decode and verify a superblock copy.
-pub fn decode_sb(bytes: &[u8]) -> Result<SbCopy, SbDecodeError> {
+/// Decode and verify a superblock copy STRUCTURALLY (magic, checksum,
+/// padding), returning its contents alongside the schema hash it was
+/// written under — without judging that hash. The engine's gate is
+/// [`decode_sb`]; this exists for the migration path, which must read
+/// generation and row count out of a LEGACY file's superblock that
+/// `decode_sb` would (correctly) refuse.
+pub fn decode_sb_any(bytes: &[u8]) -> Result<(SbCopy, u64), SbDecodeError> {
     if bytes.len() < SB_COPY_SIZE {
         return Err(SbDecodeError::Invalid);
     }
@@ -178,13 +183,23 @@ pub fn decode_sb(bytes: &[u8]) -> Result<SbCopy, SbDecodeError> {
         return Err(SbDecodeError::Invalid);
     }
     let file_schema = u64::from_le_bytes(bytes[24..32].try_into().expect("fixed slice"));
+    Ok((
+        SbCopy {
+            generation: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
+            row_count: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
+        },
+        file_schema,
+    ))
+}
+
+/// Decode and verify a superblock copy, enforcing the schema gate: a
+/// structurally-valid copy under any other schema is `SchemaMismatch`.
+pub fn decode_sb(bytes: &[u8]) -> Result<SbCopy, SbDecodeError> {
+    let (copy, file_schema) = decode_sb_any(bytes)?;
     if file_schema != SCHEMA_HASH {
         return Err(SbDecodeError::SchemaMismatch { file_schema });
     }
-    Ok(SbCopy {
-        generation: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
-        row_count: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
-    })
+    Ok(copy)
 }
 
 #[cfg(test)]

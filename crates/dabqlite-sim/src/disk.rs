@@ -162,6 +162,7 @@ impl SimFile {
 pub struct SimDisk {
     superblock: SimFile,
     rows: SimFile,
+    rows_old: SimFile,
 }
 
 impl SimDisk {
@@ -173,6 +174,7 @@ impl SimDisk {
         match id {
             FileId::Superblock => &self.superblock,
             FileId::Rows => &self.rows,
+            FileId::RowsOld => &self.rows_old,
         }
     }
 
@@ -180,6 +182,7 @@ impl SimDisk {
         match id {
             FileId::Superblock => &mut self.superblock,
             FileId::Rows => &mut self.rows,
+            FileId::RowsOld => &mut self.rows_old,
         }
     }
 
@@ -214,6 +217,7 @@ impl SimDisk {
     pub fn crash(&mut self, rng: &mut ChaCha8Rng) {
         self.superblock.crash(rng);
         self.rows.crash(rng);
+        self.rows_old.crash(rng);
     }
 
     /// The unsynced-write window, in deterministic order (superblock file
@@ -225,6 +229,7 @@ impl SimDisk {
         for (id, file) in [
             (FileId::Superblock, &self.superblock),
             (FileId::Rows, &self.rows),
+            (FileId::RowsOld, &self.rows_old),
         ] {
             for (offset, data) in &file.unsynced {
                 out.push((id, *offset, data.len()));
@@ -237,10 +242,12 @@ impl SimDisk {
     /// in [`Self::unsynced_writes`] order. This is what makes the crash
     /// space exhaustively enumerable rather than merely sampled.
     pub fn settle_with(&mut self, fates: &[WriteFate]) {
-        let total = self.superblock.unsynced.len() + self.rows.unsynced.len();
+        let total = self.superblock.unsynced.len()
+            + self.rows.unsynced.len()
+            + self.rows_old.unsynced.len();
         assert_eq!(fates.len(), total, "one fate per unsynced write");
         let mut it = fates.iter();
-        for file in [&mut self.superblock, &mut self.rows] {
+        for file in [&mut self.superblock, &mut self.rows, &mut self.rows_old] {
             let pending = std::mem::take(&mut file.unsynced);
             for (offset, data) in pending {
                 SimFile::settle_one(

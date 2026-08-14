@@ -185,7 +185,7 @@ fn deep_rollback_with_surviving_evidence_is_flagged() {
             .iter()
             .map(|&(file, _, _)| match file {
                 dabqlite_core::FileId::Superblock => WriteFate::Drop,
-                dabqlite_core::FileId::Rows => WriteFate::Keep,
+                dabqlite_core::FileId::Rows | dabqlite_core::FileId::RowsOld => WriteFate::Keep,
             })
             .collect();
         disk.settle_with(&fates);

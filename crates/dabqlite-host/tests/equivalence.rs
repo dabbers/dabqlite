@@ -94,11 +94,17 @@ fn same_workload_identical_bytes_on_sim_and_posix() {
         // Byte-for-byte: if these differ, the simulator and reality disagree
         // about the storage contract, and every simulated result is suspect.
         for (file, name) in [
-            (FileId::Superblock, dabqlite_host::posix::SUPERBLOCK_FILE),
-            (FileId::Rows, dabqlite_host::posix::ROWS_FILE),
+            (
+                FileId::Superblock,
+                dabqlite_host::posix::SUPERBLOCK_FILE.to_string(),
+            ),
+            (
+                FileId::Rows,
+                dabqlite_host::posix::rows_file_name(dabqlite_core::SCHEMA_HASH),
+            ),
         ] {
             let sim_bytes = sim.storage.0.contents(file);
-            let real_bytes = std::fs::read(dir.join(name)).expect("read back");
+            let real_bytes = std::fs::read(dir.join(&name)).expect("read back");
             assert_eq!(
                 sim_bytes, real_bytes,
                 "seed={seed}: {name} diverged between simulator and disk"
@@ -188,20 +194,22 @@ fn at_rest_faults_produce_identical_outcomes_on_sim_and_posix() {
         let dir = scratch_dir(&format!("faults-{i}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let name = match file {
-            FileId::Superblock => dabqlite_host::posix::SUPERBLOCK_FILE,
-            FileId::Rows => dabqlite_host::posix::ROWS_FILE,
+            FileId::Superblock => dabqlite_host::posix::SUPERBLOCK_FILE.to_string(),
+            FileId::Rows | FileId::RowsOld => {
+                dabqlite_host::posix::rows_file_name(dabqlite_core::SCHEMA_HASH)
+            }
         };
         for n in [
-            dabqlite_host::posix::SUPERBLOCK_FILE,
-            dabqlite_host::posix::ROWS_FILE,
+            dabqlite_host::posix::SUPERBLOCK_FILE.to_string(),
+            dabqlite_host::posix::rows_file_name(dabqlite_core::SCHEMA_HASH),
         ] {
-            std::fs::copy(master.join(n), dir.join(n)).expect("copy");
+            std::fs::copy(master.join(&n), dir.join(&n)).expect("copy");
         }
         match mask {
             Some(m) => {
-                let mut bytes = std::fs::read(dir.join(name)).expect("read");
+                let mut bytes = std::fs::read(dir.join(&name)).expect("read");
                 bytes[arg as usize] ^= m;
-                std::fs::write(dir.join(name), bytes).expect("write");
+                std::fs::write(dir.join(&name), bytes).expect("write");
             }
             None => {
                 let f = std::fs::OpenOptions::new()

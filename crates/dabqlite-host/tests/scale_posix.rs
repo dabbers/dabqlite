@@ -80,11 +80,17 @@ fn hundred_thousand_rows_on_real_files() {
 
     // Byte-for-byte at volume: 3.2 MB of rows + superblock identical.
     for (file, name) in [
-        (FileId::Superblock, dabqlite_host::posix::SUPERBLOCK_FILE),
-        (FileId::Rows, dabqlite_host::posix::ROWS_FILE),
+        (
+            FileId::Superblock,
+            dabqlite_host::posix::SUPERBLOCK_FILE.to_string(),
+        ),
+        (
+            FileId::Rows,
+            dabqlite_host::posix::rows_file_name(dabqlite_core::SCHEMA_HASH),
+        ),
     ] {
         let sim_bytes = sim.storage.0.contents(file);
-        let real_bytes = std::fs::read(dir.join(name)).expect("read back");
+        let real_bytes = std::fs::read(dir.join(&name)).expect("read back");
         assert_eq!(sim_bytes, real_bytes, "{name} diverged at scale");
     }
 

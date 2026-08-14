@@ -227,7 +227,7 @@ the simulation to real hardware behavior:
 | A **real second OS process** while the database is in active use | spawned-process | same | refused at the door before it can touch data; the refusal harms nothing |
 | Lock holder is **killed** (crashed writer) | spawned-and-killed process | same | the kernel releases `flock` with the process — no stale lock, no recovery step, the lock is crash-safe by construction |
 
-## The schema version gate (safe brick until migration lands, §4.8)
+## The schema version gate (§4.8)
 
 | Scenario | Mode | Suite | Guarantee |
 |---|---|---|---|
@@ -236,6 +236,41 @@ the simulation to real hardware behavior:
 | Repeated confused retries | targeted | same | identical refusal every time, zero cumulative harm |
 | Stray foreign copy in a stale slot (even with a higher generation) | targeted | same | ignored; healthy same-schema copies win |
 | Direction / magnitude of the hash difference | grid | same | any difference refuses, both directions |
+
+With the migration path landed (below), a `SchemaMismatch` naming the v1
+hash is no longer a brick: the host runs the offline migration and
+reopens. Any OTHER hash remains a safe brick — this binary migrates only
+from schemas it carries codecs for.
+
+## The migration path (§4.8, build step 7)
+
+The migration runs inside the NEW binary, offline, under the same
+single-writer lock. It is a second sans-I/O state machine
+(`MigrationEngine`) driven through the identical host protocol, so every
+fault knob in the simulator applies to it unchanged. The protocol: read
+the legacy superblock, read and checksum-verify every legacy row,
+transform through the pure `migrate_row` (totality property-tested over
+the old type's value space: boundary ids × per-byte bit patterns × 10k
+seeded pipelines), write the new rows file completely, fsync it, THEN
+flip the superblock to the new schema hash at generation g+1 — which
+lands in the other slot pair, so the legacy generation's copies are
+never written. Rows files are NAMED by schema hash, so the superblock's
+hash is also the name of the live file; after the flip the legacy file
+is an orphan nothing names — inert by construction (§4.4).
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| The full upgrade path (gate refuses → migrate → clean open) | seeds × sizes (incl. 0 and at-capacity) | `migrate.rs` | every row present, values widened per the append-only policy, ordered index rebuilt correctly |
+| The legacy rows file, under every outcome below | byte pin, everywhere | same | **read, never written** — byte-identical through success, crash, EIO, corrupt-refusal, and retry |
+| Crash at EVERY I/O boundary × settle seeds | exhaustive × seeded | same | **two worlds only**: still-legacy (v1 named, migration re-runs to full success) or fully-migrated (v2 named over complete durable rows). Never mixed, never a third state — verified by a coverage floor that both worlds occur |
+| EIO at every boundary | exhaustive | same | fail-stop with the file named; re-runnable to full success on the same disk |
+| Re-running against an already-migrated file | targeted | same | idempotent: zero writes, byte-identical disk — but NOT zero fsyncs: the found superblock may be page-cache-only from a dead attempt, so the no-op fsyncs before acknowledging (visible-implies-durable, the recovery lesson applied twice) |
+| Corrupt legacy row (any byte) | targeted grid | same | refused loudly naming the checksum; superblock unflipped; a migration never invents data |
+| Legacy superblock names more rows than the legacy file holds | targeted | same | refused as `Corrupt` |
+| Unknown third schema / capacity below legacy data | targeted | same | `SchemaMismatch` with both hashes / `CapacityBelowData` with both numbers |
+| Determinism | replay | same | identical bytes and I/O count on identical input |
+| Real files (POSIX), sim/real equivalence | end-to-end | `migrate_posix.rs` | gate → migrate → open on genuine files and fsyncs; migrated superblock AND rows byte-identical to the simulator's |
+| Harness teeth | planted mutations | checked by hand | skip-rows-fsync dies on the I/O-shape pin; the self-consistent wrong-file-fsync (same I/O count, rows never durable) dies in the crash sweep as a THIRD WORLD at a specific boundary — the deep invariant catches what shape pins cannot |
 
 ## Scale (the extrapolation, checked)
 

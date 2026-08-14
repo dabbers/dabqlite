@@ -6,6 +6,7 @@
 //! operation in a run crashes the process at every I/O boundary
 //! (docs/DESIGN.md §7.3).
 
+use dabqlite_core::migration::MigrationEngine;
 use dabqlite_core::{Capacities, Engine, FileId, Input, Output, VALUE_LEN};
 
 use crate::disk::SimDisk;
@@ -44,6 +45,9 @@ pub enum Misdirect {
 
 pub struct SimHost {
     pub engine: Engine,
+    /// When set, I/O completions drive the migration engine instead of the
+    /// row engine — same disk, same fault model, same crash boundaries.
+    pub migrating: Option<MigrationEngine>,
     pub disk: SimDisk,
     /// I/O operations performed so far (reads, writes, and fsyncs all count).
     pub io_count: u64,
@@ -92,6 +96,7 @@ impl SimHost {
     pub fn new(caps: Capacities, disk: SimDisk, crash_after: Option<u64>) -> Self {
         SimHost {
             engine: Engine::new(caps),
+            migrating: None,
             disk,
             io_count: 0,
             crash_after,
@@ -132,8 +137,23 @@ impl SimHost {
         }
     }
 
+    /// Tick whichever machine is active: the migration engine while a
+    /// migration is in flight, the row engine otherwise. One dispatch
+    /// point, so the fault-injection loop below is shared verbatim.
+    fn tick_machine(&mut self, input: Input<'_>) -> Output {
+        match &mut self.migrating {
+            Some(m) => m.tick(input),
+            None => self.engine.tick(input),
+        }
+    }
+
     fn drive(&mut self, first: Input<'_>) -> Driven {
-        let mut out = self.engine.tick(first);
+        let out = self.tick_machine(first);
+        self.drive_from(out)
+    }
+
+    fn drive_from(&mut self, first_out: Output) -> Driven {
+        let mut out = first_out;
         loop {
             match out {
                 Output::Read { file, offset, len } => {
@@ -142,7 +162,7 @@ impl SimHost {
                     }
                     self.n_reads += 1;
                     if self.this_op_fails() {
-                        out = self.engine.tick(Input::IoFailed { file });
+                        out = self.tick_machine(Input::IoFailed { file });
                         continue;
                     }
                     let idx = self.io_count - 1;
@@ -160,7 +180,7 @@ impl SimHost {
                             self.reads_corrupted += 1;
                         }
                     }
-                    out = self.engine.tick(Input::ReadDone { file, data: &data });
+                    out = self.tick_machine(Input::ReadDone { file, data: &data });
                 }
                 Output::Write { file, offset, data } => {
                     if self.at_crash_boundary() {
@@ -172,7 +192,7 @@ impl SimHost {
                         // dirty: model the worst case (write applied to the
                         // cache, never acknowledged).
                         self.disk.write(file, offset, data.as_slice());
-                        out = self.engine.tick(Input::IoFailed { file });
+                        out = self.tick_machine(Input::IoFailed { file });
                         continue;
                     }
                     match self.this_op_misdirects() {
@@ -185,6 +205,9 @@ impl SimHost {
                             let other = match file {
                                 FileId::Superblock => FileId::Rows,
                                 FileId::Rows => FileId::Superblock,
+                                // A misdirect near the legacy file lands in
+                                // the live rows file: the nastiest target.
+                                FileId::RowsOld => FileId::Rows,
                             };
                             self.disk.write(other, offset, data.as_slice());
                             self.misdirected += 1;
@@ -195,7 +218,7 @@ impl SimHost {
                             self.disk.write(file, offset, data.as_slice());
                         }
                     }
-                    out = self.engine.tick(Input::WriteDone { file });
+                    out = self.tick_machine(Input::WriteDone { file });
                 }
                 Output::Fsync { file } => {
                     if self.at_crash_boundary() {
@@ -203,7 +226,7 @@ impl SimHost {
                     }
                     self.n_fsyncs += 1;
                     if self.this_op_fails() {
-                        out = self.engine.tick(Input::IoFailed { file });
+                        out = self.tick_machine(Input::IoFailed { file });
                         continue;
                     }
                     let idx = self.io_count - 1;
@@ -215,7 +238,7 @@ impl SimHost {
                     } else {
                         self.disk.fsync(file);
                     }
-                    out = self.engine.tick(Input::FsyncDone { file });
+                    out = self.tick_machine(Input::FsyncDone { file });
                 }
                 terminal => return Driven::Done(terminal),
             }
@@ -229,6 +252,24 @@ impl SimHost {
             rows_len: self.disk.len(FileId::Rows),
         };
         self.drive(input)
+    }
+
+    /// Run the offline migration (docs/DESIGN.md §4.8) under the same
+    /// fault model as everything else: every crash/EIO/misdirection knob
+    /// applies to migration I/O exactly as it does to commits. The row
+    /// engine is untouched — after a successful migration, `open()` on a
+    /// fresh host recovers the migrated file.
+    pub fn run_migration(&mut self) -> Driven {
+        assert!(self.migrating.is_none(), "migration already in flight");
+        let mut m = MigrationEngine::new(self.engine.caps());
+        let first = m.start(
+            self.disk.len(FileId::Superblock),
+            self.disk.len(FileId::RowsOld),
+        );
+        self.migrating = Some(m);
+        let driven = self.drive_from(first);
+        self.migrating = None;
+        driven
     }
 
     /// Drive a client input produced by the generated query surface
@@ -256,6 +297,24 @@ impl SimHost {
         match self.run(ClientOp::Get { id }) {
             Driven::Done(Output::GetDone { result: Ok(v), .. }) => v,
             other => panic!("get({id}) did not complete cleanly: {other:?}"),
+        }
+    }
+
+    /// Full paged range scan `lo..=hi`, concatenated: a test convenience
+    /// over the bounded-page protocol (each page is one `Input::Range`).
+    pub fn range_all(&mut self, lo: u64, hi: u64) -> Vec<(u64, [u8; VALUE_LEN])> {
+        let mut out = Vec::new();
+        let mut cursor = lo;
+        loop {
+            let page = match self.run_input(Input::Range { lo: cursor, hi }) {
+                Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+                other => panic!("range_all: {other:?}"),
+            };
+            out.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => cursor = n,
+                None => return out,
+            }
         }
     }
 }

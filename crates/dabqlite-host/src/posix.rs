@@ -12,17 +12,26 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use dabqlite_core::FileId;
+use dabqlite_core::migration::V1_SCHEMA_HASH;
+use dabqlite_core::{FileId, SCHEMA_HASH};
 
 use crate::Storage;
 
 pub const SUPERBLOCK_FILE: &str = "superblock.dabq";
-pub const ROWS_FILE: &str = "rows.dabq";
 pub const LOCK_FILE: &str = "lock.dabq";
+
+/// Rows files are NAMED by the schema hash that wrote them, so the
+/// superblock's stored hash is also the name of the live rows file. After
+/// a migration flips the superblock, the legacy file is an orphan the
+/// manifest no longer names — inert by construction (docs/DESIGN.md §4.4).
+pub fn rows_file_name(schema_hash: u64) -> String {
+    format!("rows-{schema_hash:016x}.dabq")
+}
 
 pub struct PosixStorage {
     superblock: File,
     rows: File,
+    rows_old: File,
     /// The single-writer lock (docs/DESIGN.md §2: "one writer, always").
     /// Held for the storage's lifetime; `flock` is released by the kernel
     /// when the process dies, so a crash can never leave a stale lock —
@@ -62,7 +71,8 @@ impl PosixStorage {
             ));
         }
         let superblock = open(SUPERBLOCK_FILE)?;
-        let rows = open(ROWS_FILE)?;
+        let rows = open(&rows_file_name(SCHEMA_HASH))?;
+        let rows_old = open(&rows_file_name(V1_SCHEMA_HASH))?;
         // Directory fsync: the least portable operation in the design,
         // written once, here (§4.4). macOS needs F_FULLFSYNC for real
         // guarantees — tracked for when that target is wired up.
@@ -70,6 +80,7 @@ impl PosixStorage {
         Ok(PosixStorage {
             superblock,
             rows,
+            rows_old,
             _lock: lock,
         })
     }
@@ -78,6 +89,7 @@ impl PosixStorage {
         match id {
             FileId::Superblock => &self.superblock,
             FileId::Rows => &self.rows,
+            FileId::RowsOld => &self.rows_old,
         }
     }
 }

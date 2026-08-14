@@ -22,6 +22,7 @@
 //! [`Host::last_error`] for diagnostics, and the engine's terminal output
 //! carries `DbError::IoFailed`.
 
+use dabqlite_core::migration::MigrationEngine;
 use dabqlite_core::{Capacities, Engine, FileId, Input, Output};
 
 #[cfg(unix)]
@@ -54,6 +55,9 @@ pub trait Storage {
 /// time, lockstep, exactly as the core's protocol demands.
 pub struct Host<S: Storage> {
     pub engine: Engine,
+    /// When set, I/O completions drive the migration engine instead of
+    /// the row engine (docs/DESIGN.md §4.8).
+    migrating: Option<MigrationEngine>,
     pub storage: S,
     /// The storage error that fail-stopped the engine, if any.
     pub last_error: Option<S::Error>,
@@ -63,6 +67,7 @@ impl<S: Storage> Host<S> {
     pub fn new(caps: Capacities, storage: S) -> Self {
         Host {
             engine: Engine::new(caps),
+            migrating: None,
             storage,
             last_error: None,
         }
@@ -89,34 +94,64 @@ impl<S: Storage> Host<S> {
         self.drive(Input::Get { id })
     }
 
+    /// Run the offline migration (docs/DESIGN.md §4.8): bring a
+    /// legacy-schema file set up to this binary's schema, or no-op if it
+    /// is already current. Call before `open()` when open reports
+    /// `SchemaMismatch`. The single-writer lock is `storage`'s to hold —
+    /// with [`PosixStorage`] it is taken at `open_dir` and covers the
+    /// whole migration.
+    pub fn migrate(&mut self) -> Result<Output, S::Error> {
+        assert!(self.migrating.is_none(), "migration already in flight");
+        let superblock_len = self.storage.len(FileId::Superblock)?;
+        let rows_old_len = self.storage.len(FileId::RowsOld)?;
+        let mut m = MigrationEngine::new(self.engine.caps());
+        let first = m.start(superblock_len, rows_old_len);
+        self.migrating = Some(m);
+        let out = self.drive_from(first);
+        self.migrating = None;
+        Ok(out)
+    }
+
+    fn tick_machine(&mut self, input: Input<'_>) -> Output {
+        match &mut self.migrating {
+            Some(m) => m.tick(input),
+            None => self.engine.tick(input),
+        }
+    }
+
     fn drive(&mut self, first: Input<'_>) -> Output {
-        let mut out = self.engine.tick(first);
+        let out = self.tick_machine(first);
+        self.drive_from(out)
+    }
+
+    fn drive_from(&mut self, first_out: Output) -> Output {
+        let mut out = first_out;
         loop {
             match out {
                 Output::Read { file, offset, len } => {
                     out = match self.storage.read(file, offset, len) {
-                        Ok(data) => self.engine.tick(Input::ReadDone { file, data: &data }),
+                        Ok(data) => self.tick_machine(Input::ReadDone { file, data: &data }),
                         Err(e) => {
                             self.last_error = Some(e);
-                            self.engine.tick(Input::IoFailed { file })
+                            self.tick_machine(Input::IoFailed { file })
                         }
                     };
                 }
                 Output::Write { file, offset, data } => {
                     out = match self.storage.write(file, offset, data.as_slice()) {
-                        Ok(()) => self.engine.tick(Input::WriteDone { file }),
+                        Ok(()) => self.tick_machine(Input::WriteDone { file }),
                         Err(e) => {
                             self.last_error = Some(e);
-                            self.engine.tick(Input::IoFailed { file })
+                            self.tick_machine(Input::IoFailed { file })
                         }
                     };
                 }
                 Output::Fsync { file } => {
                     out = match self.storage.sync(file) {
-                        Ok(()) => self.engine.tick(Input::FsyncDone { file }),
+                        Ok(()) => self.tick_machine(Input::FsyncDone { file }),
                         Err(e) => {
                             self.last_error = Some(e);
-                            self.engine.tick(Input::IoFailed { file })
+                            self.tick_machine(Input::IoFailed { file })
                         }
                     };
                 }
