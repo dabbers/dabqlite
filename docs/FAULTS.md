@@ -190,6 +190,24 @@ functions:
 | Range during in-flight insert I/O | targeted | `query_surface.rs` | `Busy` — v1 serializes, scans never interleave with writes |
 | Rebuilt-at-recovery correctness under EVERY fault schedule | folded into `lifetime.rs` (and thus vopr) | ordered full scan == oracle, in order, after every crash / EIO / recovery-crash cycle (mutation-verified: rebuild-blindness fails 3 suites; a wrong split separator fails 4) |
 
+## ACID (design §5: stated per-target, verified per-letter)
+
+Consolidated in `acid.rs`; most evidence also lives distributed through the
+fault suites. Current scope note: the transaction unit is a single insert —
+there is no multi-operation transaction API yet, so atomicity claims bind
+per-write (and will extend to batches when batches exist, §6).
+
+| Letter | Claim | Verification |
+|---|---|---|
+| **A**tomicity | The superblock generation flip is the sole commit point; writes are all-or-nothing | crash at every boundary × settles: point-get and range observers agree, in-flight rows whole-or-absent; **exactly-once**: crashed-then-retried inserts appear exactly once in a full scan; Full rejections perform zero I/O |
+| **C**onsistency | Schema enforcement + invariants at every observable state | PK uniqueness enforced live (and after churn, without mutation on duplicate attempts); strictly-ascending unique scans; observer count agreement; recovery cross-checks (checksums, duplicate detection, count-vs-file) reject inconsistent disks loudly |
+| **I**solation | Serializable by construction: single writer, all access serialized (v1 recommendation adopted) | every client operation (insert/get/range) refused `Busy` at **every** intermediate I/O stage of a commit; a stage-count assert forces this coverage to grow with the protocol; scans read committed state only |
+| **D**urability | Acknowledged implies durable (native targets: full fsync discipline) | crash-with-adversarial-settle at **every acknowledgment point**: nothing acked is ever lost; recovery fsyncs before serving (visible implies durable); beyond the fault budget, degradation is prefix-consistent and evidence-flagged (see lying-fsync section) |
+
+The browser durability asterisk (§5: OPFS flush is best-effort, detection
+over prevention) becomes applicable when the OPFS backend lands; the
+detection machinery it relies on is already tested.
+
 ## Simulator/reality equivalence (the simulation is not a fiction)
 
 Every fault above is injected against a simulated disk. These tests anchor

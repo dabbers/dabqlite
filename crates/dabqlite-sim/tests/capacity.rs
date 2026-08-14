@@ -363,3 +363,148 @@ fn full_database_serves_every_query_path() {
     };
     assert_eq!((empty.count, empty.next), (0, None));
 }
+
+/// The user-visible reconfiguration matrix: capacity is an OPEN-TIME
+/// argument (§4.2) — the file records row_count, never capacity — so a
+/// database built under one limit must reopen under any other, with exact
+/// behavior at every boundary:
+///
+///   new capacity  > data  -> opens, wall moves to the new capacity
+///   new capacity == data  -> opens, already at the wall
+///   new capacity  < data  -> refused, error names both numbers
+///
+/// ...including shrink-then-grow cycles and crashes under the shrunken
+/// limit.
+#[test]
+fn reopening_under_a_lower_limit_over_live_data() {
+    // Built under a generous limit, lightly occupied.
+    let mut host = SimHost::new(Capacities { rows: 100 }, SimDisk::new(), None);
+    host.open();
+    for id in 0..10 {
+        assert_eq!(insert(&mut host, id), Ok(()));
+    }
+    let disk = std::mem::take(&mut host.disk);
+
+    // Shrink to 12 (data fits): opens, and the wall is now 12 — not 100,
+    // not 10.
+    let mut h12 = SimHost::new(Capacities { rows: 12 }, disk.clone(), None);
+    assert!(matches!(
+        h12.open(),
+        Driven::Done(Output::OpenDone { result: Ok(10) })
+    ));
+    assert_eq!(h12.engine.usage(), (10, 12));
+    for id in 10..12 {
+        assert_eq!(insert(&mut h12, id), Ok(()));
+    }
+    assert_eq!(
+        insert(&mut h12, 12),
+        Err(DbError::Full {
+            entity: "records",
+            capacity: 12
+        })
+    );
+    // Everything readable, ordered scan exact, at the shrunken wall.
+    for id in 0..12 {
+        assert_eq!(h12.get(id), Some(val(id as u8)));
+    }
+    let mut scanned = 0u64;
+    let mut cursor = 0u64;
+    loop {
+        let page = match h12.run_input(Input::Range {
+            lo: cursor,
+            hi: u64::MAX,
+        }) {
+            Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+            other => panic!("{other:?}"),
+        };
+        scanned += page.count as u64;
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    assert_eq!(scanned, 12);
+
+    // Shrink to exactly the data (10): opens already-full.
+    let mut h10 = SimHost::new(Capacities { rows: 10 }, disk.clone(), None);
+    assert!(matches!(
+        h10.open(),
+        Driven::Done(Output::OpenDone { result: Ok(10) })
+    ));
+    assert_eq!(
+        insert(&mut h10, 99),
+        Err(DbError::Full {
+            entity: "records",
+            capacity: 10
+        })
+    );
+
+    // Shrink below the data (9): refused, error names the fix.
+    let mut h9 = SimHost::new(Capacities { rows: 9 }, disk.clone(), None);
+    assert!(matches!(
+        h9.open(),
+        Driven::Done(Output::OpenDone {
+            result: Err(DbError::CapacityBelowData {
+                required: 10,
+                configured: 9
+            })
+        })
+    ));
+
+    // Crash at every boundary of the insert that fills the SHRUNKEN wall:
+    // the N/N+1 property holds under the reconfigured limit too.
+    for boundary in 0..5u64 {
+        let ctx = format!("shrunk-wall boundary={boundary}");
+        let mut h = SimHost::new(Capacities { rows: 11 }, disk.clone(), None);
+        assert!(matches!(
+            h.open(),
+            Driven::Done(Output::OpenDone { result: Ok(10) })
+        ));
+        let crash_at = h.io_count + boundary;
+        h.crash_after = Some(crash_at);
+        assert!(
+            matches!(
+                h.run(ClientOp::Insert {
+                    id: 10,
+                    value: val(10)
+                }),
+                Driven::Crashed
+            ),
+            "[{ctx}]"
+        );
+        let mut d = std::mem::take(&mut h.disk);
+        d.crash(&mut crash_rng(0x5C4A, boundary));
+        let mut rec = SimHost::new(Capacities { rows: 11 }, d, None);
+        let n = match rec.open() {
+            Driven::Done(Output::OpenDone { result: Ok(n) }) => n,
+            other => panic!("[{ctx}] {other:?}"),
+        };
+        assert!(n == 10 || n == 11, "[{ctx}] recovered {n}");
+        if n == 11 {
+            assert_eq!(
+                insert(&mut rec, 10),
+                Err(DbError::DuplicateId { id: 10 }),
+                "[{ctx}]"
+            );
+        } else {
+            assert_eq!(insert(&mut rec, 10), Ok(()), "[{ctx}]");
+        }
+        assert_eq!(
+            insert(&mut rec, 11),
+            Err(DbError::Full {
+                entity: "records",
+                capacity: 11
+            }),
+            "[{ctx}]"
+        );
+    }
+
+    // Grow back after shrinking: runway restored, nothing lost.
+    let mut h200 = SimHost::new(Capacities { rows: 200 }, disk, None);
+    assert!(matches!(
+        h200.open(),
+        Driven::Done(Output::OpenDone { result: Ok(10) })
+    ));
+    assert_eq!(insert(&mut h200, 150), Ok(()));
+    assert_eq!(h200.engine.usage(), (11, 200));
+}
