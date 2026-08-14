@@ -60,6 +60,18 @@ pub struct LifetimeStats {
     pub in_flight_committed: u64,
     pub in_flight_lost: u64,
     pub full_rejections: u64,
+    /// I/O ops performed across every incarnation of this lifetime, for
+    /// simulated-time accounting (docs/FAULTS.md).
+    pub reads: u64,
+    pub writes: u64,
+    pub fsyncs: u64,
+}
+
+/// Fold a dying incarnation's I/O counters into the lifetime totals.
+fn absorb_io(stats: &mut LifetimeStats, host: &SimHost) {
+    stats.reads += host.n_reads;
+    stats.writes += host.n_writes;
+    stats.fsyncs += host.n_fsyncs;
 }
 
 /// Run one full lifetime. Panics (with seed context) on any divergence.
@@ -137,6 +149,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             }
         }
 
+        absorb_io(&mut stats, &host);
         if crashed {
             stats.crashes += 1;
             let mut disk = std::mem::take(&mut host.disk);
@@ -193,6 +206,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             }
         }
     }
+    absorb_io(&mut stats, &host);
     stats
 }
 
@@ -213,6 +227,7 @@ fn recover(
         match host.open() {
             Driven::Crashed => {
                 stats.recovery_crashes += 1;
+                absorb_io(stats, &host);
                 disk = std::mem::take(&mut host.disk);
                 disk.crash(rng);
             }

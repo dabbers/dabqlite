@@ -75,6 +75,12 @@ pub struct SimHost {
     pub lie_fsync_from: Option<u64>,
     /// How many fsyncs lied.
     pub fsyncs_lied: u64,
+    /// Reads performed (for simulated-time accounting).
+    pub n_reads: u64,
+    /// Writes performed.
+    pub n_writes: u64,
+    /// Fsyncs performed (honest or lying — the caller waited either way).
+    pub n_fsyncs: u64,
 }
 
 impl SimHost {
@@ -94,6 +100,9 @@ impl SimHost {
             lie_fsync_at: None,
             lie_fsync_from: None,
             fsyncs_lied: 0,
+            n_reads: 0,
+            n_writes: 0,
+            n_fsyncs: 0,
         }
     }
 
@@ -126,6 +135,7 @@ impl SimHost {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
                     }
+                    self.n_reads += 1;
                     if self.this_op_fails() {
                         out = self.engine.tick(Input::IoFailed { file });
                         continue;
@@ -151,6 +161,7 @@ impl SimHost {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
                     }
+                    self.n_writes += 1;
                     if self.this_op_fails() {
                         // The syscall failed, but the pages may already be
                         // dirty: model the worst case (write applied to the
@@ -185,6 +196,7 @@ impl SimHost {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;
                     }
+                    self.n_fsyncs += 1;
                     if self.this_op_fails() {
                         out = self.engine.tick(Input::IoFailed { file });
                         continue;

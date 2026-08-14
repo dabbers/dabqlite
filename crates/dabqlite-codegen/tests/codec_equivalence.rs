@@ -1,7 +1,6 @@
-//! The generated codec must be bit-for-bit the codec the fault matrix
-//! validated. Every guarantee in docs/FAULTS.md was proven against the
-//! hand-written `dabqlite_core::layout` codec; this suite proves the
-//! generated one is indistinguishable from it:
+//! Two-implementation cross-checking, permanent. The engine runs on the
+//! schema-compiled codec; `dabqlite_core::layout::reference` is the
+//! independent hand-written oracle it is forever measured against:
 //!
 //! - identical encode bytes for random rows,
 //! - identical decode verdicts (accept/reject and decoded values) for both
@@ -9,15 +8,8 @@
 //! - the same full-coverage property: every single-bit flip in a slot is
 //!   detected, no dead bytes.
 
-mod generated {
-    // The generated module is a complete API surface; this test consumes
-    // only the codec portion of it.
-    #![allow(dead_code)]
-    #![allow(clippy::all)]
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/records.rs"));
-}
-
-use dabqlite_core::layout as hand;
+use dabqlite_core::generated::records as generated;
+use dabqlite_core::layout::reference as hand;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
 use generated::{decode_records_row, encode_records_row, RecordsRow, RECORDS_ROW_SIZE};
 

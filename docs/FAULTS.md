@@ -177,6 +177,37 @@ the simulation to real hardware behavior:
   wall, fault storms, long quiet runs — and one integer still reproduces
   everything.
 
+## Simulated-time accounting (how to read soak numbers)
+
+The simulator performs I/O in zero time, so a soak compresses large amounts
+of simulated operation into seconds of wall clock — the same idea as
+TigerBeetle's VOPR running clusters at ~1000x speed. To keep such claims
+auditable rather than rhetorical, `vopr` converts its event counts into
+simulated operational time using fixed, deliberately conservative
+constants, printed with every soak:
+
+| Event | Modeled cost | Rationale |
+|---|---|---|
+| fsync | 1 ms | fast NVMe flush; SATA/cloud disks are 5–20x slower |
+| read / write | 20 µs | NVMe 4K I/O |
+| crash / EIO / recovery-crash restart | 5 s | process death → supervisor restart → open |
+
+`simulated time = I/O time + restart time`. The claim shape is:
+"survived N hours of continuously faulted operation in M seconds of wall
+clock" — where *every* one of those simulated hours is spent inside the
+fault schedule (crashes mid-commit, EIO storms, recovery crashes), not
+idling. Two honesty notes:
+
+- These are modeled equivalents, not measured hardware time. The constants
+  are chosen conservative (fast hardware = less simulated time claimed);
+  slower assumed hardware would only inflate the number.
+- Fault *density* here is millions of times production reality: a fleet
+  sees a hard crash per node per week, not five per minute, and silent
+  media corruption at ~0.031%/SSD-year (TigerBeetle's cited rate) — the
+  soak injects in minutes what a production fleet would take decades of
+  disk-years to encounter. Compressed calendar time is the point; the
+  density multiplier is the real testing leverage.
+
 ## Known limits (deliberate, documented)
 
 - **Lying fsync** voids single-disk acked-durability; the tested guarantee

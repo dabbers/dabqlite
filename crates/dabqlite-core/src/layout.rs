@@ -28,11 +28,21 @@
 //! ```
 
 use crate::crc32::crc32;
+use crate::generated::records;
 
 /// Width of the single value field in the vertical slice.
 pub const VALUE_LEN: usize = 16;
-/// Fixed width of one row slot.
-pub const ROW_SIZE: usize = 32;
+/// Fixed width of one row slot, derived from the compiled schema.
+pub const ROW_SIZE: usize = records::RECORDS_ROW_SIZE;
+
+// The hand-written constants below must agree with the schema-compiled
+// layout; a schema edit that changes any of these fails right here, at
+// compile time, before a single test runs.
+const _: () = assert!(ROW_SIZE == 32);
+const _: () = assert!(records::RECORDS_COL_ID_OFFSET == 0);
+const _: () = assert!(records::RECORDS_COL_VALUE_OFFSET == 8);
+const _: () = assert!(records::RECORDS_CRC_OFFSET == 8 + VALUE_LEN);
+const _: () = assert!(VALUE_LEN == records::RECORDS_CRC_OFFSET - records::RECORDS_COL_VALUE_OFFSET);
 /// Fixed width of one superblock copy.
 pub const SB_COPY_SIZE: usize = 64;
 /// Number of redundant superblock copies (docs/DESIGN.md §4.4). Commits
@@ -48,22 +58,24 @@ pub const SB_MAGIC: [u8; 8] = *b"DABQSB01";
 
 /// Hash of the compiled schema, derived by `dabqlite-codegen` from
 /// `schema/records.sql` (FNV-1a 64 over the canonical schema rendering).
-/// Never edit by hand: the codegen test suite pins this constant against
-/// the schema file, so a schema change that alters layout fails the build
-/// here until this value — and any needed migration — is consciously
-/// updated (docs/DESIGN.md §4.8).
-pub const SCHEMA_HASH: u64 = 0x181F_56C6_632B_C4E3;
+/// A schema change that alters layout changes this value and fails the
+/// codegen pin tests until the migration story is consciously handled
+/// (docs/DESIGN.md §4.8).
+pub const SCHEMA_HASH: u64 = records::RECORDS_SCHEMA_HASH;
 
-/// Encode a row into a 32-byte slot.
+/// Encode a row into its slot. Delegates to the schema-compiled codec; the
+/// hand-written [`reference`] implementation exists as a permanent second
+/// opinion and is asserted equivalent in debug builds and test suites.
 pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
-    out[0..8].copy_from_slice(&id.to_le_bytes());
-    out[8..8 + VALUE_LEN].copy_from_slice(value);
-    let crc = crc32(&out[0..24]);
-    out[24..28].copy_from_slice(&crc.to_le_bytes());
-    out[28..32].fill(0);
-    // Pair assertion (docs/DESIGN.md §7.4): what we encode must decode back
-    // to exactly what we were given.
-    debug_assert!(matches!(decode_row(out), Some((i, v)) if i == id && v == *value));
+    records::encode_records_row(&records::RecordsRow { id, value: *value }, out);
+    // Pair assertion (docs/DESIGN.md §7.4): the independent reference codec
+    // must agree byte-for-byte with the generated one.
+    #[cfg(debug_assertions)]
+    {
+        let mut check = [0u8; ROW_SIZE];
+        reference::encode_row(id, value, &mut check);
+        debug_assert_eq!(*out, check, "generated and reference codecs diverged");
+    }
 }
 
 /// Decode and verify a row slot. Returns `None` if the slot is too short,
@@ -71,19 +83,45 @@ pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
 /// *every* byte of a live slot is covered: a single-bit flip anywhere in a
 /// committed row must be detectable, with no dead zones.
 pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
-    if bytes.len() < ROW_SIZE {
-        return None;
+    let decoded = records::decode_records_row(bytes).map(|row| (row.id, row.value));
+    debug_assert_eq!(
+        decoded,
+        reference::decode_row(bytes),
+        "generated and reference codecs diverged on decode"
+    );
+    decoded
+}
+
+/// The hand-written row codec, kept as an independent oracle for the
+/// schema-compiled one (two implementations, permanently cross-checked:
+/// in debug builds on every call above, and exhaustively in the codegen
+/// equivalence suite). Never wired into the engine directly.
+pub mod reference {
+    use super::{crc32, ROW_SIZE, VALUE_LEN};
+
+    pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
+        out[0..8].copy_from_slice(&id.to_le_bytes());
+        out[8..8 + VALUE_LEN].copy_from_slice(value);
+        let crc = crc32(&out[0..24]);
+        out[24..28].copy_from_slice(&crc.to_le_bytes());
+        out[28..32].fill(0);
     }
-    let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
-    if crc32(&bytes[0..24]) != stored {
-        return None;
+
+    pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
+        if bytes.len() < ROW_SIZE {
+            return None;
+        }
+        let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+        if crc32(&bytes[0..24]) != stored {
+            return None;
+        }
+        if bytes[28..32] != [0u8; 4] {
+            return None;
+        }
+        let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let value: [u8; VALUE_LEN] = bytes[8..8 + VALUE_LEN].try_into().ok()?;
+        Some((id, value))
     }
-    if bytes[28..32] != [0u8; 4] {
-        return None;
-    }
-    let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let value: [u8; VALUE_LEN] = bytes[8..8 + VALUE_LEN].try_into().ok()?;
-    Some((id, value))
 }
 
 /// A decoded, checksum-valid superblock copy.

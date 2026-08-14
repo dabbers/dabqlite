@@ -123,15 +123,16 @@ fn parse_errors_are_loud_and_specific() {
 
 #[test]
 fn golden_generated_file_is_current() {
-    // The checked-in generated file must be exactly what the generator
-    // emits today. CI also regenerates and diffs; this is the local guard.
+    // The checked-in generated file (load-bearing inside dabqlite-core)
+    // must be exactly what the generator emits today. CI also regenerates
+    // and diffs; this is the local guard.
     let schema = parse_schema(&records_sql()).unwrap();
     let emitted = dabqlite_codegen::emit_rust(&schema, "schema/records.sql");
-    let checked_in = include_str!("../generated/records.rs");
+    let checked_in = include_str!("../../dabqlite-core/src/generated/records.rs");
     assert_eq!(
         emitted, checked_in,
-        "generated/records.rs is stale; regenerate with \
+        "generated records.rs is stale; regenerate with \
          `cargo run -p dabqlite-codegen -- schema/records.sql \
-         crates/dabqlite-codegen/generated/records.rs`"
+         crates/dabqlite-core/src/generated/records.rs`"
     );
 }

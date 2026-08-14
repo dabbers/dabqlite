@@ -41,6 +41,7 @@ extern crate std;
 pub mod blob;
 pub mod crc32;
 pub mod engine;
+pub mod generated;
 pub mod layout;
 
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};

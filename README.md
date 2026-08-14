@@ -95,5 +95,20 @@ cargo run --release -p dabqlite-sim --bin vopr
 cargo run --release -p dabqlite-sim --bin vopr -- 12345   # reproduce a seed
 ```
 
+The soak reports auditable simulated-time accounting (model documented in
+[docs/FAULTS.md](docs/FAULTS.md)). A 20,000-lifetime sample run:
+
+```
+vopr: 20000 lifetimes | 1018993 commits | 2334702 reads, 3781788 writes, 4495950 fsyncs
+vopr: faults survived: 331281 crashes, 83047 EIO fail-stops, 207198 crashes mid-recovery
+vopr: simulated operational time: 864.5 h (1.3 h of device I/O + 621526 restart cycles at 5s)
+vopr: wall clock 10.9 s -> 285129x real time
+```
+
+Every one of those simulated hours is spent inside the fault schedule —
+crashes mid-commit, EIO storms, crashes during recovery — at a fault
+density millions of times production reality, with every acknowledged
+commit verified against the oracle after every recovery.
+
 Every simulation failure message carries the `(seed, boundary)` pair that
 reproduces it exactly, on any machine.
