@@ -45,6 +45,8 @@ jobs:
             crates/dabqlite-core/src/generated/records.rs \
             schema/queries.sql \
             crates/dabqlite-core/src/generated/queries.rs
+          cargo run -p dabqlite-codegen -- schema/records_v1.sql \
+            crates/dabqlite-core/src/generated/records_v1.rs
           git diff --exit-code
 
       # Scale suites run in release (the profile keeps debug-assertions on,

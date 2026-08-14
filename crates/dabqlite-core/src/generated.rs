@@ -10,6 +10,14 @@ pub mod records {
     include!("generated/records.rs");
 }
 
+pub mod records_v1 {
+    //! Generated from `schema/records_v1.sql` — the LEGACY schema, kept
+    //! compiled-in because the migration path (docs/DESIGN.md §4.8) runs
+    //! inside the NEW binary: it must read every schema it promises to
+    //! migrate from. Never wired into the engine; only `migration` uses it.
+    include!("generated/records_v1.rs");
+}
+
 pub mod queries {
     //! Generated from `schema/queries.sql`: the complete, finite operation
     //! space (docs/DESIGN.md §4.3). There is deliberately no runtime query
