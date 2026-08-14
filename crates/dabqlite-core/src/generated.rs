@@ -9,3 +9,11 @@ pub mod records {
     //! Generated from `schema/records.sql`.
     include!("generated/records.rs");
 }
+
+pub mod queries {
+    //! Generated from `schema/queries.sql`: the complete, finite operation
+    //! space (docs/DESIGN.md §4.3). There is deliberately no runtime query
+    //! planner — plans are fixed here, at build time, which is what keeps
+    //! the operation space enumerable and exhaustive simulation affordable.
+    include!("generated/queries.rs");
+}

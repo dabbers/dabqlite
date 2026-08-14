@@ -7,10 +7,18 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(schema_path) = args.next() else {
-        eprintln!("usage: dabqlite-codegen <schema.sql> [out.rs]");
+        eprintln!("usage: dabqlite-codegen <schema.sql> [out.rs [<queries.sql> <queries_out.rs>]]");
         return ExitCode::FAILURE;
     };
     let out_path = args.next();
+    let queries_paths = match (args.next(), args.next()) {
+        (Some(q), Some(qo)) => Some((q, qo)),
+        (None, _) => None,
+        (Some(q), None) => {
+            eprintln!("error: queries file {q} given without an output path");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let sql = match std::fs::read_to_string(&schema_path) {
         Ok(s) => s,
@@ -42,6 +50,33 @@ fn main() -> ExitCode {
             }
         }
         None => print!("{code}"),
+    }
+
+    if let Some((queries_path, queries_out)) = queries_paths {
+        let qsql = match std::fs::read_to_string(&queries_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {queries_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let queries = match dabqlite_codegen::parse_queries(&qsql, &schema) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("error: {queries_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let qcode = dabqlite_codegen::emit_queries_rust(&schema, &queries, &queries_path);
+        eprintln!(
+            "queries: {} operations, query_space_hash=0x{:016X}",
+            queries.len(),
+            dabqlite_codegen::query_space_hash(&queries)
+        );
+        if let Err(e) = std::fs::write(&queries_out, &qcode) {
+            eprintln!("error: cannot write {queries_out}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     ExitCode::SUCCESS
 }

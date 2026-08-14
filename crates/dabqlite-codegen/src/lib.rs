@@ -519,3 +519,348 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
 
     o
 }
+
+// ---- declared queries (docs/DESIGN.md §4.3) ------------------------------
+
+/// How a query returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// `:one` — returns at most one row (SELECT by primary key).
+    One,
+    /// `:exec` — returns success/failure only (INSERT).
+    Exec,
+}
+
+/// The validated shape of a query. v1 supports exactly the shapes the
+/// engine implements; anything else is a loud parse error, because an
+/// operation that parses here but has no engine path would be a lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryShape {
+    /// SELECT all columns FROM table WHERE <pk> = $1
+    SelectByPk,
+    /// INSERT INTO table (all columns) VALUES ($1..$n)
+    InsertRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub name: String,
+    pub kind: QueryKind,
+    pub shape: QueryShape,
+}
+
+/// Tokenize a SQL statement: identifiers/keywords, `$n` params, and the
+/// punctuation the v1 shapes need.
+fn sql_tokens(stmt: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    for c in stmt.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+            cur.push(c.to_ascii_lowercase());
+        } else {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            match c {
+                '(' | ')' | ',' | '=' | ';' => tokens.push(c.to_string()),
+                c if c.is_whitespace() => {}
+                other => tokens.push(other.to_string()), // surfaced as an error later
+            }
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Parse and validate the declared-queries file against a schema.
+pub fn parse_queries(sql: &str, schema: &Schema) -> Result<Vec<Query>, ParseError> {
+    let mut queries: Vec<Query> = Vec::new();
+    let mut pending: Option<(usize, String, QueryKind, String)> = None; // (line, name, kind, stmt-so-far)
+
+    for (idx, raw) in sql.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+        if let Some(comment) = line.strip_prefix("--") {
+            let comment = comment.trim();
+            if let Some(rest) = comment.strip_prefix("name:") {
+                if let Some((l, name, ..)) = &pending {
+                    return Err(err(
+                        lineno,
+                        format!("query {name:?} (line {l}) has no terminating ';'"),
+                    ));
+                }
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                let [name, kind] = parts.as_slice() else {
+                    return Err(err(
+                        lineno,
+                        format!("expected '-- name: <ident> :one|:exec', found {comment:?}"),
+                    ));
+                };
+                if !is_ident(name) {
+                    return Err(err(
+                        lineno,
+                        format!("query name {name:?} must be lower_snake_case ascii"),
+                    ));
+                }
+                if queries.iter().any(|q| q.name == *name) {
+                    return Err(err(lineno, format!("duplicate query name {name:?}")));
+                }
+                let kind = match *kind {
+                    ":one" => QueryKind::One,
+                    ":exec" => QueryKind::Exec,
+                    other => {
+                        return Err(err(
+                            lineno,
+                            format!("unknown result kind {other:?}; v1 knows :one and :exec"),
+                        ))
+                    }
+                };
+                pending = Some((lineno, name.to_string(), kind, String::new()));
+            } else if comment.contains("name:") {
+                return Err(err(
+                    lineno,
+                    format!("malformed name annotation: {comment:?} (write '-- name: <ident> :one|:exec')"),
+                ));
+            }
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let Some((decl_line, name, kind, stmt)) = pending.as_mut() else {
+            return Err(err(
+                lineno,
+                format!("statement without a '-- name:' annotation: {line:?}"),
+            ));
+        };
+        stmt.push(' ');
+        stmt.push_str(line);
+        if line.ends_with(';') {
+            let query = validate_query(*decl_line, name, *kind, stmt, schema)?;
+            queries.push(query);
+            pending = None;
+        }
+    }
+    if let Some((l, name, ..)) = pending {
+        return Err(err(l, format!("query {name:?} has no terminating ';'")));
+    }
+    if queries.is_empty() {
+        return Err(err(
+            0,
+            "no queries declared; the operation space may not be empty",
+        ));
+    }
+    Ok(queries)
+}
+
+fn validate_query(
+    line: usize,
+    name: &str,
+    kind: QueryKind,
+    stmt: &str,
+    schema: &Schema,
+) -> Result<Query, ParseError> {
+    let tokens = sql_tokens(stmt);
+    let toks: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let cols: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    let pk = cols[0];
+    let table = schema.table.as_str();
+
+    // Expected token streams for the two supported shapes, built from the
+    // schema so the comparison is exact and the error can say precisely
+    // which token diverged.
+    let mut select_expect: Vec<String> = vec!["select".into()];
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            select_expect.push(",".into());
+        }
+        select_expect.push((*c).into());
+    }
+    select_expect.extend([
+        "from".into(),
+        table.into(),
+        "where".into(),
+        pk.into(),
+        "=".into(),
+        "$1".into(),
+        ";".into(),
+    ]);
+
+    let mut insert_expect: Vec<String> =
+        vec!["insert".into(), "into".into(), table.into(), "(".into()];
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            insert_expect.push(",".into());
+        }
+        insert_expect.push((*c).into());
+    }
+    insert_expect.extend([")".into(), "values".into(), "(".into()]);
+    for i in 0..cols.len() {
+        if i > 0 {
+            insert_expect.push(",".into());
+        }
+        insert_expect.push(format!("${}", i + 1));
+    }
+    insert_expect.extend([")".into(), ";".into()]);
+
+    let matches = |expect: &[String]| {
+        toks.len() == expect.len() && toks.iter().zip(expect).all(|(a, b)| *a == b)
+    };
+
+    let shape = if toks.first() == Some(&"select") {
+        if !matches(&select_expect) {
+            return Err(err(
+                line,
+                format!(
+                    "query {name:?}: v1 SELECT must be exactly \
+                     'SELECT {} FROM {} WHERE {} = $1;' (all columns, schema \
+                     order, primary-key equality); got tokens {toks:?}",
+                    cols.join(", "),
+                    table,
+                    pk
+                ),
+            ));
+        }
+        if kind != QueryKind::One {
+            return Err(err(
+                line,
+                format!("query {name:?}: SELECT by primary key must be ':one'"),
+            ));
+        }
+        QueryShape::SelectByPk
+    } else if toks.first() == Some(&"insert") {
+        if !matches(&insert_expect) {
+            return Err(err(
+                line,
+                format!(
+                    "query {name:?}: v1 INSERT must be exactly \
+                     'INSERT INTO {} ({}) VALUES ({});' (all columns, schema \
+                     order, sequential params); got tokens {toks:?}",
+                    table,
+                    cols.join(", "),
+                    (1..=cols.len())
+                        .map(|i| format!("${i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        if kind != QueryKind::Exec {
+            return Err(err(line, format!("query {name:?}: INSERT must be ':exec'")));
+        }
+        QueryShape::InsertRow
+    } else {
+        return Err(err(
+            line,
+            format!(
+                "query {name:?}: unsupported statement {:?}; the v1 operation \
+                 space is SELECT-by-primary-key and INSERT",
+                toks.first().copied().unwrap_or("<empty>")
+            ),
+        ));
+    };
+
+    Ok(Query {
+        name: name.to_string(),
+        kind,
+        shape,
+    })
+}
+
+/// Hash of the operation space: two binaries agree on what the database
+/// can be asked to do iff these match.
+pub fn query_space_hash(queries: &[Query]) -> u64 {
+    let mut names: Vec<&Query> = queries.iter().collect();
+    names.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut canon = String::from("dabqlite-queries-v1;");
+    for q in names {
+        let kind = match q.kind {
+            QueryKind::One => "one",
+            QueryKind::Exec => "exec",
+        };
+        let shape = match q.shape {
+            QueryShape::SelectByPk => "select_by_pk",
+            QueryShape::InsertRow => "insert_row",
+        };
+        canon.push_str(&format!("{}:{}:{};", q.name, kind, shape));
+    }
+    fnv1a64(canon.as_bytes())
+}
+
+/// Emit the generated operation surface. Lives inside `dabqlite-core`
+/// (references `crate::engine::Input`), so the typed client functions and
+/// the engine can never drift apart without failing to compile.
+pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) -> String {
+    // The engine's v1 client inputs are exactly Insert{id, value} and
+    // Get{id}. Widening the schema requires widening the engine first;
+    // fail here, loudly, rather than emitting code that cannot compile.
+    assert!(
+        schema.columns.len() == 2
+            && schema.columns[0].name == "id"
+            && schema.columns[1].name == "value",
+        "engine v1 supports exactly (id BIGINT PK, value BYTEA): extend \
+         dabqlite-core's Input before widening the schema"
+    );
+    let mut o = String::new();
+    o.push_str(&format!(
+        "// @generated by dabqlite-codegen from {source_name}. DO NOT EDIT.\n\
+         // The complete, finite operation space (docs/DESIGN.md §4.3):\n\
+         // nothing outside this module can ever be asked of the engine.\n\n"
+    ));
+
+    let mut sorted: Vec<&Query> = queries.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    o.push_str("/// Every operation the compiled client surface exposes.\n");
+    o.push_str(&format!(
+        "pub const OPERATIONS: &[&str] = &[{}];\n",
+        sorted
+            .iter()
+            .map(|q| format!("\"{}\"", q.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    o.push_str(&format!(
+        "/// Two binaries agree on the operation space iff these match.\n\
+         pub const QUERY_SPACE_HASH: u64 = 0x{:016X};\n\n",
+        query_space_hash(queries)
+    ));
+
+    for q in queries {
+        match q.shape {
+            QueryShape::InsertRow => {
+                let params: Vec<String> = schema
+                    .columns
+                    .iter()
+                    .map(|c| match c.ty {
+                        ColType::BigInt => format!("{}: u64", c.name),
+                        ColType::FixedBytes(n) => format!("{}: [u8; {n}]", c.name),
+                    })
+                    .collect();
+                o.push_str(&format!(
+                    "/// `-- name: {} :exec` — INSERT one `{}` row. Durably\n\
+                     /// committed when the engine answers `InsertDone {{ result: Ok }}`.\n\
+                     pub fn {}({}) -> crate::engine::Input<'static> {{\n\
+                     \x20   crate::engine::Input::Insert {{ id, value }}\n\
+                     }}\n\n",
+                    q.name,
+                    schema.table,
+                    q.name,
+                    params.join(", ")
+                ));
+            }
+            QueryShape::SelectByPk => {
+                o.push_str(&format!(
+                    "/// `-- name: {} :one` — SELECT one `{}` row by primary key.\n\
+                     /// Answered by `GetDone`; pure in-memory, no I/O requests.\n\
+                     pub fn {}(id: u64) -> crate::engine::Input<'static> {{\n\
+                     \x20   crate::engine::Input::Get {{ id }}\n\
+                     }}\n\n",
+                    q.name, schema.table, q.name
+                ));
+            }
+        }
+    }
+    o
+}

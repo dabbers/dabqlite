@@ -226,6 +226,16 @@ impl SimHost {
         self.drive(input)
     }
 
+    /// Drive a client input produced by the generated query surface
+    /// (`dabqlite_core::generated::queries`) to completion.
+    pub fn run_input(&mut self, input: Input<'static>) -> Driven {
+        assert!(
+            matches!(input, Input::Insert { .. } | Input::Get { .. }),
+            "run_input takes client operations, not I/O completions"
+        );
+        self.drive(input)
+    }
+
     pub fn run(&mut self, op: ClientOp) -> Driven {
         match op {
             ClientOp::Insert { id, value } => self.drive(Input::Insert { id, value }),

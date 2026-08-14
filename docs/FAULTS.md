@@ -147,6 +147,23 @@ bugs in the host and must be loud, not lenient.
 | Client ops mid-I/O (Insert/Get while inserting) | targeted | core tests | `Busy` — v1 serializes everything |
 | Ops before open / after fail-stop | targeted | core tests | `NotOpen` / `IoFailed` |
 
+## The compiled query surface (no runtime planner, by design)
+
+Plans are fixed at build time (design §4.3); the "planner" is the codegen
+shape validator, and the runtime obligation is the full result matrix of
+the compiled operations — exercised exclusively through the generated
+functions:
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Every malformed query shape (wrong table/columns/order/params/kind, non-PK predicates, unsupported verbs, duplicates, unterminated) | rejection grid | `dabqlite-codegen/tests/queries.rs` | loud build-time error naming the exact accepted shape |
+| Empty / present / interleaved results at every fill level | targeted | `query_surface.rs` | exact bytes or honest absence |
+| Error results: NotOpen, DuplicateId, Full, fail-stop IoFailed | targeted | `query_surface.rs` | first-class errors; database unharmed and re-queryable |
+| **Large result (4096 rows) with faults halfway through**: at-rest and in-flight corruption at 1/4, 1/2, 3/4 of the result; EIO mid-result; crash at every recovery boundary | targeted + swept | `query_surface.rs` | detected or fail-stopped, never partial/wrong; clean retry sees every row; zero loss |
+| Generated surface vs raw engine inputs | seeds | `query_surface.rs` | byte-identical disks, identical outputs (mutation-verified: a wrong-key wrapper fails 4 independent tests) |
+| Crash sweep driven purely through compiled operations | exhaustive boundaries × seeds | `query_surface.rs` | N / N+1, same as the raw surface |
+| Operation-space drift | golden + hash + CI regenerate-diff | codegen tests | `OPERATIONS` + `QUERY_SPACE_HASH` pinned; two binaries agree on what can be asked iff hashes match |
+
 ## Simulator/reality equivalence (the simulation is not a fiction)
 
 Every fault above is injected against a simulated disk. These tests anchor

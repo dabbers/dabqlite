@@ -42,7 +42,9 @@ jobs:
       - name: Codegen drift check
         run: |
           cargo run -p dabqlite-codegen -- schema/records.sql \
-            crates/dabqlite-core/src/generated/records.rs
+            crates/dabqlite-core/src/generated/records.rs \
+            schema/queries.sql \
+            crates/dabqlite-core/src/generated/queries.rs
           git diff --exit-code
 
       # A short randomized soak on top of the deterministic sweeps. Any
