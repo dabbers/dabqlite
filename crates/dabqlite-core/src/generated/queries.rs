@@ -3,9 +3,9 @@
 // nothing outside this module can ever be asked of the engine.
 
 /// Every operation the compiled client surface exposes.
-pub const OPERATIONS: &[&str] = &["get_record", "insert_record"];
+pub const OPERATIONS: &[&str] = &["get_record", "insert_record", "list_records"];
 /// Two binaries agree on the operation space iff these match.
-pub const QUERY_SPACE_HASH: u64 = 0xF264F4E26128E03F;
+pub const QUERY_SPACE_HASH: u64 = 0x8516B0E6A0A40175;
 
 /// `-- name: get_record :one` — SELECT one `records` row by primary key.
 /// Answered by `GetDone`; pure in-memory, no I/O requests.
@@ -17,5 +17,12 @@ pub fn get_record(id: u64) -> crate::engine::Input<'static> {
 /// committed when the engine answers `InsertDone { result: Ok }`.
 pub fn insert_record(id: u64, value: [u8; 16]) -> crate::engine::Input<'static> {
     crate::engine::Input::Insert { id, value }
+}
+
+/// `-- name: list_records :many` — range SELECT over `records` by primary key,
+/// `lo..=hi`. Answered by `RangeDone` with one bounded page in
+/// strictly ascending key order; continue with `lo = page.next`.
+pub fn list_records(lo: u64, hi: u64) -> crate::engine::Input<'static> {
+    crate::engine::Input::Range { lo, hi }
 }
 

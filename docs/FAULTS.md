@@ -164,6 +164,18 @@ functions:
 | Crash sweep driven purely through compiled operations | exhaustive boundaries × seeds | `query_surface.rs` | N / N+1, same as the raw surface |
 | Operation-space drift | golden + hash + CI regenerate-diff | codegen tests | `OPERATIONS` + `QUERY_SPACE_HASH` pinned; two binaries agree on what can be asked iff hashes match |
 
+## The ordered index (B+tree) and multi-row results
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Structure vs `BTreeMap` oracle: random inserts × 5 key shapes, continuous range diffs, degenerate ranges | seeded fuzz | `btree_oracle.rs` | exact agreement; deep invariants (ordering, uniform depth, occupancy, leaf chain) checked continuously |
+| **Every insertion order** of small key sets (5040 permutations) | exhaustive | core `btree.rs` tests | identical in-order output, valid structure, always |
+| Node-pool bound (no allocation after init) | adversarial fill + fuzz assert | core + `btree_oracle.rs` | usage stays below the derived N/3 bound |
+| Multi-row range results vs oracle: full-table, empty, inverted, singleton, arbitrary sub-ranges, page-boundary edges | seeded × grids | `query_surface.rs` | exact rows, strictly ascending, bounded pages |
+| **Process restart halfway through a paged result**; writes landing ahead of the cursor between pages | targeted | `query_surface.rs` | continuation completes exactly (cursor is a plain key); committed rows ahead of the cursor appear |
+| Range during in-flight insert I/O | targeted | `query_surface.rs` | `Busy` — v1 serializes, scans never interleave with writes |
+| Rebuilt-at-recovery correctness under EVERY fault schedule | folded into `lifetime.rs` (and thus vopr) | ordered full scan == oracle, in order, after every crash / EIO / recovery-crash cycle (mutation-verified: rebuild-blindness fails 3 suites; a wrong split separator fails 4) |
+
 ## Simulator/reality equivalence (the simulation is not a fiction)
 
 Every fault above is injected against a simulated disk. These tests anchor

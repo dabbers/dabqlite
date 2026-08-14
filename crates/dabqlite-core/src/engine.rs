@@ -34,6 +34,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::btree::BTreeIndex;
 use crate::layout::{
     decode_row, decode_sb, encode_row, encode_sb, SbDecodeError, ROW_SIZE, SB_COPIES, SB_COPY_SIZE,
     SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
@@ -141,6 +142,9 @@ pub enum Input<'a> {
     Insert { id: u64, value: [u8; VALUE_LEN] },
     /// Client: fetch a row by primary key.
     Get { id: u64 },
+    /// Client: range scan by primary key, `lo..=hi`, one bounded page per
+    /// call. Continue by re-issuing with `lo = page.next`.
+    Range { lo: u64, hi: u64 },
 }
 
 /// Exactly one output per input. I/O requests must be completed before the
@@ -169,6 +173,21 @@ pub enum Output {
         id: u64,
         result: Result<Option<[u8; VALUE_LEN]>, DbError>,
     },
+    /// Range page finished (pure in-memory, always immediate).
+    RangeDone { result: Result<RangePage, DbError> },
+}
+
+/// Rows per range page. Results are bounded buffers (docs/DESIGN.md §4.5):
+/// large results are sequences of bounded pages, never unbounded blobs.
+pub const RANGE_PAGE: usize = 8;
+
+/// One bounded page of a range scan, in strictly ascending key order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangePage {
+    pub items: [(u64, [u8; VALUE_LEN]); RANGE_PAGE],
+    pub count: u8,
+    /// `Some(k)`: more rows exist; continue with `lo = k`.
+    pub next: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +262,9 @@ pub struct Engine {
     /// Sized to 2x capacity rounded up to a power of two, so load factor is
     /// bounded by 0.5 and probes provably terminate.
     index: Vec<u64>,
+    /// Ordered primary-key index (B+tree, fixed node pool) backing range
+    /// scans. Derived state: rebuilt from committed rows at every recovery.
+    ordered: BTreeIndex,
     /// Negative-space invariant: the allocations must never move. If either
     /// pointer changes, something allocated after init.
     arena_addr: usize,
@@ -263,6 +285,7 @@ impl Engine {
             .expect("rows capacity overflows index size");
         let arena = vec![0u8; arena_bytes];
         let index = vec![0u64; index_len];
+        let ordered = BTreeIndex::new(caps.rows);
         let arena_addr = arena.as_ptr() as usize;
         let index_addr = index.as_ptr() as usize;
         Engine {
@@ -275,6 +298,7 @@ impl Engine {
             orphan_valid_rows: 0,
             arena,
             index,
+            ordered,
             arena_addr,
             index_addr,
         }
@@ -325,6 +349,19 @@ impl Engine {
             "index moved: allocation after init is forbidden"
         );
         debug_assert!(self.row_count <= self.caps.rows);
+        // The ordered index is derived state over exactly the committed
+        // rows — outside recovery, where it is rebuilt before `row_count`
+        // is published at finish_open.
+        if matches!(
+            self.state,
+            State::Ready
+                | State::InsertWriteRow
+                | State::InsertFsyncRows
+                | State::InsertWriteSb { .. }
+                | State::InsertFsyncSb
+        ) {
+            debug_assert_eq!(self.ordered.len(), self.row_count);
+        }
         // Pending insert exists exactly in the insert-in-flight states.
         let inserting = matches!(
             self.state,
@@ -348,6 +385,7 @@ impl Engine {
             Input::IoFailed { file } => self.on_io_failed(file),
             Input::Insert { id, value } => self.on_insert(id, value),
             Input::Get { id } => self.on_get(id),
+            Input::Range { lo, hi } => self.on_range(lo, hi),
         }
     }
 
@@ -546,6 +584,7 @@ impl Engine {
             }
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
             self.index_insert(id, row);
+            self.ordered.insert(id, row);
         }
         // Rollback-evidence scan: checksum-valid rows beyond the manifest.
         // ONE is the normal artifact of an in-flight, never-acknowledged
@@ -705,6 +744,7 @@ impl Engine {
                 let (id, value) = self.pending.take().expect("pending insert at commit");
                 self.generation += 1;
                 self.index_insert(id, self.row_count);
+                self.ordered.insert(id, self.row_count);
                 self.row_count += 1;
                 self.state = State::Ready;
                 // Pair assertion: the committed row must now be readable.
@@ -776,6 +816,69 @@ impl Engine {
             State::Failed(e) => Err(e),
         };
         Output::GetDone { id, result }
+    }
+
+    fn on_range(&mut self, lo: u64, hi: u64) -> Output {
+        let result = match self.state {
+            State::Ready => Ok(self.scan_page(lo, hi)),
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb => Err(DbError::Busy),
+            State::Failed(e) => Err(e),
+        };
+        Output::RangeDone { result }
+    }
+
+    /// One bounded page of `lo..=hi`, ascending. Reads only committed
+    /// state: the ordered index is updated at the commit point, so an
+    /// in-flight insert is never visible here (serializable, §5).
+    fn scan_page(&self, lo: u64, hi: u64) -> RangePage {
+        let mut page = RangePage {
+            items: [(0, [0; VALUE_LEN]); RANGE_PAGE],
+            count: 0,
+            next: None,
+        };
+        if lo > hi {
+            return page; // inverted bounds: honestly empty, not an error
+        }
+        let mut hits = [(0u64, 0u64); RANGE_PAGE];
+        let mut n = 0usize;
+        let mut next = None;
+        self.ordered.for_each_from(lo, |key, row| {
+            if key > hi {
+                return false;
+            }
+            if n == RANGE_PAGE {
+                next = Some(key);
+                return false;
+            }
+            hits[n] = (key, row);
+            n += 1;
+            true
+        });
+        for (slot, &(key, row)) in page.items.iter_mut().zip(hits.iter().take(n)) {
+            let off = (row as usize) * ROW_SIZE;
+            let (rid, value) =
+                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            // Pair assertion: the ordered index must point at the row it
+            // claims, and pages must be strictly ascending.
+            debug_assert_eq!(rid, key);
+            *slot = (key, value);
+        }
+        for pair in hits[..n].windows(2) {
+            debug_assert!(pair[0].0 < pair[1].0, "range page out of order");
+        }
+        page.count = n as u8;
+        page.next = next;
+        page
     }
 
     fn lookup_value(&self, id: u64) -> Option<[u8; VALUE_LEN]> {

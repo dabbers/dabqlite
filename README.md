@@ -50,6 +50,11 @@ guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
   accounting is exact, a full alloc-then-free cycle leaks zero.
 - **Harness self-checks**: coverage floors on every interesting path, and a
   determinism meta-test (same seed → bit-for-bit identical lifetime).
+- **Ordered index + range queries**: B+tree with a `BTreeMap` oracle
+  (random fuzz plus all 5,040 insertion orders of small sets), paged
+  `:many` range scans checked row-exact against the oracle — including
+  process restarts halfway through a paged result — and the rebuilt tree
+  re-verified in-order after every fault schedule in every lifetime.
 
 Read [docs/DESIGN.md](docs/DESIGN.md) first. The testing strategy is the
 primary objective of the project; the database is the vehicle.

@@ -18,6 +18,11 @@ pub enum ClientOp {
 }
 
 /// Result of driving one client operation to completion.
+///
+/// `Output` is a deliberately flat value type (~a range page wide): the
+/// core's protocol uses bounded buffers, never allocation, so the size
+/// asymmetry with `Crashed` is by design.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Driven {
     /// The operation finished with this terminal output.
@@ -230,7 +235,10 @@ impl SimHost {
     /// (`dabqlite_core::generated::queries`) to completion.
     pub fn run_input(&mut self, input: Input<'static>) -> Driven {
         assert!(
-            matches!(input, Input::Insert { .. } | Input::Get { .. }),
+            matches!(
+                input,
+                Input::Insert { .. } | Input::Get { .. } | Input::Range { .. }
+            ),
             "run_input takes client operations, not I/O completions"
         );
         self.drive(input)

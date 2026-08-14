@@ -39,11 +39,15 @@ extern crate alloc;
 extern crate std;
 
 pub mod blob;
+pub mod btree;
 pub mod crc32;
 pub mod engine;
 pub mod generated;
 pub mod layout;
 
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
-pub use engine::{Capacities, DbError, Engine, FileId, Input, Output, RecoveryReport, WriteBuf};
+pub use engine::{
+    Capacities, DbError, Engine, FileId, Input, Output, RangePage, RecoveryReport, WriteBuf,
+    RANGE_PAGE,
+};
 pub use layout::{ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN};

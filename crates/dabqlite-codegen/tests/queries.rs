@@ -26,7 +26,13 @@ fn queries_sql() -> String {
 #[test]
 fn declared_queries_parse_to_the_expected_operation_space() {
     let queries = parse_queries(&queries_sql(), &schema()).expect("queries parse");
-    assert_eq!(queries.len(), 2);
+    assert_eq!(queries.len(), 3);
+    let list = queries
+        .iter()
+        .find(|q| q.name == "list_records")
+        .expect("list");
+    assert_eq!(list.kind, QueryKind::Many);
+    assert_eq!(list.shape, QueryShape::RangeByPk);
     let get = queries
         .iter()
         .find(|q| q.name == "get_record")
@@ -44,7 +50,7 @@ fn declared_queries_parse_to_the_expected_operation_space() {
     // client surface and this file must agree or the build is lying.
     assert_eq!(
         dabqlite_core::generated::queries::OPERATIONS,
-        &["get_record", "insert_record"]
+        &["get_record", "insert_record", "list_records"]
     );
     assert_eq!(
         query_space_hash(&queries),
@@ -75,6 +81,8 @@ fn query_space_hash_is_sensitive_and_stable() {
     // Formatting, comments, and declaration order do not.
     let reordered = "\
         -- a comment\n\
+        -- name: list_records :many\n\
+        SELECT id,value FROM records WHERE id>=$1 AND id<=$2;\n\n\
         -- name: insert_record :exec\n\
         INSERT   INTO records (id,value)\n\
         VALUES ($1, $2);\n\n\
@@ -97,8 +105,13 @@ fn every_rejection_path_is_loud_and_specific() {
         ),
         // Bad kind.
         (
-            "-- name: q :many\nSELECT id, value FROM records WHERE id = $1;",
+            "-- name: q :zap\nSELECT id, value FROM records WHERE id = $1;",
             "unknown result kind",
+        ),
+        // Point SELECT declared :many.
+        (
+            "-- name: q :many\nSELECT id, value FROM records WHERE id = $1;",
+            "must be ':one'",
         ),
         // Missing kind entirely.
         (
@@ -170,6 +183,26 @@ fn every_rejection_path_is_loud_and_specific() {
         (
             "-- name: q :exec\nUPDATE records SET value = $2 WHERE id = $1;",
             "unsupported statement",
+        ),
+        // Range SELECT must be :many.
+        (
+            "-- name: q :one\nSELECT id, value FROM records WHERE id >= $1 AND id <= $2;",
+            "must be ':many'",
+        ),
+        // Range with inverted bound operators is not a supported shape.
+        (
+            "-- name: q :many\nSELECT id, value FROM records WHERE id <= $1 AND id >= $2;",
+            "must be exactly",
+        ),
+        // Range over a non-PK column would need a secondary index.
+        (
+            "-- name: q :many\nSELECT id, value FROM records WHERE value >= $1 AND value <= $2;",
+            "must be exactly",
+        ),
+        // Half-open range is not a v1 shape.
+        (
+            "-- name: q :many\nSELECT id, value FROM records WHERE id >= $1;",
+            "must be exactly",
         ),
         // Empty operation space.
         ("-- just comments\n", "may not be empty"),

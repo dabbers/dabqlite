@@ -15,8 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use dabqlite_core::generated::queries::{get_record, insert_record, OPERATIONS};
-use dabqlite_core::{Capacities, DbError, FileId, Input, Output, ROW_SIZE, VALUE_LEN};
+use dabqlite_core::generated::queries::{get_record, insert_record, list_records, OPERATIONS};
+use dabqlite_core::{Capacities, DbError, FileId, Input, Output, RangePage, ROW_SIZE, VALUE_LEN};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost};
@@ -38,7 +38,7 @@ fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, Db
 #[test]
 fn operation_space_is_closed_and_maps_to_engine_inputs() {
     // The manifest is the whole surface…
-    assert_eq!(OPERATIONS, &["get_record", "insert_record"]);
+    assert_eq!(OPERATIONS, &["get_record", "insert_record", "list_records"]);
     // …and each operation maps to exactly the engine input it claims.
     assert_eq!(
         insert_record(7, [3; VALUE_LEN]),
@@ -48,6 +48,7 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
         }
     );
     assert_eq!(get_record(7), Input::Get { id: 7 });
+    assert_eq!(list_records(3, 9), Input::Range { lo: 3, hi: 9 });
 }
 
 #[test]
@@ -301,4 +302,165 @@ fn crash_sweep_through_generated_surface_only() {
             }
         }
     }
+}
+
+fn range_page(host: &mut SimHost, lo: u64, hi: u64) -> RangePage {
+    match host.run_input(list_records(lo, hi)) {
+        Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+        other => panic!("list_records({lo},{hi}) failed: {other:?}"),
+    }
+}
+
+/// Full paged scan through the generated surface, asserting strict
+/// ascending order across page boundaries.
+fn scan_all(host: &mut SimHost, lo: u64, hi: u64) -> Vec<(u64, [u8; VALUE_LEN])> {
+    let mut out = Vec::new();
+    let mut cursor = lo;
+    let mut pages = 0u64;
+    loop {
+        pages += 1;
+        assert!(pages <= 1 << 20, "paging did not terminate");
+        let page = range_page(host, cursor, hi);
+        for &(k, v) in &page.items[..page.count as usize] {
+            if let Some(&(pk, _)) = out.last() {
+                assert!(k > pk, "scan not strictly ascending: {pk} then {k}");
+            }
+            assert!(k >= lo && k <= hi, "key {k} outside [{lo},{hi}]");
+            out.push((k, v));
+        }
+        match page.next {
+            Some(n) => cursor = n,
+            None => return out,
+        }
+    }
+}
+
+#[test]
+fn multi_row_result_matrix_against_oracle() {
+    for seed in 0..8u64 {
+        let ops = gen_workload(seed, 40);
+        let caps = Capacities { rows: 64 };
+        let mut host = SimHost::new(caps, SimDisk::new(), None);
+        host.open();
+        let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
+        for &(id, value) in &ops {
+            insert_ok(&mut host, id, value);
+            oracle.insert(id, value);
+        }
+
+        // Full-table scan == oracle, in order.
+        let want: Vec<_> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(scan_all(&mut host, 0, u64::MAX), want, "seed={seed}");
+
+        // Empty results: inverted bounds and vacant ranges.
+        assert_eq!(scan_all(&mut host, 10, 5), vec![], "seed={seed} inverted");
+        let page = range_page(&mut host, 10, 5);
+        assert_eq!((page.count, page.next), (0, None));
+
+        // Narrow results: singleton ranges on and off keys.
+        for (&k, &v) in oracle.iter().take(10) {
+            assert_eq!(scan_all(&mut host, k, k), vec![(k, v)], "seed={seed}");
+        }
+
+        // Arbitrary sub-ranges vs oracle, including bounds landing between
+        // keys and at the extremes.
+        let keys: Vec<u64> = oracle.keys().copied().collect();
+        for i in (0..keys.len()).step_by(5) {
+            for j in (i..keys.len()).step_by(7) {
+                let (lo, hi) = (keys[i].saturating_sub(1), keys[j].saturating_add(1));
+                let want: Vec<_> = oracle.range(lo..=hi).map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(scan_all(&mut host, lo, hi), want, "seed={seed} [{lo},{hi}]");
+            }
+        }
+    }
+}
+
+#[test]
+fn large_paged_scan_with_interruptions_between_pages() {
+    const N: u64 = 4096;
+    let caps = Capacities { rows: N };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    for id in 0..N {
+        insert_ok(&mut host, id, [(id % 251) as u8; VALUE_LEN]);
+    }
+
+    // Large result: the full 4096-row scan is 512 pages, exact and ordered.
+    let all = scan_all(&mut host, 0, u64::MAX);
+    assert_eq!(all.len(), N as usize);
+    assert!(all.iter().enumerate().all(|(i, &(k, _))| k == i as u64));
+
+    // Page-boundary edges: ranges sized exactly at, one under, and one
+    // over the page size, at the start, middle, and end of the table.
+    for base in [0u64, N / 2, N - 9] {
+        for width in [7u64, 8, 9] {
+            let got = scan_all(&mut host, base, base + width - 1);
+            assert_eq!(
+                got.len() as u64,
+                width.min(N - base),
+                "base={base} width={width}"
+            );
+        }
+    }
+
+    // PROCESS RESTART halfway through a paged result: fetch half the
+    // pages, restart (recover), continue from the cursor — the remainder
+    // must be exactly the missing rows. The cursor is a plain key, so it
+    // survives restarts by construction.
+    let mut first_half = Vec::new();
+    let mut cursor = 0u64;
+    for _ in 0..256 {
+        let page = range_page(&mut host, cursor, u64::MAX);
+        first_half.extend_from_slice(&page.items[..page.count as usize]);
+        cursor = page.next.expect("mid-table page must have a continuation");
+    }
+    let disk = std::mem::take(&mut host.disk);
+    let mut restarted = SimHost::new(caps, disk, None);
+    assert!(matches!(
+        restarted.open(),
+        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == N
+    ));
+    let second_half = scan_all(&mut restarted, cursor, u64::MAX);
+    let mut combined = first_half;
+    combined.extend(second_half);
+    assert_eq!(
+        combined.len(),
+        N as usize,
+        "restart mid-scan lost or duplicated rows"
+    );
+    assert!(combined
+        .iter()
+        .enumerate()
+        .all(|(i, &(k, _))| k == i as u64));
+
+    // WRITES BETWEEN PAGES: a row inserted ahead of the cursor appears in
+    // the remainder; the scan is over live committed state per page.
+    let caps2 = Capacities { rows: 32 };
+    let mut h2 = SimHost::new(caps2, SimDisk::new(), None);
+    h2.open();
+    for id in (0..20u64).map(|i| i * 2) {
+        insert_ok(&mut h2, id, [1; VALUE_LEN]);
+    }
+    let page = range_page(&mut h2, 0, u64::MAX);
+    let cursor = page.next.expect("more pages");
+    insert_ok(&mut h2, cursor + 1, [7; VALUE_LEN]); // lands ahead of cursor
+    let rest = scan_all(&mut h2, cursor, u64::MAX);
+    assert!(
+        rest.iter()
+            .any(|&(k, v)| k == cursor + 1 && v == [7; VALUE_LEN]),
+        "row committed ahead of the cursor must appear in the continuation"
+    );
+
+    // BUSY mid-insert: range during in-flight insert I/O is refused, not
+    // interleaved (v1 serializes everything).
+    let mut h3 = SimHost::new(caps2, SimDisk::new(), None);
+    h3.open();
+    let out = h3.engine.tick(insert_record(1, [1; VALUE_LEN]));
+    assert!(matches!(out, Output::Write { .. }));
+    assert!(matches!(
+        h3.engine.tick(list_records(0, 10)),
+        Output::RangeDone {
+            result: Err(DbError::Busy)
+        }
+    ));
 }

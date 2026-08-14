@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use dabqlite_core::{Capacities, Output, VALUE_LEN};
+use dabqlite_core::{Capacities, Input, Output, VALUE_LEN};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -197,6 +197,39 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         // Full-database verification against the oracle, every cycle.
         for (&id, &value) in &oracle {
             assert_eq!(host.get(id), Some(value), "[{ctx}] committed id={id} lost");
+        }
+        // Ordered-scan verification: a full paged range scan must equal the
+        // oracle exactly, in key order — the rebuilt B+tree is checked
+        // against reality after every recovery, under every fault schedule.
+        {
+            let mut cursor = 0u64;
+            let mut scanned = 0u64;
+            let mut oracle_iter = oracle.iter();
+            loop {
+                let page = match host.run_input(Input::Range {
+                    lo: cursor,
+                    hi: u64::MAX,
+                }) {
+                    Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+                    other => panic!("[{ctx}] range scan failed: {other:?}"),
+                };
+                for &(k, v) in &page.items[..page.count as usize] {
+                    let (&ok, &ov) = oracle_iter
+                        .next()
+                        .unwrap_or_else(|| panic!("[{ctx}] scan has extra key {k}"));
+                    assert_eq!((k, v), (ok, ov), "[{ctx}] ordered scan diverged");
+                    scanned += 1;
+                }
+                match page.next {
+                    Some(n) => cursor = n,
+                    None => break,
+                }
+            }
+            assert_eq!(
+                scanned,
+                oracle.len() as u64,
+                "[{ctx}] ordered scan missed rows"
+            );
         }
         // Negative space: ids never inserted must be absent.
         for _ in 0..4 {

@@ -529,6 +529,8 @@ pub enum QueryKind {
     One,
     /// `:exec` — returns success/failure only (INSERT).
     Exec,
+    /// `:many` — returns pages of rows (range SELECT).
+    Many,
 }
 
 /// The validated shape of a query. v1 supports exactly the shapes the
@@ -540,6 +542,8 @@ pub enum QueryShape {
     SelectByPk,
     /// INSERT INTO table (all columns) VALUES ($1..$n)
     InsertRow,
+    /// SELECT all columns FROM table WHERE <pk> >= $1 AND <pk> <= $2
+    RangeByPk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,10 +614,13 @@ pub fn parse_queries(sql: &str, schema: &Schema) -> Result<Vec<Query>, ParseErro
                 let kind = match *kind {
                     ":one" => QueryKind::One,
                     ":exec" => QueryKind::Exec,
+                    ":many" => QueryKind::Many,
                     other => {
                         return Err(err(
                             lineno,
-                            format!("unknown result kind {other:?}; v1 knows :one and :exec"),
+                            format!(
+                                "unknown result kind {other:?}; v1 knows :one, :exec, and :many"
+                            ),
                         ))
                     }
                 };
@@ -705,18 +712,50 @@ fn validate_query(
     }
     insert_expect.extend([")".into(), ";".into()]);
 
+    let mut range_expect: Vec<String> = vec!["select".into()];
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            range_expect.push(",".into());
+        }
+        range_expect.push((*c).into());
+    }
+    range_expect.extend([
+        "from".into(),
+        table.into(),
+        "where".into(),
+        pk.into(),
+        ">".into(),
+        "=".into(),
+        "$1".into(),
+        "and".into(),
+        pk.into(),
+        "<".into(),
+        "=".into(),
+        "$2".into(),
+        ";".into(),
+    ]);
+
     let matches = |expect: &[String]| {
         toks.len() == expect.len() && toks.iter().zip(expect).all(|(a, b)| *a == b)
     };
 
-    let shape = if toks.first() == Some(&"select") {
+    let shape = if toks.first() == Some(&"select") && matches(&range_expect) {
+        if kind != QueryKind::Many {
+            return Err(err(
+                line,
+                format!("query {name:?}: a range SELECT must be ':many'"),
+            ));
+        }
+        QueryShape::RangeByPk
+    } else if toks.first() == Some(&"select") {
         if !matches(&select_expect) {
             return Err(err(
                 line,
                 format!(
                     "query {name:?}: v1 SELECT must be exactly \
                      'SELECT {} FROM {} WHERE {} = $1;' (all columns, schema \
-                     order, primary-key equality); got tokens {toks:?}",
+                     order, primary-key equality), or the ':many' range form with \
+                     'WHERE {{pk}} >= $1 AND {{pk}} <= $2'; got tokens {toks:?}",
                     cols.join(", "),
                     table,
                     pk
@@ -779,10 +818,12 @@ pub fn query_space_hash(queries: &[Query]) -> u64 {
         let kind = match q.kind {
             QueryKind::One => "one",
             QueryKind::Exec => "exec",
+            QueryKind::Many => "many",
         };
         let shape = match q.shape {
             QueryShape::SelectByPk => "select_by_pk",
             QueryShape::InsertRow => "insert_row",
+            QueryShape::RangeByPk => "range_by_pk",
         };
         canon.push_str(&format!("{}:{}:{};", q.name, kind, shape));
     }
@@ -848,6 +889,17 @@ pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) 
                     schema.table,
                     q.name,
                     params.join(", ")
+                ));
+            }
+            QueryShape::RangeByPk => {
+                o.push_str(&format!(
+                    "/// `-- name: {} :many` — range SELECT over `{}` by primary key,\n\
+                     /// `lo..=hi`. Answered by `RangeDone` with one bounded page in\n\
+                     /// strictly ascending key order; continue with `lo = page.next`.\n\
+                     pub fn {}(lo: u64, hi: u64) -> crate::engine::Input<'static> {{\n\
+                     \x20   crate::engine::Input::Range {{ lo, hi }}\n\
+                     }}\n\n",
+                    q.name, schema.table, q.name
                 ));
             }
             QueryShape::SelectByPk => {

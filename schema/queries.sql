@@ -13,3 +13,6 @@ SELECT id, value FROM records WHERE id = $1;
 
 -- name: insert_record :exec
 INSERT INTO records (id, value) VALUES ($1, $2);
+
+-- name: list_records :many
+SELECT id, value FROM records WHERE id >= $1 AND id <= $2;
