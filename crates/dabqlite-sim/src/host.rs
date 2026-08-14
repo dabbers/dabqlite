@@ -48,6 +48,12 @@ pub struct SimHost {
     /// When set, I/O completions drive the migration engine instead of the
     /// row engine — same disk, same fault model, same crash boundaries.
     pub migrating: Option<MigrationEngine>,
+    /// Deadlock injection: from this I/O index on, the machine STOPS
+    /// MAKING PROGRESS — every tick returns the same read request forever,
+    /// modeling a state machine wedged in a request loop (the lockstep
+    /// protocol's analog of a deadlock). The drive loop's fuel watchdog
+    /// must convert this into a loud panic, never a hang.
+    pub stall_from: Option<u64>,
     pub disk: SimDisk,
     /// I/O operations performed so far (reads, writes, and fsyncs all count).
     pub io_count: u64,
@@ -97,6 +103,7 @@ impl SimHost {
         SimHost {
             engine: Engine::new(caps),
             migrating: None,
+            stall_from: None,
             disk,
             io_count: 0,
             crash_after,
@@ -141,6 +148,17 @@ impl SimHost {
     /// migration is in flight, the row engine otherwise. One dispatch
     /// point, so the fault-injection loop below is shared verbatim.
     fn tick_machine(&mut self, input: Input<'_>) -> Output {
+        if let Some(from) = self.stall_from {
+            if self.io_count >= from {
+                // The wedged machine: consumes the input, re-requests the
+                // same read, forever.
+                return Output::Read {
+                    file: FileId::Superblock,
+                    offset: 0,
+                    len: 8,
+                };
+            }
+        }
         match &mut self.migrating {
             Some(m) => m.tick(input),
             None => self.engine.tick(input),
@@ -154,7 +172,20 @@ impl SimHost {
 
     fn drive_from(&mut self, first_out: Output) -> Driven {
         let mut out = first_out;
+        // The deadlock watchdog: every operation terminates within a
+        // statically-known I/O budget (the largest is migration: one write
+        // per row plus a constant tail). A machine that keeps requesting
+        // I/O past the budget has stopped making progress — the lockstep
+        // protocol's deadlock — and hanging the host would hide it. Panic
+        // loudly instead.
+        let fuel = 64 + 8 * self.engine.caps().rows;
+        let mut ticks = 0u64;
         loop {
+            ticks += 1;
+            assert!(
+                ticks <= fuel,
+                "protocol stall (deadlock): {ticks} ticks without a terminal                  output (budget {fuel}) — the machine stopped making progress,                  last request: {out:?}"
+            );
             match out {
                 Output::Read { file, offset, len } => {
                     if self.at_crash_boundary() {

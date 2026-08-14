@@ -279,6 +279,44 @@ is an orphan nothing names — inert by construction (§4.4).
 | **1,000,000 rows** through the full engine (interleaved keys → splits everywhere) | release-mode CI step | `scale.rs` | wall exact and zero-I/O at 1M; full 32 MB recovery re-verifying every checksum; ordered windows at start/middle/end; crash boundaries of the millionth insert: N/N+1 |
 | **100,000 rows on real files** (200k genuine fsyncs) | release-mode CI step | `scale_posix.rs` | byte-identical to the simulator at volume; real recovery + sampled reads exact |
 
+## Deadlock (and its lockstep analog, the protocol stall)
+
+Classic lock-ordering deadlock is **structurally impossible**, and the
+argument is enforced, not asserted:
+
+- The core is a single-threaded sans-I/O state machine: no threads, no
+  mutexes, no channels, no blocking calls. The wasm32 determinism gate
+  makes this a build-time fact — the core is `no_std`, and `std::sync`
+  does not exist to link against.
+- The one OS lock (`flock` in `PosixStorage`) is taken with `LOCK_NB`:
+  it never waits, it refuses instantly with `WouldBlock` (pinned by
+  error kind in `locking.rs`). With no blocking acquisition anywhere,
+  there is no wait-for graph to have a cycle in.
+- The only mutex in the repository is test-only (the locking suite's
+  serialization guard): a single lock, never nested, poison-recovering.
+
+What the lockstep protocol CAN have is the deadlock's analog: a
+**protocol stall** — a machine that keeps emitting I/O requests without
+ever reaching a terminal output (the host drives forever), or a machine
+that silently absorbs an input its peer expects an answer to (the peer
+waits forever). Both defended, both teeth-tested (`deadlock.rs`):
+
+| Scenario | Mode | Guarantee |
+|---|---|---|
+| Wedged machine (re-requests I/O forever) at open, mid-insert, mid-migration | arranged via the sim's `stall_from` knob | the **fuel watchdog** in BOTH drive loops (sim and production POSIX host) panics with "protocol stall (deadlock)" naming the tick count, budget, and last request — never a hang |
+| Wedge at EVERY boundary of an insert | exhaustive | every arranged deadlock is caught; the disk survives intact — a caught stall is recoverable exactly like a crash at the same boundary |
+| Liveness budgets | exact pins | fresh open = 3 I/Os, insert = 5, recovery = 4, get/range/rejections = 0 (cannot even stall), migration = n+6, no-op re-migration = 3. Termination is not "eventually" but "in exactly k steps"; new I/O in any path is a conscious, test-breaking change |
+| Silent absorption (the deadlock seed: an ignored input starves the peer) | targeted | every unexpected `(state, input)` pair panics "protocol violation" — engine AND migration engine, client ops and unrequested completions alike |
+| Watchdog teeth | planted mutation, checked by hand | a real engine wedge (recovery re-requesting the same superblock read forever) died by watchdog panic at tick 193 of a 192 budget in milliseconds — where it previously would have hung the suite until an external timeout |
+
+The fuel budget is `64 + 8 × rows` — generous over the largest legit
+operation (migration writes one row per row) yet finite, so a false
+positive requires being ~8× over the worst real budget. Known limit:
+the core cannot detect a HOST that stops feeding it inputs — the core
+has no clock, by design (§7.1) — so stall detection lives in the
+drivers, and an embedding that abandons its drive loop mid-operation
+owns that outcome (the disk, as always, recovers as from a crash).
+
 ## Harness self-checks (a passing sweep must mean something)
 
 - Coverage floors: crash counts, fail-stop counts, recovery-crash counts,

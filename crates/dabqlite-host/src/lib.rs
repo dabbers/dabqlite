@@ -126,7 +126,20 @@ impl<S: Storage> Host<S> {
 
     fn drive_from(&mut self, first_out: Output) -> Output {
         let mut out = first_out;
+        // Deadlock watchdog, same as the simulator's: every operation has
+        // a bounded I/O budget, so a machine still requesting I/O past it
+        // has wedged. A hung embedder process would hide that; a panic
+        // names it. (The core cannot time out on its own — it has no
+        // clock, by design §7.1 — so stall detection lives here, in the
+        // driver.)
+        let fuel = 64 + 8 * self.engine.caps().rows;
+        let mut ticks = 0u64;
         loop {
+            ticks += 1;
+            assert!(
+                ticks <= fuel,
+                "protocol stall (deadlock): {ticks} ticks without a terminal                  output (budget {fuel}) — last request: {out:?}"
+            );
             match out {
                 Output::Read { file, offset, len } => {
                     out = match self.storage.read(file, offset, len) {

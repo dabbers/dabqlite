@@ -493,6 +493,31 @@ mod tests {
         }
     }
 
+    /// A client operation aimed at a mid-migration machine must panic
+    /// (protocol violation), never be silently absorbed: in a lockstep
+    /// protocol, an ignored input leaves the peer waiting forever — the
+    /// deadlock seed. Loud beats wedged.
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn client_input_during_migration_is_refused_loudly() {
+        let mut m = MigrationEngine::new(Capacities { rows: 8 });
+        let out = m.start(256, 24);
+        assert!(matches!(out, Output::Read { .. }));
+        m.tick(Input::Get { id: 1 });
+    }
+
+    /// Same for a completion the machine never requested.
+    #[test]
+    #[should_panic(expected = "protocol violation")]
+    fn unrequested_completion_during_migration_is_refused_loudly() {
+        let mut m = MigrationEngine::new(Capacities { rows: 8 });
+        let out = m.start(256, 24);
+        assert!(matches!(out, Output::Read { .. }));
+        // The machine asked for a superblock READ; hand it a rows write
+        // completion instead.
+        m.tick(Input::WriteDone { file: FileId::Rows });
+    }
+
     /// Order preservation: migration never reorders or renumbers — the
     /// btree rebuild after migration must see the same key sequence.
     #[test]
