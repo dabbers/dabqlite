@@ -46,10 +46,11 @@ pub mod generated;
 pub mod inspect;
 pub mod layout;
 pub mod migration;
+pub mod trigram;
 
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{
-    Capacities, DbError, Engine, FileId, Input, Output, RangePage, RecoveryReport, WriteBuf,
-    RANGE_PAGE,
+    Capacities, DbError, Engine, FileId, FindPage, Input, Output, RangePage, RecoveryReport,
+    WriteBuf, FIND_PAGE, RANGE_PAGE,
 };
 pub use layout::{ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN};

@@ -309,7 +309,7 @@ impl SimHost {
         assert!(
             matches!(
                 input,
-                Input::Insert { .. } | Input::Get { .. } | Input::Range { .. }
+                Input::Insert { .. } | Input::Get { .. } | Input::Range { .. } | Input::Find { .. }
             ),
             "run_input takes client operations, not I/O completions"
         );
@@ -328,6 +328,31 @@ impl SimHost {
         match self.run(ClientOp::Get { id }) {
             Driven::Done(Output::GetDone { result: Ok(v), .. }) => v,
             other => panic!("get({id}) did not complete cleanly: {other:?}"),
+        }
+    }
+
+    /// Full paged substring search, concatenated: a test convenience over
+    /// the bounded-page protocol (each page is one `Input::Find`).
+    pub fn find_all(&mut self, needle: &[u8]) -> Vec<(u64, [u8; VALUE_LEN])> {
+        assert!(needle.len() <= VALUE_LEN);
+        let mut padded = [0u8; VALUE_LEN];
+        padded[..needle.len()].copy_from_slice(needle);
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match self.run_input(Input::Find {
+                needle: padded,
+                needle_len: needle.len() as u8,
+                after,
+            }) {
+                Driven::Done(Output::FindDone { result: Ok(p) }) => p,
+                other => panic!("find_all: {other:?}"),
+            };
+            out.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => after = Some(n),
+                None => return out,
+            }
         }
     }
 

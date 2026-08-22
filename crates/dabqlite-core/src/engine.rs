@@ -39,6 +39,7 @@ use crate::layout::{
     decode_row, decode_sb, encode_row, encode_sb, SbDecodeError, ROW_SIZE, SB_COPIES, SB_COPY_SIZE,
     SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
+use crate::trigram::TrigramIndex;
 
 /// The declared file set (docs/DESIGN.md §4.4): derived from the schema,
 /// knowable before the program runs. One file per zone.
@@ -152,6 +153,15 @@ pub enum Input<'a> {
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
     /// call. Continue by re-issuing with `lo = page.next`.
     Range { lo: u64, hi: u64 },
+    /// Client: substring search over `value` bytes (trigram-accelerated,
+    /// verification-exact). One bounded page per call, in insertion
+    /// (row) order; continue by re-issuing with `after = page.next`.
+    /// `needle_len` bytes of `needle` are the pattern (<= VALUE_LEN).
+    Find {
+        needle: [u8; VALUE_LEN],
+        needle_len: u8,
+        after: Option<u64>,
+    },
 }
 
 /// Exactly one output per input. I/O requests must be completed before the
@@ -182,6 +192,8 @@ pub enum Output {
     },
     /// Range page finished (pure in-memory, always immediate).
     RangeDone { result: Result<RangePage, DbError> },
+    /// Find page finished (pure in-memory, always immediate).
+    FindDone { result: Result<FindPage, DbError> },
     /// Offline migration finished (docs/DESIGN.md §4.8). `Ok(n)` = the
     /// file now carries this binary's schema with `n` rows — either
     /// migrated just now or found already current (idempotent no-op).
@@ -192,6 +204,22 @@ pub enum Output {
 /// Rows per range page. Results are bounded buffers (docs/DESIGN.md §4.5):
 /// large results are sequences of bounded pages, never unbounded blobs.
 pub const RANGE_PAGE: usize = 8;
+
+/// Rows per find page (bounded buffers, docs/DESIGN.md §4.5).
+pub const FIND_PAGE: usize = 8;
+
+/// One bounded page of a substring search, in ascending INSERTION (row)
+/// order — substring results have no natural key order, and row order is
+/// deterministic and stable. `next` is an opaque continuation cursor: a
+/// full page sets it, and the final continuation may legitimately return
+/// an empty page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub struct FindPage {
+    pub items: [(u64, [u8; VALUE_LEN]); FIND_PAGE],
+    pub count: u8,
+    pub next: Option<u64>,
+}
 
 /// One bounded page of a range scan, in strictly ascending key order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +305,10 @@ pub struct Engine {
     /// Ordered primary-key index (B+tree, fixed node pool) backing range
     /// scans. Derived state: rebuilt from committed rows at every recovery.
     ordered: BTreeIndex,
+    /// Trigram index over `value` bytes (docs/DESIGN.md §4.6): derived
+    /// state like the btree — rebuilt at every recovery, updated at the
+    /// commit point.
+    trigram: TrigramIndex,
     /// Negative-space invariant: the allocations must never move. If either
     /// pointer changes, something allocated after init.
     arena_addr: usize,
@@ -298,6 +330,7 @@ impl Engine {
         let arena = vec![0u8; arena_bytes];
         let index = vec![0u64; index_len];
         let ordered = BTreeIndex::new(caps.rows);
+        let trigram = TrigramIndex::new(caps.rows);
         let arena_addr = arena.as_ptr() as usize;
         let index_addr = index.as_ptr() as usize;
         Engine {
@@ -311,6 +344,7 @@ impl Engine {
             arena,
             index,
             ordered,
+            trigram,
             arena_addr,
             index_addr,
         }
@@ -378,6 +412,7 @@ impl Engine {
                 | State::InsertFsyncSb
         ) {
             debug_assert_eq!(self.ordered.len(), self.row_count);
+            debug_assert_eq!(self.trigram.len(), self.row_count);
         }
         // Pending insert exists exactly in the insert-in-flight states.
         let inserting = matches!(
@@ -403,6 +438,11 @@ impl Engine {
             Input::Insert { id, value } => self.on_insert(id, value),
             Input::Get { id } => self.on_get(id),
             Input::Range { lo, hi } => self.on_range(lo, hi),
+            Input::Find {
+                needle,
+                needle_len,
+                after,
+            } => self.on_find(needle, needle_len, after),
         }
     }
 
@@ -589,7 +629,7 @@ impl Engine {
             let chunk = &data[off..off + ROW_SIZE];
             // Pair assertion (docs/DESIGN.md §7.4): rows were verified when
             // encoded on the write path; verify again reading them back.
-            let Some((id, _value)) = decode_row(chunk) else {
+            let Some((id, value)) = decode_row(chunk) else {
                 return self.fail_open(DbError::Corrupt {
                     what: "committed row failed checksum",
                 });
@@ -602,6 +642,7 @@ impl Engine {
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
             self.index_insert(id, row);
             self.ordered.insert(id, row);
+            self.trigram.insert(row, &value);
         }
         // Rollback-evidence scan: checksum-valid rows beyond the manifest.
         // ONE is the normal artifact of an in-flight, never-acknowledged
@@ -762,6 +803,7 @@ impl Engine {
                 self.generation += 1;
                 self.index_insert(id, self.row_count);
                 self.ordered.insert(id, self.row_count);
+                self.trigram.insert(self.row_count, &value);
                 self.row_count += 1;
                 self.state = State::Ready;
                 // Pair assertion: the committed row must now be readable.
@@ -852,6 +894,60 @@ impl Engine {
             State::Failed(e) => Err(e),
         };
         Output::RangeDone { result }
+    }
+
+    fn on_find(&mut self, needle: [u8; VALUE_LEN], needle_len: u8, after: Option<u64>) -> Output {
+        assert!(
+            (needle_len as usize) <= VALUE_LEN,
+            "needle exceeds the value width"
+        );
+        let result = match self.state {
+            State::Ready => Ok(self.find_page(&needle[..needle_len as usize], after)),
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb => Err(DbError::Busy),
+            State::Failed(e) => Err(e),
+        };
+        Output::FindDone { result }
+    }
+
+    /// One bounded page of rows whose value contains `needle`, ascending
+    /// by row (insertion order). The trigram index only narrows the
+    /// candidates; every returned row is VERIFIED against the arena
+    /// bytes, so results are exact regardless of index state — the index
+    /// can only make this slower, never wrong. Committed state only:
+    /// like the btree, the trigram index is updated at the commit point.
+    fn find_page(&self, needle: &[u8], after: Option<u64>) -> FindPage {
+        let mut rows = [0u64; FIND_PAGE];
+        let n = self.trigram.find_page(needle, after, &mut rows, |row| {
+            let off = (row as usize) * ROW_SIZE;
+            let (_, value) =
+                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
+        });
+        let mut page = FindPage {
+            items: [(0, [0; VALUE_LEN]); FIND_PAGE],
+            count: n as u8,
+            next: None,
+        };
+        for (slot, &row) in page.items.iter_mut().zip(rows.iter().take(n)) {
+            let off = (row as usize) * ROW_SIZE;
+            let (id, value) =
+                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            *slot = (id, value);
+        }
+        if n == FIND_PAGE {
+            page.next = Some(rows[n - 1]);
+        }
+        page
     }
 
     /// One bounded page of `lo..=hi`, ascending. Reads only committed

@@ -190,6 +190,33 @@ functions:
 | Range during in-flight insert I/O | targeted | `query_surface.rs` | `Busy` — v1 serializes, scans never interleave with writes |
 | Rebuilt-at-recovery correctness under EVERY fault schedule | folded into `lifetime.rs` (and thus vopr) | ordered full scan == oracle, in order, after every crash / EIO / recovery-crash cycle (mutation-verified: rebuild-blindness fails 3 suites; a wrong split separator fails 4) |
 
+## The trigram index (§4.6: v1's "one hard one", and why it is trigram)
+
+The design left "vector or trigram" open (§10). **Trigram, decided**: the
+design demands every index be "a small isolated component with a free
+oracle", and trigram's oracle — naive substring match — is EXACT, so
+every test asserts result equality, always. HNSW is approximate by
+construction: its oracle can only bound recall statistically, which no
+zero-tolerance equality bar can absorb. Vector search stays first-class
+via `ExternalRef` (§4.5).
+
+Correctness is layered so the index CANNOT lie: every candidate the
+trigram chains produce is **verified against the actual arena bytes**
+before being returned — the index accelerates, verification decides. An
+arbitrarily corrupted index can only make queries slower, never wrong.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Exact oracle equality | random workloads × needles of EVERY length 0..=16 (prefixes, infixes, suffixes of stored values; seeded noise) | `trigram_find.rs` | results == naive scan, exactly, in insertion order |
+| Rebuilt-at-recovery correctness | crash at every insert boundary × settle seeds | same | the rebuilt index answers over exactly the recovered prefix — all-or-nothing, like every index |
+| Committed state only | targeted | same | a never-committed value is never findable, even with its row sitting in the arena as an orphan |
+| Bounded paging (§4.5) | 24-hit result through 8-row pages | same | pages ascending, continuation exact, fixed memory per page |
+| Zero read-path I/O | pinned | same | find performs no I/O: nothing to fault, nothing to stall |
+| Lifecycle | targeted | same | NotOpen before open, the original error after fail-stop, Busy mid-insert (state machine shared with Range) |
+| Pool bound is arithmetic | unit pins | core `trigram.rs` | postings pool is EXACTLY rows × 14 (slot = row×14+k, a bijection — no allocation bookkeeping to corrupt); table load ≤ 0.5 over worst-case distinct trigrams |
+| Guard teeth | forged corrupt state | same | probe-termination (`!=`, exact) and chain-cycle guards provably fire; duplicate windows ("aaaa…") yield one posting |
+| Harness teeth | planted mutations, checked by hand | — | skip-rebuild-at-recovery dies on the `trigram.len == row_count` tripwire in 2 suites; trust-the-index-blindly (verification removed) dies on oracle equality |
+
 ## ACID (design §5: stated per-target, verified per-letter)
 
 Consolidated in `acid.rs`; most evidence also lives distributed through the
