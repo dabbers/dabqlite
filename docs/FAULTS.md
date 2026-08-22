@@ -216,6 +216,8 @@ arbitrarily corrupted index can only make queries slower, never wrong.
 | Pool bound is arithmetic | unit pins | core `trigram.rs` | postings pool is EXACTLY rows × 14 (slot = row×14+k, a bijection — no allocation bookkeeping to corrupt); table load ≤ 0.5 over worst-case distinct trigrams |
 | Guard teeth | forged corrupt state | same | probe-termination (`!=`, exact) and chain-cycle guards provably fire; duplicate windows ("aaaa…") yield one posting |
 | Harness teeth | planted mutations, checked by hand | — | skip-rebuild-at-recovery dies on the `trigram.len == row_count` tripwire in 2 suites; trust-the-index-blindly (verification removed) dies on oracle equality |
+| The compiled surface (`:find`) | codegen tests + wrapper pins | `queries.rs` (codegen), `query_surface.rs` | `WHERE value LIKE $1` compiles ONLY against a column annotated `@index(trigram)` — the finite operation space contains only operations the declared indexes can serve; wrong kinds and un-annotated LIKE are refused by name |
+| Index annotations vs the version gate | hash pin | codegen `schema.rs` | `@index(trigram)` does NOT change `SCHEMA_HASH`: indexes are derived state, so declaring one never bricks existing files or forces a migration — pinned by test |
 
 ## ACID (design §5: stated per-target, verified per-letter)
 

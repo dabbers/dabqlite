@@ -15,7 +15,9 @@
 
 use std::collections::BTreeMap;
 
-use dabqlite_core::generated::queries::{get_record, insert_record, list_records, OPERATIONS};
+use dabqlite_core::generated::queries::{
+    find_records, get_record, insert_record, list_records, OPERATIONS,
+};
 use dabqlite_core::{Capacities, DbError, FileId, Input, Output, RangePage, ROW_SIZE, VALUE_LEN};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
@@ -38,7 +40,15 @@ fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, Db
 #[test]
 fn operation_space_is_closed_and_maps_to_engine_inputs() {
     // The manifest is the whole surface…
-    assert_eq!(OPERATIONS, &["get_record", "insert_record", "list_records"]);
+    assert_eq!(
+        OPERATIONS,
+        &[
+            "find_records",
+            "get_record",
+            "insert_record",
+            "list_records"
+        ]
+    );
     // …and each operation maps to exactly the engine input it claims.
     assert_eq!(
         insert_record(7, [3; VALUE_LEN]),
@@ -49,6 +59,31 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
     );
     assert_eq!(get_record(7), Input::Get { id: 7 });
     assert_eq!(list_records(3, 9), Input::Range { lo: 3, hi: 9 });
+    // The find wrapper pads and measures the needle itself.
+    let mut padded = [0u8; VALUE_LEN];
+    padded[..5].copy_from_slice(b"hello");
+    assert_eq!(
+        find_records(b"hello", Some(4)),
+        Input::Find {
+            needle: padded,
+            needle_len: 5,
+            after: Some(4),
+        }
+    );
+    assert_eq!(
+        find_records(b"", None),
+        Input::Find {
+            needle: [0u8; VALUE_LEN],
+            needle_len: 0,
+            after: None,
+        }
+    );
+}
+
+#[test]
+#[should_panic(expected = "needle exceeds the value width")]
+fn generated_find_wrapper_refuses_oversized_needles() {
+    find_records(&[0u8; VALUE_LEN + 1], None);
 }
 
 #[test]

@@ -3,9 +3,9 @@
 // nothing outside this module can ever be asked of the engine.
 
 /// Every operation the compiled client surface exposes.
-pub const OPERATIONS: &[&str] = &["get_record", "insert_record", "list_records"];
+pub const OPERATIONS: &[&str] = &["find_records", "get_record", "insert_record", "list_records"];
 /// Two binaries agree on the operation space iff these match.
-pub const QUERY_SPACE_HASH: u64 = 0x8516B0E6A0A40175;
+pub const QUERY_SPACE_HASH: u64 = 0x5B30A2E6B405FFCC;
 
 /// `-- name: get_record :one` — SELECT one `records` row by primary key.
 /// Answered by `GetDone`; pure in-memory, no I/O requests.
@@ -24,5 +24,20 @@ pub fn insert_record(id: u64, value: [u8; 16]) -> crate::engine::Input<'static> 
 /// strictly ascending key order; continue with `lo = page.next`.
 pub fn list_records(lo: u64, hi: u64) -> crate::engine::Input<'static> {
     crate::engine::Input::Range { lo, hi }
+}
+
+/// `-- name: find_records :find` — substring SELECT over `records.value` bytes
+/// (trigram-accelerated, verification-exact). Answered by `FindDone`
+/// with one bounded page in insertion order; continue with
+/// `after = page.next`. Panics if the needle exceeds the value width.
+pub fn find_records(needle: &[u8], after: Option<u64>) -> crate::engine::Input<'static> {
+    assert!(needle.len() <= 16, "needle exceeds the value width");
+    let mut padded = [0u8; 16];
+    padded[..needle.len()].copy_from_slice(needle);
+    crate::engine::Input::Find {
+        needle: padded,
+        needle_len: needle.len() as u8,
+        after,
+    }
 }
 

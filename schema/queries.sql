@@ -16,3 +16,8 @@ INSERT INTO records (id, value) VALUES ($1, $2);
 
 -- name: list_records :many
 SELECT id, value FROM records WHERE id >= $1 AND id <= $2;
+
+-- name: find_records :find
+-- Substring search over value bytes: trigram-accelerated, verification-
+-- exact, pages in insertion order (docs/DESIGN.md 4.6).
+SELECT id, value FROM records WHERE value LIKE $1;

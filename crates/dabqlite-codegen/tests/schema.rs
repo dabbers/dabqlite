@@ -136,3 +136,42 @@ fn golden_generated_file_is_current() {
          crates/dabqlite-core/src/generated/records.rs`"
     );
 }
+
+#[test]
+fn index_annotations_shape_operations_not_layout() {
+    // The load-bearing property: @index(trigram) must NOT change the
+    // schema hash. Indexes are derived state — adding one must never
+    // brick existing files behind the version gate or force a migration.
+    let plain = "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY,\n \
+                 value BYTEA NOT NULL -- @fixed(16)\n);";
+    let indexed = "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY,\n \
+                   value BYTEA NOT NULL -- @fixed(16) @index(trigram)\n);";
+    let plain = parse_schema(plain).unwrap();
+    let indexed = parse_schema(indexed).unwrap();
+    assert_eq!(plain.schema_hash(), indexed.schema_hash());
+    assert!(!plain.columns[1].trigram);
+    assert!(indexed.columns[1].trigram);
+}
+
+#[test]
+fn index_annotation_rejections_are_loud() {
+    for (sql, msg) in [
+        (
+            "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY -- @index(trigram)\n);",
+            "applies to BYTEA",
+        ),
+        (
+            "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY,\n \
+             value BYTEA NOT NULL -- @fixed(16) @index(hnsw)\n);",
+            "not a v1 index method",
+        ),
+        (
+            "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY,\n \
+             value BYTEA NOT NULL -- @fixed(16) @index(trigram\n);",
+            "missing its closing",
+        ),
+    ] {
+        let e = parse_schema(sql).expect_err(sql);
+        assert!(e.msg.contains(msg), "{sql:?}: {e}");
+    }
+}

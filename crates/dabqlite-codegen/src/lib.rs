@@ -38,6 +38,11 @@ pub struct Column {
     pub name: String,
     pub ty: ColType,
     pub primary_key: bool,
+    /// `-- @index(trigram)`: substring search over this column's bytes
+    /// (docs/DESIGN.md §4.6). Index annotations shape the OPERATION
+    /// space, not the layout: they are deliberately excluded from
+    /// `schema_hash`, so adding an index never forces a migration.
+    pub trigram: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,14 +169,20 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
             .next()
             .ok_or_else(|| err(lineno, format!("column {name:?} is missing a type")))?;
 
-        // Annotation, if any.
-        let fixed = parse_fixed_annotation(comment, lineno)?;
+        // Annotations, if any.
+        let (fixed, trigram) = parse_annotations(comment, lineno)?;
 
         let ty = if ty_token.eq_ignore_ascii_case("bigint") {
             if fixed.is_some() {
                 return Err(err(
                     lineno,
                     format!("column {name:?}: @fixed(n) applies to BYTEA, not BIGINT"),
+                ));
+            }
+            if trigram {
+                return Err(err(
+                    lineno,
+                    format!("column {name:?}: @index(trigram) applies to BYTEA, not BIGINT"),
                 ));
             }
             ColType::BigInt
@@ -243,6 +254,7 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
             name: name.to_string(),
             ty,
             primary_key,
+            trigram,
         });
     }
 
@@ -281,25 +293,48 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
     Ok(Schema { table, columns })
 }
 
-fn parse_fixed_annotation(comment: &str, lineno: usize) -> Result<Option<u32>, ParseError> {
-    let Some(pos) = comment.find("@fixed(") else {
-        if comment.contains('@') {
+/// Parse column annotations from the trailing comment: `@fixed(n)` and
+/// `@index(trigram)`. Any other `@…` is refused by name — an annotation
+/// that silently parses as nothing is a schema author's silent data bug.
+fn parse_annotations(comment: &str, lineno: usize) -> Result<(Option<u32>, bool), ParseError> {
+    let mut fixed = None;
+    let mut trigram = false;
+    for (pos, _) in comment.match_indices('@') {
+        let at = &comment[pos..];
+        if let Some(rest) = at.strip_prefix("@fixed(") {
+            let Some(end) = rest.find(')') else {
+                return Err(err(lineno, "@fixed( is missing its closing ')'"));
+            };
+            let n = rest[..end]
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| err(lineno, format!("@fixed({}) is not a number", &rest[..end])))?;
+            fixed = Some(n);
+        } else if let Some(rest) = at.strip_prefix("@index(") {
+            let Some(end) = rest.find(')') else {
+                return Err(err(lineno, "@index( is missing its closing ')'"));
+            };
+            match rest[..end].trim() {
+                "trigram" => trigram = true,
+                other => {
+                    return Err(err(
+                        lineno,
+                        format!(
+                            "@index({other}) is not a v1 index method; v1 ships                              @index(trigram) (docs/DESIGN.md §4.6)"
+                        ),
+                    ))
+                }
+            }
+        } else {
             return Err(err(
                 lineno,
-                format!("unrecognized annotation in comment {comment:?}; v1 knows @fixed(n)"),
+                format!(
+                    "unrecognized annotation in comment {comment:?}; v1 knows                      @fixed(n) and @index(trigram)"
+                ),
             ));
         }
-        return Ok(None);
-    };
-    let rest = &comment[pos + "@fixed(".len()..];
-    let Some(end) = rest.find(')') else {
-        return Err(err(lineno, "@fixed( is missing its closing ')'"));
-    };
-    rest[..end]
-        .trim()
-        .parse::<u32>()
-        .map(Some)
-        .map_err(|_| err(lineno, format!("@fixed({}) is not a number", &rest[..end])))
+    }
+    Ok((fixed, trigram))
 }
 
 impl Schema {
@@ -643,6 +678,9 @@ pub enum QueryKind {
     Exec,
     /// `:many` — returns pages of rows (range SELECT).
     Many,
+    /// `:find` — returns pages of rows (substring SELECT via a trigram
+    /// index, verification-exact).
+    Find,
 }
 
 /// The validated shape of a query. v1 supports exactly the shapes the
@@ -656,6 +694,8 @@ pub enum QueryShape {
     InsertRow,
     /// SELECT all columns FROM table WHERE <pk> >= $1 AND <pk> <= $2
     RangeByPk,
+    /// SELECT all columns FROM table WHERE <trigram col> LIKE $1
+    FindBySubstring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,11 +767,12 @@ pub fn parse_queries(sql: &str, schema: &Schema) -> Result<Vec<Query>, ParseErro
                     ":one" => QueryKind::One,
                     ":exec" => QueryKind::Exec,
                     ":many" => QueryKind::Many,
+                    ":find" => QueryKind::Find,
                     other => {
                         return Err(err(
                             lineno,
                             format!(
-                                "unknown result kind {other:?}; v1 knows :one, :exec, and :many"
+                                "unknown result kind {other:?}; v1 knows :one, :exec,                                  :many, and :find"
                             ),
                         ))
                     }
@@ -847,11 +888,50 @@ fn validate_query(
         ";".into(),
     ]);
 
+    // LIKE targets the (single, v1) trigram-annotated column, if any.
+    let trigram_col = schema.columns.iter().find(|c| c.trigram);
+    let find_expect: Option<Vec<String>> = trigram_col.map(|tc| {
+        let mut e: Vec<String> = vec!["select".into()];
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                e.push(",".into());
+            }
+            e.push((*c).into());
+        }
+        e.extend([
+            "from".into(),
+            table.into(),
+            "where".into(),
+            tc.name.clone(),
+            "like".into(),
+            "$1".into(),
+            ";".into(),
+        ]);
+        e
+    });
+
     let matches = |expect: &[String]| {
         toks.len() == expect.len() && toks.iter().zip(expect).all(|(a, b)| *a == b)
     };
 
-    let shape = if toks.first() == Some(&"select") && matches(&range_expect) {
+    let shape = if toks.first() == Some(&"select")
+        && find_expect.as_deref().is_some_and(&matches)
+    {
+        if kind != QueryKind::Find {
+            return Err(err(
+                line,
+                format!("query {name:?}: a LIKE SELECT must be ':find'"),
+            ));
+        }
+        QueryShape::FindBySubstring
+    } else if toks.first() == Some(&"select") && toks.contains(&"like") && find_expect.is_none() {
+        return Err(err(
+            line,
+            format!(
+                "query {name:?}: LIKE requires a trigram-indexed column —                  annotate it '-- @index(trigram)' in the schema (docs/DESIGN.md §4.6)"
+            ),
+        ));
+    } else if toks.first() == Some(&"select") && matches(&range_expect) {
         if kind != QueryKind::Many {
             return Err(err(
                 line,
@@ -931,11 +1011,13 @@ pub fn query_space_hash(queries: &[Query]) -> u64 {
             QueryKind::One => "one",
             QueryKind::Exec => "exec",
             QueryKind::Many => "many",
+            QueryKind::Find => "find",
         };
         let shape = match q.shape {
             QueryShape::SelectByPk => "select_by_pk",
             QueryShape::InsertRow => "insert_row",
             QueryShape::RangeByPk => "range_by_pk",
+            QueryShape::FindBySubstring => "find_by_substring",
         };
         canon.push_str(&format!("{}:{}:{};", q.name, kind, shape));
     }
@@ -1012,6 +1094,34 @@ pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) 
                      \x20   crate::engine::Input::Range {{ lo, hi }}\n\
                      }}\n\n",
                     q.name, schema.table, q.name
+                ));
+            }
+            QueryShape::FindBySubstring => {
+                let tc = schema
+                    .columns
+                    .iter()
+                    .find(|c| c.trigram)
+                    .expect("parse_queries enforced a trigram column");
+                let width = match tc.ty {
+                    ColType::FixedBytes(n) => n as usize,
+                    ColType::BigInt => unreachable!("trigram is BYTEA-only"),
+                };
+                o.push_str(&format!(
+                    "/// `-- name: {} :find` — substring SELECT over `{}.{}` bytes\n\
+                     /// (trigram-accelerated, verification-exact). Answered by `FindDone`\n\
+                     /// with one bounded page in insertion order; continue with\n\
+                     /// `after = page.next`. Panics if the needle exceeds the value width.\n\
+                     pub fn {}(needle: &[u8], after: Option<u64>) -> crate::engine::Input<'static> {{\n\
+                     \x20   assert!(needle.len() <= {width}, \"needle exceeds the value width\");\n\
+                     \x20   let mut padded = [0u8; {width}];\n\
+                     \x20   padded[..needle.len()].copy_from_slice(needle);\n\
+                     \x20   crate::engine::Input::Find {{\n\
+                     \x20       needle: padded,\n\
+                     \x20       needle_len: needle.len() as u8,\n\
+                     \x20       after,\n\
+                     \x20   }}\n\
+                     }}\n\n",
+                    q.name, schema.table, tc.name, q.name
                 ));
             }
             QueryShape::SelectByPk => {

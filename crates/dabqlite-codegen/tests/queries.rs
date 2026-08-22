@@ -26,7 +26,7 @@ fn queries_sql() -> String {
 #[test]
 fn declared_queries_parse_to_the_expected_operation_space() {
     let queries = parse_queries(&queries_sql(), &schema()).expect("queries parse");
-    assert_eq!(queries.len(), 3);
+    assert_eq!(queries.len(), 4);
     let list = queries
         .iter()
         .find(|q| q.name == "list_records")
@@ -45,12 +45,23 @@ fn declared_queries_parse_to_the_expected_operation_space() {
         .expect("insert");
     assert_eq!(ins.kind, QueryKind::Exec);
     assert_eq!(ins.shape, QueryShape::InsertRow);
+    let find = queries
+        .iter()
+        .find(|q| q.name == "find_records")
+        .expect("find");
+    assert_eq!(find.kind, QueryKind::Find);
+    assert_eq!(find.shape, QueryShape::FindBySubstring);
 
     // Pin the generated constants against the live core: the compiled
     // client surface and this file must agree or the build is lying.
     assert_eq!(
         dabqlite_core::generated::queries::OPERATIONS,
-        &["get_record", "insert_record", "list_records"]
+        &[
+            "find_records",
+            "get_record",
+            "insert_record",
+            "list_records"
+        ]
     );
     assert_eq!(
         query_space_hash(&queries),
@@ -81,6 +92,8 @@ fn query_space_hash_is_sensitive_and_stable() {
     // Formatting, comments, and declaration order do not.
     let reordered = "\
         -- a comment\n\
+        -- name: find_records :find\n\
+        SELECT id,value FROM records WHERE value LIKE $1;\n\n\
         -- name: list_records :many\n\
         SELECT id,value FROM records WHERE id>=$1 AND id<=$2;\n\n\
         -- name: insert_record :exec\n\
@@ -194,6 +207,22 @@ fn every_rejection_path_is_loud_and_specific() {
             "-- name: q :many\nSELECT id, value FROM records WHERE id <= $1 AND id >= $2;",
             "must be exactly",
         ),
+        // A LIKE SELECT must be declared :find.
+        (
+            "-- name: q :many\nSELECT id, value FROM records WHERE value LIKE $1;",
+            "must be ':find'",
+        ),
+        // :find with a non-LIKE shape is refused (falls into the strict
+        // point-SELECT shape check).
+        (
+            "-- name: q :find\nSELECT id, value FROM records WHERE id = $1;",
+            "must be ':one'",
+        ),
+        // LIKE over the primary key: not the annotated column's shape.
+        (
+            "-- name: q :find\nSELECT id, value FROM records WHERE id LIKE $1;",
+            "must be exactly",
+        ),
         // Range over a non-PK column would need a secondary index.
         (
             "-- name: q :many\nSELECT id, value FROM records WHERE value >= $1 AND value <= $2;",
@@ -231,4 +260,22 @@ fn golden_generated_queries_file_is_current() {
          crates/dabqlite-core/src/generated/records.rs schema/queries.sql \
          crates/dabqlite-core/src/generated/queries.rs`"
     );
+}
+
+#[test]
+fn like_without_a_trigram_annotation_is_refused() {
+    // The annotation is load-bearing: without @index(trigram) in the
+    // schema, a LIKE query does not compile — the finite operation space
+    // only contains operations the declared indexes can serve.
+    let plain = parse_schema(
+        "CREATE TABLE records (\n id BIGINT NOT NULL PRIMARY KEY,\n \
+         value BYTEA NOT NULL -- @fixed(16)\n);",
+    )
+    .unwrap();
+    let e = parse_queries(
+        "-- name: q :find\nSELECT id, value FROM records WHERE value LIKE $1;",
+        &plain,
+    )
+    .expect_err("must refuse");
+    assert!(e.msg.contains("@index(trigram)"), "{e}");
 }

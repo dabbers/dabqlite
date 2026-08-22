@@ -12,5 +12,5 @@
 
 CREATE TABLE records (
     id    BIGINT NOT NULL PRIMARY KEY,
-    value BYTEA  NOT NULL -- @fixed(16)
+    value BYTEA  NOT NULL -- @fixed(16) @index(trigram)
 );
