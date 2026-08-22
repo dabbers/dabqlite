@@ -34,6 +34,71 @@ fn lifetimes_survive_repeated_crashes() {
 }
 
 #[test]
+fn every_cycle_verifies_the_whole_feature_surface() {
+    // The lifetime is the "everything in one pass" harness: every cycle
+    // must run substring-search oracle checks AND inspector agreements,
+    // or the soak's coverage claim is hollow. Floors, not hopes.
+    let cfg = LifetimeConfig::default();
+    let mut find_checks = 0;
+    let mut inspections = 0;
+    let mut cycles = 0;
+    for seed in 0..16u64 {
+        let stats = run_lifetime(seed, &cfg);
+        find_checks += stats.find_checks;
+        inspections += stats.inspections;
+        cycles += stats.cycles as u64;
+    }
+    assert_eq!(
+        inspections, cycles,
+        "inspector agreement must run EVERY cycle"
+    );
+    assert!(
+        find_checks >= cycles * 3,
+        "only {find_checks} substring checks across {cycles} cycles"
+    );
+}
+
+#[test]
+fn legacy_lifetimes_migrate_under_fire_and_then_live_normally() {
+    // A lifetime that BEGINS as a v1 database: migrated under the fault
+    // schedule (crash/EIO retries until the two-worlds protocol
+    // converges), then lives through the usual crash cycles with the
+    // migrated rows folded into every oracle check.
+    let cfg = LifetimeConfig {
+        legacy_rows_max: 24,
+        ..LifetimeConfig::default()
+    };
+    let mut migrations = 0;
+    let mut attempts = 0;
+    for seed in 0..24u64 {
+        let stats = run_lifetime(seed, &cfg);
+        migrations += stats.migrations;
+        attempts += stats.migration_attempts;
+    }
+    assert_eq!(migrations, 24, "every legacy lifetime must converge");
+    assert!(
+        attempts > migrations + 10,
+        "only {attempts} attempts for {migrations} migrations; \
+         the faulted-migration retry path is under-exercised"
+    );
+}
+
+#[test]
+fn legacy_lifetimes_are_deterministic_too() {
+    let cfg = LifetimeConfig {
+        legacy_rows_max: 16,
+        ..LifetimeConfig::default()
+    };
+    for seed in 0..6u64 {
+        assert_eq!(
+            run_lifetime(seed, &cfg),
+            run_lifetime(seed, &cfg),
+            "seed={seed} legacy lifetime diverged"
+        );
+    }
+}
+
+#[test]
 fn same_seed_same_lifetime_bit_for_bit() {
     // The seed is the only input (docs/DESIGN.md §7.2). If two runs of one
     // seed diverge, some nondeterminism leaked into the simulator and every

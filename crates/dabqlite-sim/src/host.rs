@@ -295,6 +295,7 @@ impl SimHost {
         let mut m = MigrationEngine::new(self.engine.caps());
         let first = m.start(
             self.disk.len(FileId::Superblock),
+            self.disk.len(FileId::Rows),
             self.disk.len(FileId::RowsOld),
         );
         self.migrating = Some(m);

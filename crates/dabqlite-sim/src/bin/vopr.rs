@@ -40,6 +40,10 @@ struct Totals {
     crashes: u64,
     io_failures: u64,
     recovery_crashes: u64,
+    find_checks: u64,
+    inspections: u64,
+    migrations: u64,
+    migration_attempts: u64,
 }
 
 impl Totals {
@@ -52,6 +56,10 @@ impl Totals {
         self.crashes += s.crashes;
         self.io_failures += s.io_failures;
         self.recovery_crashes += s.recovery_crashes;
+        self.find_checks += s.find_checks;
+        self.inspections += s.inspections;
+        self.migrations += s.migrations;
+        self.migration_attempts += s.migration_attempts;
     }
 
     fn report(&self, wall_secs: f64) {
@@ -66,6 +74,11 @@ impl Totals {
         println!(
             "vopr: faults survived: {} crashes, {} EIO fail-stops, {} crashes mid-recovery",
             self.crashes, self.io_failures, self.recovery_crashes
+        );
+        println!(
+            "vopr: full surface: {} migrations ({} attempts under faults), \
+             {} substring-search oracle checks, {} inspector agreements",
+            self.migrations, self.migration_attempts, self.find_checks, self.inspections
         );
         println!(
             "vopr: simulated operational time: {:.1} h ({:.1} h of device I/O + {} restart cycles at {}s)",
@@ -92,12 +105,20 @@ fn config_for(seed: u64) -> LifetimeConfig {
     let rows = *[4u64, 16, 64, 256, 1024]
         .get(rng.gen_range(0..5))
         .expect("in range");
+    // A quarter of all lifetimes begin as legacy v1 databases and migrate
+    // under the fault schedule before their first open.
+    let legacy_rows_max = if rng.gen_bool(0.25) {
+        rng.gen_range(1..=rows.min(64))
+    } else {
+        0
+    };
     LifetimeConfig {
         cycles: rng.gen_range(8..=96),
         max_inserts_per_cycle: rng.gen_range(1..=12),
         caps: Capacities { rows },
         recovery_crash_p: rng.gen_range(0.0..0.4),
         io_fail_p: rng.gen_range(0.0..0.4),
+        legacy_rows_max,
     }
 }
 

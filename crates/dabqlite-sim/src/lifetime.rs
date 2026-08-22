@@ -11,15 +11,26 @@
 //! Everything derives from the single `u64` seed. A failure panics with the
 //! seed and cycle in the message; rerunning with that seed reproduces it
 //! bit-for-bit (docs/DESIGN.md §7.2).
+//!
+//! The lifetime covers the ENTIRE feature surface, so one soak pass
+//! exercises everything the database can do: lifetimes may START as a
+//! legacy v1 database and migrate under the same fault schedule
+//! (crash/EIO retries until the two-worlds protocol converges); every
+//! cycle verifies point gets, the full ordered scan, substring search
+//! against the insertion-order oracle, negative space, AND the
+//! inspector's independent verdict against the engine's recovery report.
 
 use std::collections::BTreeMap;
 
-use dabqlite_core::{Capacities, Input, Output, VALUE_LEN};
+use dabqlite_core::inspect::{inspect, Verdict};
+use dabqlite_core::migration::V1_VALUE_LEN;
+use dabqlite_core::{Capacities, DbError, FileId, Input, Output, VALUE_LEN};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::disk::SimDisk;
 use crate::host::{ClientOp, Driven, SimHost};
+use crate::workload::build_v1_disk;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LifetimeConfig {
@@ -34,6 +45,10 @@ pub struct LifetimeConfig {
     /// Probability that a cycle ends in an I/O *failure* (fail-stop, dirty
     /// page cache carries into the restart) instead of a machine crash.
     pub io_fail_p: f64,
+    /// Start this lifetime as a LEGACY v1 database with up to this many
+    /// rows, and migrate it — under the fault schedule — before the first
+    /// open. 0 = start fresh (the classic lifetime).
+    pub legacy_rows_max: u64,
 }
 
 impl Default for LifetimeConfig {
@@ -44,6 +59,7 @@ impl Default for LifetimeConfig {
             caps: Capacities { rows: 64 },
             recovery_crash_p: 0.25,
             io_fail_p: 0.2,
+            legacy_rows_max: 0,
         }
     }
 }
@@ -60,6 +76,15 @@ pub struct LifetimeStats {
     pub in_flight_committed: u64,
     pub in_flight_lost: u64,
     pub full_rejections: u64,
+    /// Substring-search verifications performed (each one an exact
+    /// oracle-equality assertion over the whole database).
+    pub find_checks: u64,
+    /// Inspector-agreement verifications performed.
+    pub inspections: u64,
+    /// Successful legacy→current migrations (0 or 1 per lifetime).
+    pub migrations: u64,
+    /// Migration attempts, including ones ended by crash or EIO.
+    pub migration_attempts: u64,
     /// I/O ops performed across every incarnation of this lifetime, for
     /// simulated-time accounting (docs/FAULTS.md).
     pub reads: u64,
@@ -79,14 +104,83 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut stats = LifetimeStats::default();
 
-    // The oracle: everything certainly committed (§7.2 technique 3).
+    // The oracle: everything certainly committed (§7.2 technique 3),
+    // plus the same facts in INSERTION order — the substring index answers
+    // in row order, so the log is its exact oracle.
     let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
+    let mut log: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
 
-    // Clean first open.
-    let mut host = SimHost::new(cfg.caps, SimDisk::new(), None);
+    // Some lifetimes begin as a LEGACY v1 database: migrate it first,
+    // under the same fault schedule as everything else. The two-worlds
+    // protocol means every failed attempt leaves either the untouched
+    // legacy world (retry) or the completed migration (idempotent no-op
+    // on retry) — the loop converges because attempts eventually run
+    // fault-free.
+    let mut disk = SimDisk::new();
+    if cfg.legacy_rows_max > 0 {
+        let n = rng.gen_range(1..=cfg.legacy_rows_max.min(cfg.caps.rows));
+        let (legacy_disk, v1_ops) = build_v1_disk(&mut rng, n);
+        disk = legacy_disk;
+        let legacy_bytes = disk.contents(FileId::RowsOld);
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            stats.migration_attempts += 1;
+            let mut host = SimHost::new(cfg.caps, disk, None);
+            // Fault the early attempts; guarantee convergence by running
+            // later attempts clean.
+            if attempts < 8 && rng.gen_bool(0.6) {
+                let delta = rng.gen_range(0..n + 8);
+                if rng.gen_bool(cfg.io_fail_p) {
+                    host.fail_after = Some(delta);
+                } else {
+                    host.crash_after = Some(delta);
+                }
+            }
+            match host.run_migration() {
+                Driven::Done(Output::MigrateDone { result: Ok(rows) }) => {
+                    assert_eq!(rows, n, "[seed={seed}] migration row count");
+                    absorb_io(&mut stats, &host);
+                    disk = std::mem::take(&mut host.disk);
+                    stats.migrations += 1;
+                    break;
+                }
+                Driven::Done(Output::MigrateDone {
+                    result: Err(DbError::IoFailed { .. }),
+                }) => {
+                    // Fail-stop; the dirty page cache carries into the
+                    // retry, exactly like an EIO'd insert.
+                    absorb_io(&mut stats, &host);
+                    disk = std::mem::take(&mut host.disk);
+                }
+                Driven::Crashed => {
+                    absorb_io(&mut stats, &host);
+                    disk = std::mem::take(&mut host.disk);
+                    disk.crash(&mut rng);
+                }
+                other => panic!("[seed={seed}] migration attempt {attempts}: {other:?}"),
+            }
+            // The legacy file is read, never written — through every
+            // failed attempt, byte-identical.
+            assert_eq!(
+                disk.contents(FileId::RowsOld),
+                legacy_bytes,
+                "[seed={seed}] migration touched the legacy file"
+            );
+        }
+        for &(id, v1) in &v1_ops {
+            let mut value = [0u8; VALUE_LEN];
+            value[..V1_VALUE_LEN].copy_from_slice(&v1);
+            oracle.insert(id, value);
+            log.push((id, value));
+        }
+    }
+
+    // First open: fresh init, or recovery of the freshly-migrated file.
+    let mut host = SimHost::new(cfg.caps, disk, None);
     match host.open() {
-        Driven::Done(Output::OpenDone { result: Ok(0) }) => {}
-        other => panic!("[seed={seed}] fresh open failed: {other:?}"),
+        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == oracle.len() as u64 => {}
+        other => panic!("[seed={seed}] first open failed: {other:?}"),
     }
 
     for cycle in 0..cfg.cycles {
@@ -117,6 +211,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             match host.run(ClientOp::Insert { id, value }) {
                 Driven::Done(Output::InsertDone { result: Ok(()), .. }) => {
                     oracle.insert(id, value);
+                    log.push((id, value));
                     stats.commits += 1;
                 }
                 Driven::Done(Output::InsertDone {
@@ -182,6 +277,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 "[{ctx}] in-flight insert committed but corrupted"
             );
             oracle.insert(id, value);
+            log.push((id, value));
             stats.in_flight_committed += 1;
         } else {
             assert_eq!(
@@ -238,6 +334,62 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 assert_eq!(host.get(absent), None, "[{ctx}] phantom row id={absent}");
             }
         }
+        // Substring-search verification: the rebuilt trigram index against
+        // the insertion-order log — a guaranteed-hit trigram and a full
+        // value from a random committed row, seeded noise, and (some
+        // cycles) the match-everything empty needle.
+        {
+            debug_assert_eq!(log.len(), oracle.len(), "[{ctx}] log/oracle drift");
+            let mut needles: Vec<Vec<u8>> = Vec::new();
+            if !log.is_empty() {
+                let (_, v) = log[rng.gen_range(0..log.len())];
+                let off = rng.gen_range(0..=VALUE_LEN - 3);
+                needles.push(v[off..off + 3].to_vec());
+                needles.push(v.to_vec());
+            }
+            let mut noise = vec![0u8; rng.gen_range(3..=4)];
+            rng.fill_bytes(&mut noise);
+            needles.push(noise);
+            if cycle % 4 == 0 {
+                needles.push(Vec::new());
+            }
+            for needle in &needles {
+                let want: Vec<(u64, [u8; VALUE_LEN])> = log
+                    .iter()
+                    .filter(|(_, v)| {
+                        needle.is_empty() || v.windows(needle.len()).any(|w| w == &needle[..])
+                    })
+                    .copied()
+                    .collect();
+                assert_eq!(
+                    host.find_all(needle),
+                    want,
+                    "[{ctx}] substring search diverged for {needle:?}"
+                );
+                stats.find_checks += 1;
+            }
+        }
+        // Inspector agreement: the independent second implementation of
+        // the recovery rules must reach the engine's exact conclusion
+        // about this disk, every cycle, under every fault schedule.
+        {
+            let report = inspect(
+                &host.disk.contents(FileId::Superblock),
+                &host.disk.contents(FileId::Rows),
+            );
+            let (used, _) = host.engine.usage();
+            assert!(
+                matches!(report.verdict, Verdict::Recovers { rows } if rows == used),
+                "[{ctx}] inspector verdict diverged: {:?} vs {used} rows",
+                report.verdict
+            );
+            let rr = host.engine.recovery_report();
+            assert_eq!(
+                report.rollback_evidence, rr.rollback_evidence,
+                "[{ctx}] inspector rollback-evidence diverged"
+            );
+            stats.inspections += 1;
+        }
     }
     absorb_io(&mut stats, &host);
     stats
@@ -255,7 +407,7 @@ fn recover(
 ) -> SimHost {
     if rng.gen_bool(cfg.recovery_crash_p) {
         // Crash during the recovery itself, then settle and try again.
-        let boundary = rng.gen_range(0..4);
+        let boundary = rng.gen_range(0..6); // recovery is 6 ops incl. repair writes
         let mut host = SimHost::new(cfg.caps, disk, Some(boundary));
         match host.open() {
             Driven::Crashed => {

@@ -249,6 +249,31 @@ enum State {
     /// Serving it without fsyncing would mean a later power loss erases
     /// rows that this incarnation already showed the application.
     RecoverFsyncRows { generation: u64, row_count: u64 },
+    /// Recovery: REPAIR write in flight — recovery rewrites the chosen
+    /// generation's INVALID twin slot before the final fsync, restoring
+    /// the two-copy redundancy invariant no matter how the generation was
+    /// found (a single surviving copy after a torn commit, a
+    /// media-faulted twin, a cache-only copy after an EIO'd commit).
+    /// Without repair, a generation recovered from one copy runs with NO
+    /// redundancy and a single later in-budget fault silently drops it —
+    /// found by the full-surface storm (seed 2: torn commit kept one
+    /// copy, visible-implies-durable acked it, one transient read fault
+    /// later rolled it back).
+    ///
+    /// ONLY the invalid twin is ever written — never the valid copy the
+    /// generation was recovered FROM. Rewriting a valid copy in place
+    /// would break the protocol's golden rule (never overwrite the only
+    /// copy of the truth): a crash DURING recovery could tear the repair
+    /// write over the sole good copy and lose the generation — the storm
+    /// found that too (seed 16, against an earlier rewrite-both repair).
+    /// Torn this way, a repair write can only damage a slot that was
+    /// already dead: strictly monotone.
+    RecoverRepairSb {
+        generation: u64,
+        row_count: u64,
+        /// The pair-relative index (0 or 1) of the twin being repaired.
+        copy: u8,
+    },
     /// Recovery: superblock fsync in flight (see `RecoverFsyncRows`).
     RecoverFsyncSb { generation: u64, row_count: u64 },
     /// Open and idle.
@@ -296,6 +321,10 @@ pub struct Engine {
     opened_rows_len: u64,
     /// Checksum-valid rows found beyond the manifest during recovery.
     orphan_valid_rows: u64,
+    /// Recovery scratch: the chosen generation's twin slot needs repair
+    /// (pair-relative copy index). Set while reading the superblock,
+    /// consumed when staging the recovery fsyncs.
+    pending_repair: Option<u8>,
     /// Row-slot arena: one allocation at init, never grown (§4.2).
     arena: Vec<u8>,
     /// Open-addressing primary-key index: slot -> row index + 1 (0 = empty).
@@ -341,6 +370,7 @@ impl Engine {
             pending: None,
             opened_rows_len: 0,
             orphan_valid_rows: 0,
+            pending_repair: None,
             arena,
             index,
             ordered,
@@ -546,6 +576,27 @@ impl Engine {
             }
         }
 
+        // Twin-repair decision, made from THIS read: for the chosen
+        // generation's home pair, any slot that does not already hold a
+        // canonical copy of exactly (generation, row_count) gets rewritten
+        // before the recovery fsync — but the slot the generation was
+        // recovered FROM is valid by construction and is NEVER touched.
+        self.pending_repair = None;
+        if let Some((_, chosen)) = best {
+            let slots = Self::sb_slots_for(chosen.generation);
+            for (pair_idx, &slot) in slots.iter().enumerate() {
+                let healthy = data
+                    .get(slot as usize * SB_COPY_SIZE..(slot as usize + 1) * SB_COPY_SIZE)
+                    .and_then(|chunk| decode_sb(chunk).ok())
+                    .is_some_and(|c| {
+                        c.generation == chosen.generation && c.row_count == chosen.row_count
+                    });
+                if !healthy {
+                    self.pending_repair = Some(pair_idx as u8);
+                }
+            }
+        }
+
         let Some((_slot, copy)) = best else {
             if let Some(file_schema) = schema_mismatch {
                 return self.fail_open(DbError::SchemaMismatch {
@@ -689,6 +740,7 @@ impl Engine {
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
@@ -745,6 +797,22 @@ impl Engine {
                     file: FileId::Superblock,
                 }
             }
+            (
+                State::RecoverRepairSb {
+                    generation,
+                    row_count,
+                    ..
+                },
+                FileId::Superblock,
+            ) => {
+                self.state = State::RecoverFsyncSb {
+                    generation,
+                    row_count,
+                };
+                Output::Fsync {
+                    file: FileId::Superblock,
+                }
+            }
             (State::InsertWriteRow, FileId::Rows) => {
                 self.state = State::InsertFsyncRows;
                 Output::Fsync { file: FileId::Rows }
@@ -775,12 +843,24 @@ impl Engine {
                 },
                 FileId::Rows,
             ) => {
-                self.state = State::RecoverFsyncSb {
-                    generation,
-                    row_count,
-                };
-                Output::Fsync {
-                    file: FileId::Superblock,
+                // Rows durable. If the chosen generation's twin slot is
+                // not healthy, repair it (see `State::RecoverRepairSb`)
+                // before the final fsync; otherwise fsync directly.
+                if let Some(copy) = self.pending_repair.take() {
+                    self.state = State::RecoverRepairSb {
+                        generation,
+                        row_count,
+                        copy,
+                    };
+                    Self::sb_copy_write(generation, row_count, copy)
+                } else {
+                    self.state = State::RecoverFsyncSb {
+                        generation,
+                        row_count,
+                    };
+                    Output::Fsync {
+                        file: FileId::Superblock,
+                    }
                 }
             }
             (
@@ -831,7 +911,7 @@ impl Engine {
                 FileId::Superblock
             }
             State::RecoverReadRows { .. } | State::RecoverFsyncRows { .. } => FileId::Rows,
-            State::RecoverFsyncSb { .. } => FileId::Superblock,
+            State::RecoverRepairSb { .. } | State::RecoverFsyncSb { .. } => FileId::Superblock,
             State::InsertWriteRow | State::InsertFsyncRows => FileId::Rows,
             State::InsertWriteSb { .. } | State::InsertFsyncSb => FileId::Superblock,
             state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
@@ -867,6 +947,7 @@ impl Engine {
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
@@ -886,6 +967,7 @@ impl Engine {
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows
@@ -909,6 +991,7 @@ impl Engine {
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
             | State::InsertFsyncRows

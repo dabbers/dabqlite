@@ -171,11 +171,14 @@ fn every_operation_terminates_in_exactly_its_budget() {
     });
     assert_eq!(host.io_count - before, 0, "read-path budget");
 
-    // Recovery: read sb, read rows, fsync rows, fsync sb.
+    // Recovery of a HEALTHY disk: read sb, read rows, fsync rows,
+    // fsync sb — no repair write, because both copies of the live
+    // generation already verify. (A single-copy recovery costs exactly
+    // one more: the invalid twin's repair write — pinned in faults.rs.)
     let disk = std::mem::take(&mut host.disk);
     let mut host = SimHost::new(CAPS, disk, None);
     host.open();
-    assert_eq!(host.io_count, 4, "recovery budget");
+    assert_eq!(host.io_count, 4, "healthy recovery budget");
 
     // Rejections: zero I/O (pinned deeper in capacity.rs; asserted here
     // because zero I/O means zero opportunity to stall).
@@ -193,11 +196,13 @@ fn every_operation_terminates_in_exactly_its_budget() {
     host.run_migration();
     assert_eq!(host.io_count, n + 6, "migration budget");
 
-    // Idempotent re-migration: 1 read + 2 durability fsyncs.
+    // Idempotent re-migration: read sb, read + VERIFY the current rows
+    // (never taken on faith — a lying-fsync residue would otherwise be
+    // acknowledged), then 2 durability fsyncs.
     let disk = std::mem::take(&mut host.disk);
     let mut host = SimHost::new(CAPS, disk, None);
     host.run_migration();
-    assert_eq!(host.io_count, 3, "noop migration budget");
+    assert_eq!(host.io_count, 4, "noop migration budget");
 }
 
 // ---- 3. The OS lock cannot deadlock: it never waits --------------------

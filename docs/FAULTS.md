@@ -110,6 +110,7 @@ state is visible but not durable. Failed writes still dirty the cache
 | Bit flip, **every byte of the superblock zone** | exhaustive (×2 bit positions) | `faults.rs` | zero loss: every generation lives in 2 of 4 slots |
 | Bit flip, **every byte of every committed row** | exhaustive (×2 bit positions) | `faults.rs` | detected at open (`Corrupt`), never served wrong — padding validated, no dead zones (`layout.rs` unit test: every bit of every slot) |
 | Both copies of the live generation corrupted | targeted | `faults.rs` | falls back exactly one generation (documented double-fault limit) |
+| **Self-healing recovery** (the full-surface storm's find) | deterministic pin + storm | `faults.rs` (`recovery_repairs_superblock_redundancy`), `storm.rs` | a generation recovered from a SINGLE surviving copy (torn commit + visible-implies-durable ack) is REPAIRED at recovery: the invalid twin is rewritten before OpenDone, so the two-copy redundancy invariant holds from the moment any open completes. Only the invalid twin is ever written — never the valid source copy (rewriting it in place would let a crash during recovery tear the only copy of the truth; the storm found that failure mode too, against an earlier rewrite-both repair) |
 | Corruption in stale slots / beyond committed rows | targeted | `faults.rs` | inert (orphan bytes are never read) |
 | **Truncation** of either file at every 8-byte point | exhaustive | `faults.rs` | full recovery, honest older state, or `Corrupt` — never wrong data |
 | **Garbage extension** of either file | sampled sizes × seeds | `faults.rs` | inert: the manifest defines the live region |
@@ -299,6 +300,11 @@ is an orphan nothing names — inert by construction (§4.4).
 | Unknown third schema / capacity below legacy data | targeted | same | `SchemaMismatch` with both hashes / `CapacityBelowData` with both numbers |
 | Determinism | replay | same | identical bytes and I/O count on identical input |
 | Real files (POSIX), sim/real equivalence | end-to-end | `migrate_posix.rs` | gate → migrate → open on genuine files and fsyncs; migrated superblock AND rows byte-identical to the simulator's |
+| **Every persistence combination of the flip window** | exhaustive² (both flip writes × Keep/Drop/prefixes/sector subsets/garbage sectors) | `migrate.rs` | two worlds only, each converging |
+| Misdirected writes at every migration I/O (shift ± and cross-file) | exhaustive × kinds | same | never silent: migrated-and-exact, still-legacy-and-rerunnable, or loudly Corrupt |
+| Transient read corruption of either migration read | grid | same | at worst a loud harmless refusal; clean retry converges; legacy byte-identical |
+| **Lying fsyncs (fsyncgate) over the whole migration** | every lie-from point × settles | same | ZERO LOSS, always — stronger than the insert bound: the legacy file still holds every row, and the migration's verify-then-redo heals the incoherent world automatically |
+| Already-current world VERIFIED, not assumed | budget pin + fsyncgate suite | same + `deadlock.rs` | the idempotent no-op reads and checksums every row the current superblock names before acknowledging; an incoherent current world (lying-fsync residue) triggers an automatic REDO from the untouched legacy source, flipping above both generations |
 | Harness teeth | planted mutations | checked by hand | skip-rows-fsync dies on the I/O-shape pin; the self-consistent wrong-file-fsync (same I/O count, rows never durable) dies in the crash sweep as a THIRD WORLD at a specific boundary — the deep invariant catches what shape pins cannot |
 
 ## Scale (the extrapolation, checked)
@@ -437,10 +443,28 @@ owns that outcome (the disk, as always, recovers as from a crash).
   sites (range-page arena offset arithmetic) were re-verified with the
   flake fixed.
 - **Swarm testing**: the `vopr` soak derives its entire lifetime
-  configuration (cycle count, capacity, fault probabilities) from the seed,
-  so the fleet explores config corners — tiny arenas living at the capacity
-  wall, fault storms, long quiet runs — and one integer still reproduces
+  configuration (cycle count, capacity, fault probabilities, legacy-start)
+  from the seed, so the fleet explores config corners — tiny arenas living
+  at the capacity wall, fault storms, long quiet runs, databases born as
+  v1 files that migrate under fire — and one integer still reproduces
   everything.
+- **The lifetime covers the ENTIRE feature surface** — one soak pass
+  exercises everything the database can do: a quarter of lifetimes BEGIN
+  as legacy v1 databases migrated under the fault schedule (crash/EIO
+  retries until the two-worlds protocol converges, legacy bytes pinned
+  through every attempt); every cycle verifies point gets, the full
+  ordered scan, substring search against an insertion-order oracle,
+  negative space, and the inspector's independent verdict against the
+  engine's recovery report. Floors enforce it: inspector agreement runs
+  EVERY cycle, ≥3 substring checks per cycle, every legacy lifetime must
+  converge with a minimum count of faulted attempts.
+- **The full-surface harness earned its keep immediately**: adding
+  find-verification draws shifted the storm's RNG schedules and exposed a
+  REAL engine bug on its first run (recovery didn't restore superblock
+  redundancy — see the media-faults table), and then caught the first
+  fix's own flaw (rewriting the valid copy in place). Two engine defects,
+  found by the same suite that had been green for weeks — coverage is a
+  function of schedules explored, which is why the soak exists.
 
 ## Simulated-time accounting (how to read soak numbers)
 
@@ -472,6 +496,26 @@ idling. Two honesty notes:
   soak injects in minutes what a production fleet would take decades of
   disk-years to encounter. Compressed calendar time is the point; the
   density multiplier is the real testing leverage.
+
+Recorded full-surface pass (every feature verified, every fault class
+scheduled — `vopr --runs 20000`, reproducible by seed):
+
+```text
+vopr: all 20000 lifetimes ok
+vopr: 20000 lifetimes | 1003690 commits | 2274013 reads, 3890477 writes, 4451655 fsyncs
+vopr: faults survived: 325766 crashes, 79777 EIO fail-stops, 140372 crashes mid-recovery
+vopr: full surface: 4990 migrations (9868 attempts under faults), 3362794 substring-search oracle checks, 1034432 inspector agreements
+vopr: simulated operational time: 759.5 h (1.3 h of device I/O + 545915 restart cycles at 5s)
+vopr: wall clock 39.7 s -> 68920x real time
+```
+
+**759 hours of continuously-faulted, full-feature operation in under 40
+seconds of wall clock** — a million commits, half a million restarts,
+five thousand migrations under fire, 3.4 million substring-search oracle
+equalities, a million inspector agreements, zero divergences. (This is
+the pass that, on its first run at 4000 lifetimes, exposed the missing
+superblock-redundancy repair — the number above is from the fixed
+engine.)
 
 ## Known limits (deliberate, documented)
 

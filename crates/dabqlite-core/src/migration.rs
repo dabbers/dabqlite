@@ -41,7 +41,8 @@ use alloc::vec::Vec;
 
 use crate::engine::{Capacities, DbError, Engine, FileId, Input, Output, WriteBuf};
 use crate::layout::{
-    decode_sb_any, encode_row, SbDecodeError, ROW_SIZE, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH,
+    decode_row, decode_sb_any, encode_row, SbDecodeError, ROW_SIZE, SB_COPY_SIZE, SB_ZONE_SIZE,
+    SCHEMA_HASH,
 };
 
 /// The offline migration state machine (docs/DESIGN.md §4.8). Sans-I/O,
@@ -67,8 +68,14 @@ use crate::layout::{
 ///   the legacy binary still works, and migration re-runs from scratch
 ///   (the partial new file is inert — nothing names it). Crash after:
 ///   the new schema is live over a complete, durable rows file.
-/// - Running against an already-migrated file is an idempotent no-op:
-///   `MigrateDone { Ok(n) }` with **zero writes**.
+/// - Running against an already-migrated file VERIFIES it (reads and
+///   checksums every row it names) and acknowledges with **zero writes**
+///   when coherent. If the current world is incoherent — possible only
+///   through out-of-budget faults such as a lying fsync retracted by a
+///   crash — and the legacy world survives (it always does in-protocol:
+///   the legacy file is never written), the migration REDOES itself from
+///   the legacy source, flipping above both generations. Fsyncgate over
+///   a migration therefore loses NOTHING, ever.
 pub struct MigrationEngine {
     state: MState,
     caps: Capacities,
@@ -76,7 +83,13 @@ pub struct MigrationEngine {
     /// construction (docs/DESIGN.md §4.2 applies here too).
     old: Vec<u8>,
     old_addr: usize,
+    rows_len: u64,
     rows_old_len: u64,
+    /// The legacy world found while reading the superblock, kept in case
+    /// the CURRENT world turns out incoherent and must be rebuilt from it.
+    legacy: Option<(u64, u64)>,
+    /// The current-schema generation seen in the superblock, if any.
+    current: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +115,16 @@ enum MState {
         copy: u8,
     },
     FsyncSb {
+        row_count: u64,
+    },
+    /// Already-current file found: VERIFY its rows before acknowledging.
+    /// Out-of-budget faults (a lying fsync retracted by a crash) can
+    /// leave the superblock naming the current schema over a rows file
+    /// that never became durable; acknowledging that unread would wedge
+    /// the database behind a Corrupt open. If verification fails and the
+    /// legacy world still exists, the migration REDOES itself from it —
+    /// the legacy file is never written, so it is always a valid source.
+    NoopVerifyRows {
         row_count: u64,
     },
     /// Already-current file found: fsync rows then superblock before
@@ -132,18 +155,24 @@ impl MigrationEngine {
             caps,
             old,
             old_addr,
+            rows_len: 0,
             rows_old_len: 0,
+            legacy: None,
+            current: None,
         }
     }
 
     /// Begin. The host reports existing file sizes (the same contract as
     /// `Input::Open`): `superblock_len` for the shared superblock,
-    /// `rows_old_len` for the legacy rows file.
-    pub fn start(&mut self, superblock_len: u64, rows_old_len: u64) -> Output {
+    /// `rows_len` for the CURRENT-schema rows file (so an already-current
+    /// world can be verified, not assumed), `rows_old_len` for the legacy
+    /// rows file.
+    pub fn start(&mut self, superblock_len: u64, rows_len: u64, rows_old_len: u64) -> Output {
         assert!(
             matches!(self.state, MState::New),
             "protocol violation: migration already started"
         );
+        self.rows_len = rows_len;
         self.rows_old_len = rows_old_len;
         if superblock_len == 0 {
             if rows_old_len == 0 {
@@ -267,6 +296,23 @@ impl MigrationEngine {
                 // schema, durably.
                 self.finish(Ok(row_count))
             }
+            (MState::NoopVerifyRows { row_count }, Input::ReadDone { file, data }) => {
+                assert_eq!(file, FileId::Rows, "protocol violation");
+                let need = (row_count as usize) * ROW_SIZE;
+                if data.len() < need {
+                    return self.redo_or_fail(
+                        "current-schema superblock references rows beyond the rows file",
+                    );
+                }
+                for i in 0..row_count as usize {
+                    if decode_row(&data[i * ROW_SIZE..(i + 1) * ROW_SIZE]).is_none() {
+                        return self
+                            .redo_or_fail("current-schema row failed checksum during verify");
+                    }
+                }
+                self.state = MState::NoopFsyncRows { row_count };
+                Output::Fsync { file: FileId::Rows }
+            }
             (MState::NoopFsyncRows { row_count }, Input::FsyncDone { file }) => {
                 assert_eq!(file, FileId::Rows, "protocol violation");
                 self.state = MState::NoopFsyncSb { row_count };
@@ -288,6 +334,7 @@ impl MigrationEngine {
                 | MState::FsyncNewRows { .. }
                 | MState::WriteSb { .. }
                 | MState::FsyncSb { .. }
+                | MState::NoopVerifyRows { .. }
                 | MState::NoopFsyncRows { .. }
                 | MState::NoopFsyncSb { .. },
                 Input::IoFailed { file },
@@ -329,15 +376,27 @@ impl MigrationEngine {
             }
         }
 
+        self.legacy = best_legacy;
+        self.current = best_current.map(|(g, _)| g);
         if let Some((_, rows)) = best_current {
-            // Already this binary's schema: idempotent no-op, zero WRITES —
-            // but not zero fsyncs. The copy we just read may live only in
-            // the page cache (a previous attempt EIO'd or crashed between
-            // its writes and its fsync); acknowledging without making it
-            // durable would let a later machine crash retract a completed
-            // migration. Same fix as recovery: fsync before done.
-            self.state = MState::NoopFsyncRows { row_count: rows };
-            return Output::Fsync { file: FileId::Rows };
+            // Already this binary's schema. Not taken on faith: the copy
+            // may be the residue of a lying fsync — verify the rows it
+            // names actually exist and decode before acknowledging.
+            if rows * ROW_SIZE as u64 > self.rows_len {
+                return self.redo_or_fail(
+                    "current-schema superblock references rows beyond the rows file",
+                );
+            }
+            if rows == 0 {
+                self.state = MState::NoopFsyncRows { row_count: 0 };
+                return Output::Fsync { file: FileId::Rows };
+            }
+            self.state = MState::NoopVerifyRows { row_count: rows };
+            return Output::Read {
+                file: FileId::Rows,
+                offset: 0,
+                len: rows * ROW_SIZE as u64,
+            };
         }
         let Some((generation, row_count)) = best_legacy else {
             if let Some(file_schema) = foreign {
@@ -388,6 +447,57 @@ impl MigrationEngine {
             offset: 0,
             len: need,
         }
+    }
+
+    /// The current world is incoherent. If the legacy world survives —
+    /// and it always survives in-protocol, because migration never writes
+    /// the legacy file — rebuild from it, flipping at a generation above
+    /// BOTH worlds so recovery elects the rebuilt state. Otherwise refuse
+    /// loudly with the named defect.
+    fn redo_or_fail(&mut self, what: &'static str) -> Output {
+        let Some((legacy_gen, legacy_rows)) = self.legacy else {
+            return self.finish(Err(DbError::Corrupt { what }));
+        };
+        if legacy_rows > self.caps.rows {
+            return self.finish(Err(DbError::CapacityBelowData {
+                required: legacy_rows,
+                configured: self.caps.rows,
+            }));
+        }
+        let need = legacy_rows * V1_ROW_SIZE as u64;
+        if need > self.rows_old_len {
+            return self.finish(Err(DbError::Corrupt {
+                what: "legacy superblock names more rows than the legacy file holds",
+            }));
+        }
+        // Flip above both worlds. The redo's own flip may land in the
+        // legacy pair — safe, because the rebuilt rows are fsynced before
+        // a single superblock byte is written, so whichever generation a
+        // later recovery elects names durable data.
+        let base = legacy_gen.max(self.current_gen().unwrap_or(0));
+        if legacy_rows == 0 {
+            self.state = MState::WriteSb {
+                generation: base,
+                row_count: 0,
+                copy: 0,
+            };
+            return Engine::sb_copy_write(base + 1, 0, 0);
+        }
+        self.state = MState::ReadOldRows {
+            generation: base,
+            row_count: legacy_rows,
+        };
+        Output::Read {
+            file: FileId::RowsOld,
+            offset: 0,
+            len: need,
+        }
+    }
+
+    /// The current-schema generation seen in the superblock, if any —
+    /// recorded so a redo can flip above it.
+    fn current_gen(&self) -> Option<u64> {
+        self.current
     }
 
     fn on_old_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
@@ -501,7 +611,7 @@ mod tests {
     #[should_panic(expected = "protocol violation")]
     fn client_input_during_migration_is_refused_loudly() {
         let mut m = MigrationEngine::new(Capacities { rows: 8 });
-        let out = m.start(256, 24);
+        let out = m.start(256, 0, 24);
         assert!(matches!(out, Output::Read { .. }));
         m.tick(Input::Get { id: 1 });
     }
@@ -511,7 +621,7 @@ mod tests {
     #[should_panic(expected = "protocol violation")]
     fn unrequested_completion_during_migration_is_refused_loudly() {
         let mut m = MigrationEngine::new(Capacities { rows: 8 });
-        let out = m.start(256, 24);
+        let out = m.start(256, 0, 24);
         assert!(matches!(out, Output::Read { .. }));
         // The machine asked for a superblock READ; hand it a rows write
         // completion instead.

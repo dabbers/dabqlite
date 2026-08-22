@@ -10,7 +10,7 @@ use dabqlite_core::{Capacities, DbError, Output, SB_COPY_SIZE, SB_ZONE_SIZE, VAL
 use dabqlite_core::{FileId, ROW_SIZE};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
-use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost};
+use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost, WriteFate};
 
 const CAPS: Capacities = Capacities { rows: 16 };
 const INSERTS: usize = 8;
@@ -240,4 +240,99 @@ fn corruption_outside_live_data_is_inert() {
     }
     // Sanity: the superblock zone is exactly the four slots we reason about.
     assert_eq!(SB_ZONE_SIZE, 4 * SB_COPY_SIZE);
+}
+
+/// THE STORM'S FIND, pinned deterministically (found at storm seed 2 once
+/// find-verification draws shifted its fault schedule): a commit torn
+/// between its two superblock copy writes can survive in exactly ONE
+/// durable copy; visible-implies-durable recovery acknowledges it — and
+/// before self-healing recovery existed, left it with NO redundancy, so
+/// one later in-budget fault (a media flip or one transient read
+/// corruption) silently rolled back the acknowledged commit. Recovery
+/// now REPAIRS the pair: it rewrites both copies of the chosen
+/// generation before OpenDone.
+#[test]
+fn recovery_repairs_superblock_redundancy() {
+    // One committed row (generation 2, pair 0).
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    let ops = gen_workload(77, 2);
+    assert!(matches!(
+        host.run(ClientOp::Insert {
+            id: ops[0].0,
+            value: ops[0].1
+        }),
+        Driven::Done(Output::InsertDone { result: Ok(()), .. })
+    ));
+
+    // Second insert (generation 3, pair 1 = slots 2,3): crash after the
+    // FIRST superblock copy write — row durable, copy 0 in cache, copy 1
+    // never written.
+    host.crash_after = Some(host.io_count + 3);
+    assert!(matches!(
+        host.run(ClientOp::Insert {
+            id: ops[1].0,
+            value: ops[1].1
+        }),
+        Driven::Crashed
+    ));
+    let mut disk = std::mem::take(&mut host.disk);
+    let fates: Vec<WriteFate> = disk
+        .unsynced_writes()
+        .iter()
+        .map(|_| WriteFate::Keep)
+        .collect();
+    assert_eq!(fates.len(), 1, "exactly the lone sb copy write is unsynced");
+    disk.settle_with(&fates);
+
+    // Recovery sees the single surviving copy of generation 3 and, per
+    // visible-implies-durable, acknowledges 2 rows.
+    let mut host = SimHost::new(CAPS, disk, None);
+    assert!(matches!(
+        host.open(),
+        Driven::Done(Output::OpenDone { result: Ok(2) })
+    ));
+
+    // THE REPAIR, byte-level: both slots of pair 1 must now hold a valid
+    // generation-3 copy. (Before the fix, slot 3 still held stale bytes,
+    // and generation 3 existed on disk exactly once.)
+    for slot in [2u64, 3] {
+        let bytes = host.disk.read(
+            FileId::Superblock,
+            slot * SB_COPY_SIZE as u64,
+            SB_COPY_SIZE as u64,
+        );
+        let copy = dabqlite_core::layout::decode_sb(&bytes)
+            .unwrap_or_else(|e| panic!("slot {slot} not repaired: {e:?}"));
+        assert_eq!((copy.generation, copy.row_count), (3, 2), "slot {slot}");
+    }
+
+    // And the payoff: a single media fault on the ORIGINALLY-surviving
+    // copy is now survivable — the repaired twin carries the generation.
+    // (Before the fix: silent fallback to generation 2 — an acknowledged
+    // commit lost to one in-budget fault.)
+    let mut disk = std::mem::take(&mut host.disk);
+    disk.corrupt(FileId::Superblock, 2 * SB_COPY_SIZE as u64 + 9, 0x40);
+    let mut host = SimHost::new(CAPS, disk, None);
+    assert!(matches!(
+        host.open(),
+        Driven::Done(Output::OpenDone { result: Ok(2) })
+    ));
+    for &(id, value) in &ops {
+        assert!(matches!(
+            host.run(ClientOp::Get { id }),
+            Driven::Done(Output::GetDone { result: Ok(Some(v)), .. }) if v == value
+        ));
+    }
+
+    // Transient variant: a corrupt READ of the repaired pair during the
+    // sb scan still recovers exactly — the twin is read clean.
+    let disk = std::mem::take(&mut host.disk);
+    let mut host = SimHost::new(CAPS, disk, None);
+    host.read_corrupt_at = Some((0, 3 * SB_COPY_SIZE + 9, 0x20));
+    assert!(matches!(
+        host.open(),
+        Driven::Done(Output::OpenDone { result: Ok(2) })
+    ));
+    assert_eq!(host.reads_corrupted, 1, "the transient fault must fire");
 }

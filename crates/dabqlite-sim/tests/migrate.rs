@@ -17,7 +17,7 @@ use dabqlite_core::generated::records_v1;
 use dabqlite_core::migration::{V1_ROW_SIZE, V1_SCHEMA_HASH, V1_VALUE_LEN};
 use dabqlite_core::{crc32::crc32, Capacities, DbError, FileId, Output, SB_COPY_SIZE, VALUE_LEN};
 use dabqlite_sim::workload::crash_rng;
-use dabqlite_sim::{Driven, SimDisk, SimHost};
+use dabqlite_sim::{Driven, Misdirect, SimDisk, SimHost, WriteFate};
 
 const CAPS: Capacities = Capacities { rows: 16 };
 
@@ -382,4 +382,237 @@ fn migration_is_deterministic() {
         )
     };
     assert_eq!(run(disk.clone()), run(disk));
+}
+
+/// The migrated world's data, or proof we are still (recoverably) in the
+/// legacy world — with `allow_loud` (out-of-budget faults only), a LOUD
+/// Corrupt open is also acceptable, PROVIDED the migration's self-healing
+/// redo then converges to the full migrated world with zero loss.
+fn assert_two_worlds_and_converge(
+    mut disk: SimDisk,
+    seed: u64,
+    n: u64,
+    allow_loud: bool,
+    ctx: &str,
+) {
+    let rerun = |disk: SimDisk, ctx: &str| {
+        let mut host = SimHost::new(CAPS, disk, None);
+        assert!(
+            matches!(
+                host.run_migration(),
+                Driven::Done(Output::MigrateDone { result: Ok(rows) }) if rows == n
+            ),
+            "{ctx}: retry did not converge"
+        );
+        let disk = std::mem::take(&mut host.disk);
+        let mut host = SimHost::new(CAPS, disk, None);
+        assert!(matches!(
+            host.open(),
+            Driven::Done(Output::OpenDone { result: Ok(rows) }) if rows == n
+        ));
+        verify_migrated(&mut host, seed, n);
+    };
+    let mut host = SimHost::new(CAPS, disk, None);
+    match host.open() {
+        Driven::Done(Output::OpenDone { result: Ok(rows) }) => {
+            assert_eq!(rows, n, "{ctx}: partial commit");
+            verify_migrated(&mut host, seed, n);
+        }
+        Driven::Done(Output::OpenDone {
+            result: Err(DbError::SchemaMismatch { file_schema, .. }),
+        }) => {
+            assert_eq!(file_schema, V1_SCHEMA_HASH, "{ctx}");
+            disk = std::mem::take(&mut host.disk);
+            rerun(disk, ctx);
+        }
+        Driven::Done(Output::OpenDone {
+            result: Err(DbError::Corrupt { .. }),
+        }) if allow_loud => {
+            // Out-of-budget faults may leave the current world incoherent
+            // (loud, never wrong). The migration's verify-then-redo path
+            // must rebuild it from the untouched legacy source.
+            disk = std::mem::take(&mut host.disk);
+            rerun(disk, ctx);
+        }
+        other => panic!("{ctx}: third world: {other:?}"),
+    }
+}
+
+/// Exhaustive settle of the FLIP window: crash right before the final
+/// superblock fsync leaves exactly the two flip writes unsynced —
+/// enumerate every persistence combination of both (Keep/Drop/prefixes/
+/// sector subsets), and demand the two-worlds invariant for each.
+#[test]
+fn every_persistence_combination_of_the_flip_window() {
+    let seed = 17u64;
+    let n = 4u64;
+    let pristine = build_v1_disk(seed, n);
+    let total_io = 6 + n;
+
+    // Crash immediately before the final fsync: ops 0..total_io-1 done.
+    let mut host = SimHost::new(CAPS, pristine.clone(), Some(total_io - 1));
+    assert!(matches!(host.run_migration(), Driven::Crashed));
+    let disk = std::mem::take(&mut host.disk);
+    let window = disk.unsynced_writes();
+    assert_eq!(window.len(), 2, "flip window is exactly the two sb writes");
+
+    fn fates_for(len: usize) -> Vec<WriteFate> {
+        let mut fates = vec![WriteFate::Drop, WriteFate::Keep];
+        for n in (8..len).step_by(8) {
+            fates.push(WriteFate::Prefix(n));
+        }
+        fates.push(WriteFate::Subset(0b10));
+        fates.push(WriteFate::Subset(0b0101_0101));
+        fates.push(WriteFate::SubsetGarbage {
+            mask: 0b1111_0000,
+            garbage_sector: 1,
+            garbage: [0x5A; dabqlite_sim::SECTOR],
+        });
+        fates
+    }
+    let mut scenarios = 0u64;
+    for f0 in fates_for(64) {
+        for f1 in fates_for(64) {
+            let mut d = disk.clone();
+            d.settle_with(&[f0, f1]);
+            assert_eq!(
+                d.contents(FileId::RowsOld),
+                pristine.contents(FileId::RowsOld),
+                "legacy file changed"
+            );
+            assert_two_worlds_and_converge(d, seed, n, false, &format!("fates {f0:?}/{f1:?}"));
+            scenarios += 1;
+        }
+    }
+    assert!(scenarios >= 100, "only {scenarios} flip-window scenarios");
+}
+
+/// Misdirected writes during migration (firmware lies about WHERE): the
+/// outcome may be the migrated world, the legacy world, or a LOUD
+/// refusal — never silently wrong data, and the legacy file only changes
+/// if the misdirect physically lands there (same-file shifts; the
+/// engine never targets it).
+#[test]
+fn misdirected_writes_during_migration_are_never_silent() {
+    let seed = 19u64;
+    let n = 4u64;
+    let pristine = build_v1_disk(seed, n);
+    let total_io = 6 + n;
+    let mut hits = 0u64;
+    for idx in 0..total_io {
+        for kind in [
+            Misdirect::Shift(64),
+            Misdirect::Shift(-64),
+            Misdirect::CrossFile,
+        ] {
+            let mut host = SimHost::new(CAPS, pristine.clone(), None);
+            host.misdirect_at = Some((idx, kind));
+            let outcome = host.run_migration();
+            hits += host.misdirected;
+            let ctx = format!("idx={idx} kind={kind:?}");
+            match outcome {
+                Driven::Done(Output::MigrateDone { result: Ok(rows) }) => {
+                    assert_eq!(rows, n, "{ctx}");
+                    // The machine believes it migrated. Open and demand
+                    // NEVER-WRONG: either every row is exact, or the
+                    // damage is detected loudly.
+                    let disk = std::mem::take(&mut host.disk);
+                    let mut host = SimHost::new(CAPS, disk, None);
+                    match host.open() {
+                        Driven::Done(Output::OpenDone { result: Ok(rows) }) if rows == n => {
+                            verify_migrated(&mut host, seed, n);
+                        }
+                        Driven::Done(Output::OpenDone {
+                            result: Err(DbError::Corrupt { .. }),
+                        }) => {} // loud: acceptable for an out-of-budget fault
+                        Driven::Done(Output::OpenDone { result: Ok(rows) }) => {
+                            panic!("{ctx}: silent wrong count {rows}");
+                        }
+                        other => panic!("{ctx}: {other:?}"),
+                    }
+                }
+                Driven::Done(Output::MigrateDone {
+                    result: Err(DbError::Corrupt { .. } | DbError::SchemaMismatch { .. }),
+                }) => {} // refused loudly mid-flight: fine
+                other => panic!("{ctx}: {other:?}"),
+            }
+        }
+    }
+    assert!(hits > 0, "no misdirect ever fired");
+}
+
+/// Transient READ faults during migration's two reads: at worst a loud,
+/// harmless refusal — and a clean retry always converges.
+#[test]
+fn corrupt_reads_during_migration_refuse_then_converge() {
+    let seed = 23u64;
+    let n = 5u64;
+    let pristine = build_v1_disk(seed, n);
+    for read_idx in [0u64, 1] {
+        for byte in [0usize, 40, 70, 100] {
+            let mut host = SimHost::new(CAPS, pristine.clone(), None);
+            host.read_corrupt_at = Some((read_idx, byte, 0x08));
+            let ctx = format!("read={read_idx} byte={byte}");
+            match host.run_migration() {
+                Driven::Done(Output::MigrateDone { result: Ok(rows) }) => {
+                    // The flip survived the transient (e.g. the corrupt
+                    // byte hit a stale slot or the twin carried it).
+                    assert_eq!(rows, n, "{ctx}");
+                }
+                Driven::Done(Output::MigrateDone {
+                    result: Err(DbError::Corrupt { .. } | DbError::SchemaMismatch { .. }),
+                }) => {}
+                other => panic!("{ctx}: {other:?}"),
+            }
+            // Whatever happened, the legacy file is intact and a clean
+            // retry converges to the full migrated world.
+            let disk = std::mem::take(&mut host.disk);
+            assert_eq!(
+                disk.contents(FileId::RowsOld),
+                pristine.contents(FileId::RowsOld),
+                "{ctx}: legacy file changed"
+            );
+            assert_two_worlds_and_converge(disk, seed, n, false, &ctx);
+        }
+    }
+}
+
+/// A LYING fsync during migration (fsyncgate): the migration may be
+/// acknowledged and then retracted by a machine crash — but unlike an
+/// insert, migration under fsyncgate loses NOTHING: the legacy file
+/// still holds every row, and the retry converges to the full migrated
+/// world. Bounded regression, zero data loss.
+#[test]
+fn lying_fsyncs_during_migration_lose_nothing() {
+    let seed = 29u64;
+    let n = 4u64;
+    let pristine = build_v1_disk(seed, n);
+    let total_io = 6 + n;
+    for lie_from in 0..total_io {
+        for settle_seed in 0..3u64 {
+            let mut host = SimHost::new(CAPS, pristine.clone(), None);
+            host.lie_fsync_from = Some(lie_from);
+            let acked = matches!(
+                host.run_migration(),
+                Driven::Done(Output::MigrateDone { result: Ok(rows) }) if rows == n
+            );
+            assert!(acked, "lie_from={lie_from}: migration itself never errors");
+            // Machine crash: everything the lying fsyncs never persisted
+            // settles arbitrarily.
+            let mut disk = std::mem::take(&mut host.disk);
+            disk.crash(&mut crash_rng(0xF5C, lie_from * 10 + settle_seed));
+            assert_eq!(
+                disk.contents(FileId::RowsOld),
+                pristine.contents(FileId::RowsOld),
+                "lie_from={lie_from}: legacy file changed"
+            );
+            assert_two_worlds_and_converge(
+                disk,
+                seed,
+                n,
+                true, // fsyncgate is out-of-budget: loud-then-heal is the contract
+                &format!("lie_from={lie_from} settle={settle_seed}"),
+            );
+        }
+    }
 }

@@ -914,9 +914,7 @@ fn validate_query(
         toks.len() == expect.len() && toks.iter().zip(expect).all(|(a, b)| *a == b)
     };
 
-    let shape = if toks.first() == Some(&"select")
-        && find_expect.as_deref().is_some_and(&matches)
-    {
+    let shape = if toks.first() == Some(&"select") && find_expect.as_deref().is_some_and(&matches) {
         if kind != QueryKind::Find {
             return Err(err(
                 line,

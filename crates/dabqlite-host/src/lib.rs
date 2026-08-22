@@ -103,9 +103,10 @@ impl<S: Storage> Host<S> {
     pub fn migrate(&mut self) -> Result<Output, S::Error> {
         assert!(self.migrating.is_none(), "migration already in flight");
         let superblock_len = self.storage.len(FileId::Superblock)?;
+        let rows_len = self.storage.len(FileId::Rows)?;
         let rows_old_len = self.storage.len(FileId::RowsOld)?;
         let mut m = MigrationEngine::new(self.engine.caps());
-        let first = m.start(superblock_len, rows_old_len);
+        let first = m.start(superblock_len, rows_len, rows_old_len);
         self.migrating = Some(m);
         let out = self.drive_from(first);
         self.migrating = None;

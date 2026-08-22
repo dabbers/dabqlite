@@ -208,3 +208,69 @@ fn find_reads_committed_state_only() {
     assert_eq!(host.find_all(b"never"), vec![]);
     assert_eq!(host.find_all(b"before").len(), 1);
 }
+
+#[test]
+fn pathological_chains_all_rows_one_trigram() {
+    // Every row the same value: ONE trigram chain of maximum length (the
+    // index degenerates to a scan — still exact, still zero I/O), at the
+    // capacity wall.
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    let mut ops = Vec::new();
+    for i in 0..CAPS.rows {
+        let value = [0xAB; VALUE_LEN];
+        ops.push((i, value));
+        assert!(matches!(
+            host.run(ClientOp::Insert { id: i, value }),
+            Driven::Done(Output::InsertDone { result: Ok(()), .. })
+        ));
+    }
+    let io = host.io_count;
+    for needle in [
+        &[0xAB, 0xAB, 0xAB][..],
+        &[0xAB; VALUE_LEN][..],
+        &[0xAB, 0xAB, 0xAC][..],
+    ] {
+        assert_eq!(host.find_all(needle), oracle(&ops, needle), "{needle:?}");
+    }
+    assert_eq!(host.io_count, io, "degenerate chains still cost zero I/O");
+
+    // And the rebuilt index after recovery handles the same degenerate
+    // chain identically.
+    let disk = std::mem::take(&mut host.disk);
+    let mut host = SimHost::new(CAPS, disk, None);
+    assert!(matches!(
+        host.open(),
+        Driven::Done(Output::OpenDone { result: Ok(n) }) if n == CAPS.rows
+    ));
+    assert_eq!(
+        host.find_all(&[0xAB, 0xAB, 0xAB]),
+        oracle(&ops, &[0xAB, 0xAB, 0xAB])
+    );
+}
+
+#[test]
+fn maximum_distinct_trigrams_stress_the_table() {
+    // The opposite pathology: every window of every row distinct, driving
+    // the trigram table toward its worst-case load. Exactness holds.
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    let mut ops = Vec::new();
+    for i in 0..CAPS.rows {
+        let mut value = [0u8; VALUE_LEN];
+        for (k, b) in value.iter_mut().enumerate() {
+            *b = (i as u8)
+                .wrapping_mul(16)
+                .wrapping_add(k as u8)
+                .wrapping_mul(7);
+        }
+        ops.push((i, value));
+        host.run(ClientOp::Insert { id: i, value });
+    }
+    for &(_, v) in ops.iter().take(6) {
+        for off in [0usize, 5, VALUE_LEN - 3] {
+            let needle = &v[off..off + 3];
+            assert_eq!(host.find_all(needle), oracle(&ops, needle), "{needle:?}");
+        }
+    }
+}

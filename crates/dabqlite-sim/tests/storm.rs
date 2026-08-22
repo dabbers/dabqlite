@@ -49,6 +49,9 @@ fn all_in_budget_faults_together_zero_loss_zero_drift() {
     for seed in 0..SEEDS {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
+        // Insertion-order mirror of the oracle: the substring index
+        // answers in row order, so this is its exact oracle.
+        let mut log: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
         // Budget guard: a superblock media fault is only injected once the
         // generation has advanced 2 past the previous one, guaranteeing
         // both slot pairs were rewritten and the earlier damage healed.
@@ -85,6 +88,7 @@ fn all_in_budget_faults_together_zero_loss_zero_drift() {
                 match host.run(ClientOp::Insert { id, value }) {
                     Driven::Done(Output::InsertDone { result: Ok(()), .. }) => {
                         oracle.insert(id, value);
+                        log.push((id, value));
                     }
                     Driven::Done(Output::InsertDone {
                         result: Err(DbError::Full { .. }),
@@ -147,6 +151,7 @@ fn all_in_budget_faults_together_zero_loss_zero_drift() {
                     in_flight.unwrap_or_else(|| panic!("[{ctx}] extra row, none in flight"));
                 assert_eq!(host.get(id), Some(value), "[{ctx}] in-flight torn");
                 oracle.insert(id, value);
+                log.push((id, value));
             } else {
                 assert_eq!(
                     used, expected,
@@ -163,6 +168,27 @@ fn all_in_budget_faults_together_zero_loss_zero_drift() {
                 let absent: u64 = rng.gen();
                 if !oracle.contains_key(&absent) {
                     assert_eq!(host.get(absent), None, "[{ctx}] phantom id={absent}");
+                }
+            }
+            // Substring search under the storm: exact oracle equality even
+            // with every in-budget fault class layered into the lifetime.
+            if !log.is_empty() {
+                let (_, v) = log[rng.gen_range(0..log.len())];
+                let off = rng.gen_range(0..=VALUE_LEN - 3);
+                let hit = v[off..off + 3].to_vec();
+                let mut miss = vec![0u8; 3];
+                rng.fill_bytes(&mut miss);
+                for needle in [&hit[..], &miss[..]] {
+                    let want: Vec<(u64, [u8; VALUE_LEN])> = log
+                        .iter()
+                        .filter(|(_, v)| v.windows(needle.len()).any(|w| w == needle))
+                        .copied()
+                        .collect();
+                    assert_eq!(
+                        host.find_all(needle),
+                        want,
+                        "[{ctx}] substring DRIFT under storm, needle={needle:?}"
+                    );
                 }
             }
             let report = host.engine.recovery_report();
