@@ -43,6 +43,7 @@ pub mod btree;
 pub mod crc32;
 pub mod engine;
 pub mod generated;
+pub mod inspect;
 pub mod layout;
 pub mod migration;
 

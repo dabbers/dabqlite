@@ -279,6 +279,27 @@ is an orphan nothing names — inert by construction (§4.4).
 | **1,000,000 rows** through the full engine (interleaved keys → splits everywhere) | release-mode CI step | `scale.rs` | wall exact and zero-I/O at 1M; full 32 MB recovery re-verifying every checksum; ordered windows at start/middle/end; crash boundaries of the millionth insert: N/N+1 |
 | **100,000 rows on real files** (200k genuine fsyncs) | release-mode CI step | `scale_posix.rs` | byte-identical to the simulator at volume; real recovery + sampled reads exact |
 
+## The inspector (§9 step 8: forensics that cannot lie by construction)
+
+`dabqlite-inspect <dir>` is `sqlite3 file.db` for dabqlite: read-only
+forensics over the raw files. The analysis lives in `core::inspect` as a
+**deliberate second implementation of the recovery rules** — written
+from the spec, not by calling the engine — and the two are cross-checked
+the same way the reference codec is:
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Verdict agreement: `inspect()` vs a real engine open | property, over clean dbs × crash-settled disks at every boundary × wiped/bit-rotted superblocks × forged-foreign × legacy-v1 × row-corrupted × orphan-bearing | `inspect.rs` (sim) | the pure report PREDICTS the engine's exact outcome (including error strings), and its orphan/rollback-evidence accounting matches the recovery report |
+| Read-only, byte-pinned | targeted | `inspect_posix.rs` | inspecting (even with `--verify`) changes zero bytes of any file |
+| Live-writer coexistence | real processes | same | the CLI takes NO lock: it inspects a directory whose writer is alive and holding the flock — forensics on a wedged process is exactly when you need it |
+| Deterministic output | golden | same | byte-identical output across runs; names files, never paths |
+| Damage → exit code | targeted | same | `--verify` exits 2 on any refusal-verdict or rollback evidence, for scripts |
+| Totality | by construction | core | `inspect()` is pure and total: garbage input yields a report, never a panic — garbage is the expected input for a forensics tool |
+
+The file-format documentation (`docs/FORMAT.md`) is **generated from the
+schema** by dabqlite-codegen and drift-checked in CI, so the documented
+offsets can never rot away from the code that uses them.
+
 ## Deadlock (and its lockstep analog, the protocol stall)
 
 Classic lock-ordering deadlock is **structurally impossible**, and the

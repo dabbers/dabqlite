@@ -1,11 +1,27 @@
 //! CLI: `dabqlite-codegen <schema.sql> [out.rs]` — parse, generate, write
 //! (or print to stdout). Exit code 1 with a line-numbered message on any
 //! schema error.
+//!
+//! `--format-doc <legacy.sql> <out.md>` additionally emits the on-disk
+//! format documentation, derived from the schema (and the legacy schema,
+//! for the migration section) so the numbers cannot rot.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut format_doc: Option<(String, String)> = None;
+    if let Some(i) = raw.iter().position(|a| a == "--format-doc") {
+        if raw.len() < i + 3 {
+            eprintln!("error: --format-doc needs <legacy.sql> <out.md>");
+            return ExitCode::FAILURE;
+        }
+        let out = raw.remove(i + 2);
+        let legacy = raw.remove(i + 1);
+        raw.remove(i);
+        format_doc = Some((legacy, out));
+    }
+    let mut args = raw.into_iter();
     let Some(schema_path) = args.next() else {
         eprintln!("usage: dabqlite-codegen <schema.sql> [out.rs [<queries.sql> <queries_out.rs>]]");
         return ExitCode::FAILURE;
@@ -50,6 +66,29 @@ fn main() -> ExitCode {
             }
         }
         None => print!("{code}"),
+    }
+
+    if let Some((legacy_path, doc_out)) = format_doc {
+        let legacy_sql = match std::fs::read_to_string(&legacy_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {legacy_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let legacy = match dabqlite_codegen::parse_schema(&legacy_sql) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {legacy_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let doc = dabqlite_codegen::emit_format_doc(&schema, &legacy, &schema_path);
+        if let Err(e) = std::fs::write(&doc_out, &doc) {
+            eprintln!("error: cannot write {doc_out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("format doc: {doc_out}");
     }
 
     if let Some((queries_path, queries_out)) = queries_paths {

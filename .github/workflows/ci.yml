@@ -44,7 +44,8 @@ jobs:
           cargo run -p dabqlite-codegen -- schema/records.sql \
             crates/dabqlite-core/src/generated/records.rs \
             schema/queries.sql \
-            crates/dabqlite-core/src/generated/queries.rs
+            crates/dabqlite-core/src/generated/queries.rs \
+            --format-doc schema/records_v1.sql docs/FORMAT.md
           cargo run -p dabqlite-codegen -- schema/records_v1.sql \
             crates/dabqlite-core/src/generated/records_v1.rs
           git diff --exit-code
