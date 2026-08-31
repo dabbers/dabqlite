@@ -115,6 +115,33 @@ state is visible but not durable. Failed writes still dirty the cache
 | **Truncation** of either file at every 8-byte point | exhaustive | `faults.rs` | full recovery, honest older state, or `Corrupt` — never wrong data |
 | **Garbage extension** of either file | sampled sizes × seeds | `faults.rs` | inert: the manifest defines the live region |
 
+## Disk exhaustion (ENOSPC: the filesystem's wall, not the schema's)
+
+ENOSPC is a fault REGIME, not an event: once the disk is full, every
+write and fsync fails until space frees, while reads keep working. The
+one-shot EIO sweeps cannot express that persistence — so the simulator
+has a dedicated regime (`disk_full_from`/`until`: writes and fsyncs
+refused, reads served, failed writes still dirty the cache), and the
+same episode runs against REAL files with the KERNEL refusing the
+writes (a size-capped tmpfs; `/dev/full` itself is a single character
+device and cannot host a database directory).
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| The wall arrives at EVERY boundary of an insert | exhaustive × seeds | `disk_full.rs` | fail-stop; repeated recoveries on the still-full disk refused loudly with zero cumulative harm; one recovery after space frees serves every acked row exactly (N or N+1) |
+| Reads through the regime | pinned | same | gets/ranges/finds on an open engine keep working — zero I/O, zero opportunity for the wall to bite |
+| Crash DURING the episode | settle seeds | same | composes with the crash model: settle, loud refusals while full, exact convergence after |
+| Single-copy repair meets the full disk | targeted | same | the repair write is refused until space frees, then lands — never repaired-in-name-only |
+| Migration on a full disk | every I/O boundary | same | clean fail-stop, legacy byte-identical, full convergence after space frees |
+| Full-disk recovery episodes in the soak | seeded, floor-asserted | `lifetime.rs`, `vopr` | folded into every lifetime's fault schedule |
+| **Genuine kernel ENOSPC** (256K tmpfs, real files, real errno 28) | end-to-end | `dabqlite-host/tests/enospc.rs` (root or `DABQLITE_ENOSPC_DIR`; CI mounts it with sudo) | the whole episode on real hardware semantics: raw `ENOSPC` surfaced via `last_error`, fail-stop, the inspector works on the full disk, recovery succeeds on the STILL-FULL disk (recovery never allocates: reads, flushes of existing pages, and a repair overwrite of an existing slot), still-full re-refusal, then space freed → zero acked loss across the episode |
+
+Honesty note: "recovery never allocates" holds for overwrite-in-place
+filesystems (tmpfs, ext4). On CoW filesystems (btrfs, ZFS) an overwrite
+can itself ENOSPC — there recovery fails LOUDLY instead (the sim regime
+covers exactly that shape: recovery refused until space frees). Either
+way: never silent, never lossy.
+
 ## Read-path faults (in flight; the disk itself is clean)
 
 | Scenario | Mode | Suite | Guarantee |

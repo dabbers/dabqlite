@@ -63,6 +63,14 @@ pub struct SimHost {
     /// dirties the page cache first — a failed syscall may have partially
     /// succeeded; a failed fsync syncs nothing.
     pub fail_after: Option<u64>,
+    /// Disk-full (ENOSPC) regime: from this I/O index, EVERY write and
+    /// fsync fails — persistently, the way a full disk actually behaves —
+    /// while reads keep succeeding. Failed writes still dirty the page
+    /// cache (the syscall may have partially applied before hitting the
+    /// wall). Ends at `disk_full_until` (exclusive), or never.
+    pub disk_full_from: Option<u64>,
+    /// End of the disk-full regime: the index at which space was freed.
+    pub disk_full_until: Option<u64>,
     /// Misdirect the write at this I/O index (non-write ops are unaffected;
     /// see `misdirected` to check whether it actually fired).
     pub misdirect_at: Option<(u64, Misdirect)>,
@@ -108,6 +116,8 @@ impl SimHost {
             io_count: 0,
             crash_after,
             fail_after: None,
+            disk_full_from: None,
+            disk_full_until: None,
             misdirect_at: None,
             misdirected: 0,
             read_corrupt_at: None,
@@ -135,6 +145,14 @@ impl SimHost {
     /// (`io_count` was already advanced past it.)
     fn this_op_fails(&self) -> bool {
         Some(self.io_count - 1) == self.fail_after
+    }
+
+    /// True if the op just counted falls inside the disk-full regime —
+    /// applies to writes and fsyncs only; a full disk still reads fine.
+    fn disk_is_full(&self) -> bool {
+        let idx = self.io_count - 1;
+        self.disk_full_from.is_some_and(|from| idx >= from)
+            && self.disk_full_until.is_none_or(|until| idx < until)
     }
 
     fn this_op_misdirects(&self) -> Option<Misdirect> {
@@ -218,10 +236,12 @@ impl SimHost {
                         return Driven::Crashed;
                     }
                     self.n_writes += 1;
-                    if self.this_op_fails() {
+                    if self.this_op_fails() || self.disk_is_full() {
                         // The syscall failed, but the pages may already be
                         // dirty: model the worst case (write applied to the
-                        // cache, never acknowledged).
+                        // cache, never acknowledged). ENOSPC behaves the
+                        // same at this seam — the difference is that the
+                        // full-disk regime PERSISTS across ops.
                         self.disk.write(file, offset, data.as_slice());
                         out = self.tick_machine(Input::IoFailed { file });
                         continue;
@@ -256,7 +276,7 @@ impl SimHost {
                         return Driven::Crashed;
                     }
                     self.n_fsyncs += 1;
-                    if self.this_op_fails() {
+                    if self.this_op_fails() || self.disk_is_full() {
                         out = self.tick_machine(Input::IoFailed { file });
                         continue;
                     }

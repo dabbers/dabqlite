@@ -58,6 +58,16 @@ jobs:
           cargo test -p dabqlite-sim --test scale --release -- --ignored
           cargo test -p dabqlite-host --test scale_posix --release -- --ignored
 
+      # GENUINE ENOSPC: a 256K tmpfs, filled until the kernel refuses the
+      # writes. The test skips itself without this mount; CI provides it.
+      - name: Real ENOSPC episode (size-capped tmpfs)
+        run: |
+          sudo mkdir -p /mnt/dabqlite-enospc
+          sudo mount -t tmpfs -o size=256k,mode=0777 tmpfs /mnt/dabqlite-enospc
+          DABQLITE_ENOSPC_DIR=/mnt/dabqlite-enospc \
+            cargo test -p dabqlite-host --test enospc -- --nocapture
+          sudo umount /mnt/dabqlite-enospc
+
       # A short randomized soak on top of the deterministic sweeps. Any
       # failure prints the seed that reproduces it.
       - name: VOPR soak (200 random lifetimes)

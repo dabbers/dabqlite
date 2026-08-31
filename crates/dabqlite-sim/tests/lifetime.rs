@@ -59,6 +59,23 @@ fn every_cycle_verifies_the_whole_feature_surface() {
 }
 
 #[test]
+fn full_disk_episodes_actually_happen_in_the_soak() {
+    let cfg = LifetimeConfig {
+        disk_full_p: 0.5,
+        ..LifetimeConfig::default()
+    };
+    let mut episodes = 0;
+    for seed in 0..12u64 {
+        episodes += run_lifetime(seed, &cfg).disk_full_recoveries;
+    }
+    assert!(
+        episodes > 20,
+        "only {episodes} full-disk recovery episodes; the ENOSPC regime \
+         is under-exercised"
+    );
+}
+
+#[test]
 fn legacy_lifetimes_migrate_under_fire_and_then_live_normally() {
     // A lifetime that BEGINS as a v1 database: migrated under the fault
     // schedule (crash/EIO retries until the two-worlds protocol

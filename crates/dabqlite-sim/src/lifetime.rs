@@ -49,6 +49,11 @@ pub struct LifetimeConfig {
     /// rows, and migrate it — under the fault schedule — before the first
     /// open. 0 = start fresh (the classic lifetime).
     pub legacy_rows_max: u64,
+    /// Probability that a recovery happens during a DISK-FULL episode:
+    /// the first attempt(s) run with every write and fsync refused
+    /// (reads fine), must fail loudly, and the real recovery follows
+    /// once "space frees".
+    pub disk_full_p: f64,
 }
 
 impl Default for LifetimeConfig {
@@ -60,6 +65,7 @@ impl Default for LifetimeConfig {
             recovery_crash_p: 0.25,
             io_fail_p: 0.2,
             legacy_rows_max: 0,
+            disk_full_p: 0.15,
         }
     }
 }
@@ -85,6 +91,8 @@ pub struct LifetimeStats {
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
     pub migration_attempts: u64,
+    /// Recoveries first refused by a full-disk episode, then converged.
+    pub disk_full_recoveries: u64,
     /// I/O ops performed across every incarnation of this lifetime, for
     /// simulated-time accounting (docs/FAULTS.md).
     pub reads: u64,
@@ -405,6 +413,25 @@ fn recover(
     rng: &mut ChaCha8Rng,
     stats: &mut LifetimeStats,
 ) -> SimHost {
+    if rng.gen_bool(cfg.disk_full_p) {
+        // The restart lands on a FULL DISK: recovery must be refused
+        // loudly (IoFailed, no ack, no harm), one or more times, until
+        // space frees. Reads would still work; recovery's durability
+        // fsyncs cannot.
+        for _ in 0..rng.gen_range(1..=3) {
+            let mut host = SimHost::new(cfg.caps, disk, None);
+            host.disk_full_from = Some(0);
+            match host.open() {
+                Driven::Done(Output::OpenDone {
+                    result: Err(dabqlite_core::DbError::IoFailed { .. }),
+                }) => {}
+                other => panic!("[{ctx}] full-disk recovery must refuse: {other:?}"),
+            }
+            absorb_io(stats, &host);
+            disk = std::mem::take(&mut host.disk);
+        }
+        stats.disk_full_recoveries += 1;
+    }
     if rng.gen_bool(cfg.recovery_crash_p) {
         // Crash during the recovery itself, then settle and try again.
         let boundary = rng.gen_range(0..6); // recovery is 6 ops incl. repair writes

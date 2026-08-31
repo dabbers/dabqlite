@@ -44,6 +44,7 @@ struct Totals {
     inspections: u64,
     migrations: u64,
     migration_attempts: u64,
+    disk_full_recoveries: u64,
 }
 
 impl Totals {
@@ -60,6 +61,7 @@ impl Totals {
         self.inspections += s.inspections;
         self.migrations += s.migrations;
         self.migration_attempts += s.migration_attempts;
+        self.disk_full_recoveries += s.disk_full_recoveries;
     }
 
     fn report(&self, wall_secs: f64) {
@@ -77,8 +79,13 @@ impl Totals {
         );
         println!(
             "vopr: full surface: {} migrations ({} attempts under faults), \
-             {} substring-search oracle checks, {} inspector agreements",
-            self.migrations, self.migration_attempts, self.find_checks, self.inspections
+             {} substring-search oracle checks, {} inspector agreements, \
+             {} full-disk recovery episodes",
+            self.migrations,
+            self.migration_attempts,
+            self.find_checks,
+            self.inspections,
+            self.disk_full_recoveries
         );
         println!(
             "vopr: simulated operational time: {:.1} h ({:.1} h of device I/O + {} restart cycles at {}s)",
@@ -119,6 +126,7 @@ fn config_for(seed: u64) -> LifetimeConfig {
         recovery_crash_p: rng.gen_range(0.0..0.4),
         io_fail_p: rng.gen_range(0.0..0.4),
         legacy_rows_max,
+        disk_full_p: rng.gen_range(0.0..0.3),
     }
 }
 
