@@ -142,6 +142,50 @@ can itself ENOSPC — there recovery fails LOUDLY instead (the sim regime
 covers exactly that shape: recovery refused until space frees). Either
 way: never silent, never lossy.
 
+## Resource exhaustion: memory and CPU (the other two walls)
+
+Disk was one wall; memory and CPU are the other two, and the design
+retires both structurally rather than probabilistically — then pins the
+structure with tests that would notice it eroding.
+
+**Memory.** §4.2 confines allocation to init: every arena is sized from
+the declared capacities in `Engine::new`, and nothing allocates after.
+That claim is not a code-review opinion — it is a COUNT. A counting
+global allocator measures literally zero heap allocations across the
+entire steady-state surface (open, commits, gets, range paging,
+substring search, and a second engine's full recovery with its complete
+index rebuilds), with the host lending borrowed read buffers as the
+sans-I/O protocol invites. An engine that cannot allocate after init
+cannot OOM after init; OOM is thereby cornered at construction, where it
+equals a crash before the first write — a fate the crash sweeps already
+own — and that equality is proven against a REAL allocator failure, not
+a mock.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Steady state allocates | counting `#[global_allocator]`, single-test binary | `dabqlite-core/tests/allocation.rs` | **zero** heap allocations after `Engine::new` — across open, 64 commits, every get, full range paging, substring search, AND a fresh engine's recovery + reads. Not "few": zero, asserted as a number |
+| Genuine OOM at init (`RLIMIT_AS` 256 MiB vs a ~1.6 GiB arena) | real child process, allocator abort | `dabqlite-host/tests/oom.rs` | the process dies by the allocator's own abort; the database directory is **byte-identical** after the death (OOM ≡ crash-before-first-write); the flock died with the process, so a normal open works immediately and serves every row. A control run (same limit, sane capacity) proves the death is the allocation's, not the environment's |
+| Unrepresentable capacity (arena size overflows) | named-panic pins | `dabqlite-core/tests/limits.rs` | refused at construction with a named panic — checked arithmetic never wraps into a small arena that would corrupt addressing later; zero-capacity refused likewise (engine and migration engine both) |
+
+**CPU.** The core is clockless by construction (§7.1 — the wasm gate
+makes ambient time and threads unlinkable), so CPU starvation has no
+seam to enter through: a starved engine computes the same bytes, later.
+Pinned empirically at both ends of the scale:
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Every core pegged (2× spinner threads per core) | full-surface lifetimes vs unloaded baseline | `dabqlite-sim/tests/saturation.rs` | **bit-identical** `LifetimeStats` for every seed — crashes, EIO, recovery crashes, disk-full episodes, legacy migration, all of it, unmoved by scheduling pressure |
+| The same seed raced from 8 threads simultaneously, under load | concurrent self-agreement | same | exact agreement — no hidden global, no shared mutable state, nothing scheduling-order-dependent in engine, simulator, oracle, or inspector |
+| The infinitely pegged CPU: a REAL writer SIGSTOPed mid-commit, held, resumed — ×5 staggered freeze points | real processes, real signals | `dabqlite-host/tests/sigstop.rs` | the writer completes its workload exactly (every row byte-for-byte) as if nothing happened — from where it stands, nothing did; the flock protects the store for the whole pause (stillness is not death: a second process is refused throughout); the inspector works on the frozen writer's directory, torn mid-commit bytes and all |
+
+Honesty note: a host embedding the engine can of course still allocate
+around it (buffers it chooses to own, `Vec` results in convenience
+APIs); the zero-allocation proof is about the ENGINE's steady state, and
+the borrowed-buffer host in the test shows the zero-copy path exists
+end-to-end. And SIGSTOP freezes between instructions, not between
+syscall submission and completion — the crash sweeps own the harder
+question of I/O torn mid-flight.
+
 ## Read-path faults (in flight; the disk itself is clean)
 
 | Scenario | Mode | Suite | Guarantee |
