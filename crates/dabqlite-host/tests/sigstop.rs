@@ -36,7 +36,18 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn proc_state(pid: i32) -> char {
+/// Send a named signal via the POSIX shell's `kill` builtin — the same
+/// syscall, reached without FFI, so the harness stays as safe as the
+/// engine it tests.
+fn signal(pid: u32, sig: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", r#"kill -s "$1" "$2""#, "sh", sig, &pid.to_string()])
+        .status()
+        .expect("spawn kill")
+        .success()
+}
+
+fn proc_state(pid: u32) -> char {
     // /proc/<pid>/stat field 3 is the state letter; the comm field before
     // it is parenthesized and may contain spaces, so split after ')'.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
@@ -59,7 +70,7 @@ fn a_writer_frozen_mid_commit_resumes_and_completes_exactly() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn churner");
-    let pid = churner.id() as i32;
+    let pid = churner.id();
     let mut stdout = BufReader::new(churner.stdout.take().expect("stdout"));
 
     let mut line = String::new();
@@ -77,10 +88,7 @@ fn a_writer_frozen_mid_commit_resumes_and_completes_exactly() {
     // finishes the whole workload instantly cannot race these cycles.)
     for (cycle, delay_ms) in [0u64, 2, 5, 15, 40].into_iter().enumerate() {
         std::thread::sleep(Duration::from_millis(delay_ms));
-        // setrlimit-style FFI confinement: one signal syscall on our child.
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::kill(pid, libc::SIGSTOP) };
-        assert_eq!(rc, 0, "SIGSTOP failed on cycle {cycle}");
+        assert!(signal(pid, "STOP"), "SIGSTOP failed on cycle {cycle}");
         // The process is truly frozen (state T), not merely signaled.
         let mut state = proc_state(pid);
         for _ in 0..100 {
@@ -115,9 +123,7 @@ fn a_writer_frozen_mid_commit_resumes_and_completes_exactly() {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::kill(pid, libc::SIGCONT) };
-        assert_eq!(rc, 0, "SIGCONT failed on cycle {cycle}");
+        assert!(signal(pid, "CONT"), "SIGCONT failed on cycle {cycle}");
     }
 
     // Thawed for the last time: the writer finishes as if nothing at all

@@ -6,9 +6,8 @@
 //! backend is pure positional I/O on held handles, the same shape OPFS
 //! sync access handles offer.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -56,19 +55,23 @@ impl PosixStorage {
         // Take the single-writer lock BEFORE touching data files: a second
         // process must be refused before it can do any harm at all.
         let lock = open(LOCK_FILE)?;
-        // FFI is the only way to flock; the unsafety is confined to this
-        // one syscall on an owned fd.
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "dabqlite: {} is locked by another process; the store is \
-                     single-writer (design §2) — close the other handle first",
-                    dir.display()
-                ),
-            ));
+        // Non-blocking exclusive lock via std (`flock(LOCK_EX|LOCK_NB)` on
+        // Linux): held by the open file description, released by the
+        // kernel when the process dies — crash-safe by construction, and
+        // no unsafe FFI anywhere in the workspace's production code.
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "dabqlite: {} is locked by another process; the store is \
+                         single-writer (design §2) — close the other handle first",
+                        dir.display()
+                    ),
+                ));
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
         }
         let superblock = open(SUPERBLOCK_FILE)?;
         let rows = open(&rows_file_name(SCHEMA_HASH))?;

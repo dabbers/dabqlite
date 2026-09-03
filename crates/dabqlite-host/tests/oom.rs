@@ -35,6 +35,25 @@ const CAPS: Capacities = Capacities { rows: 64 };
 const HUGE_ROWS: u64 = 50_000_000;
 const RLIMIT_MB: u64 = 256;
 
+/// Run the probe under an address-space ceiling imposed from OUTSIDE the
+/// process, by the shell (`ulimit -v`, in KiB, is `RLIMIT_AS`). The limit
+/// arrives before `exec`, so the probe binary itself contains no FFI and
+/// no unsafe code — the harness stays as safe as the engine it tests.
+fn probe_under_limit(dir: &Path, rows: u64, limit_mb: u64) -> std::process::Output {
+    Command::new("sh")
+        .args([
+            "-c",
+            r#"ulimit -v "$1" && exec "$2" "$3" "$4""#,
+            "sh",
+            &(limit_mb * 1024).to_string(),
+            env!("CARGO_BIN_EXE_oomprobe"),
+            dir.to_str().expect("utf8 dir"),
+            &rows.to_string(),
+        ])
+        .output()
+        .expect("spawn probe")
+}
+
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-oom-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -80,14 +99,7 @@ fn oom_at_init_is_a_crash_before_the_first_write() {
     // Honesty control FIRST: the same limit, a sane capacity — the probe
     // binary opens and reads the database fine. Whatever kills the next
     // run is therefore the allocation, not the limit or the environment.
-    let out = Command::new(env!("CARGO_BIN_EXE_oomprobe"))
-        .args([
-            dir.to_str().expect("utf8 dir"),
-            &CAPS.rows.to_string(),
-            &RLIMIT_MB.to_string(),
-        ])
-        .output()
-        .expect("spawn control probe");
+    let out = probe_under_limit(&dir, CAPS.rows, RLIMIT_MB);
     assert!(
         out.status.success(),
         "control probe failed under the limit: {}",
@@ -102,14 +114,7 @@ fn oom_at_init_is_a_crash_before_the_first_write() {
     // The real thing: an oversized capacity under the same limit. The
     // init allocation fails; Rust's allocator error handler ABORTS —
     // no exit code 0, no unwinding something could swallow.
-    let out = Command::new(env!("CARGO_BIN_EXE_oomprobe"))
-        .args([
-            dir.to_str().expect("utf8 dir"),
-            &HUGE_ROWS.to_string(),
-            &RLIMIT_MB.to_string(),
-        ])
-        .output()
-        .expect("spawn oom probe");
+    let out = probe_under_limit(&dir, HUGE_ROWS, RLIMIT_MB);
     assert!(
         !out.status.success(),
         "a {HUGE_ROWS}-row arena fit inside {RLIMIT_MB} MiB?"

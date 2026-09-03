@@ -9,14 +9,14 @@ repository.workspace = true
 [dependencies]
 dabqlite-core = { path = "../dabqlite-core" }
 
-[target.'cfg(unix)'.dependencies]
-# flock only: the single-writer lock (docs/DESIGN.md §2: "one writer,
-# always") needs an advisory lock that the kernel releases on process
-# death, which std does not expose.
-libc = "0.2"
-
 [dev-dependencies]
 dabqlite-sim = { path = "../dabqlite-sim" }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Constants only (the ENOSPC errno in the disk-full test). The
+# single-writer lock uses std's `File::try_lock` (flock on Linux), so
+# production code needs no libc and contains no unsafe.
+libc = "0.2"
 
 [lints]
 workspace = true

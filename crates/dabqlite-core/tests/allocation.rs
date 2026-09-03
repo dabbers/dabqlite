@@ -1,7 +1,9 @@
-// The one test-only unsafe exception in the workspace: a global
-// allocator must be `unsafe impl` by language rule. It delegates every
-// call verbatim to `System` and only increments a counter — the unsafety
-// is the trait signature, not any behavior.
+// The ONLY unsafe code in the entire workspace (production code has
+// none; `unsafe_code` is denied workspace-wide): a global allocator must
+// be `unsafe impl` by language rule — there is no safe-Rust way to
+// observe every allocation. It delegates every call verbatim to `System`
+// and only increments a counter; the unsafety is the trait signature,
+// not any behavior.
 #![allow(unsafe_code)]
 //! Memory exhaustion, made structurally impossible after init — and
 //! PROVEN as a count, not argued from discipline.

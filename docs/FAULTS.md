@@ -186,6 +186,14 @@ end-to-end. And SIGSTOP freezes between instructions, not between
 syscall submission and completion — the crash sweeps own the harder
 question of I/O torn mid-flight.
 
+On memory SAFETY (as opposed to exhaustion): `unsafe_code` is denied
+workspace-wide, and production code contains none at all — the
+single-writer lock uses std's safe `File::try_lock` (`flock` on Linux),
+and the harness reaches `ulimit`/signals through the shell rather than
+FFI. The one `#![allow(unsafe_code)]` in the entire tree is the counting
+global allocator in `allocation.rs`: `GlobalAlloc` is an unsafe trait by
+language rule, and the impl delegates verbatim to `System`.
+
 ## Read-path faults (in flight; the disk itself is clean)
 
 | Scenario | Mode | Suite | Guarantee |
@@ -415,10 +423,11 @@ argument is enforced, not asserted:
   mutexes, no channels, no blocking calls. The wasm32 determinism gate
   makes this a build-time fact — the core is `no_std`, and `std::sync`
   does not exist to link against.
-- The one OS lock (`flock` in `PosixStorage`) is taken with `LOCK_NB`:
-  it never waits, it refuses instantly with `WouldBlock` (pinned by
-  error kind in `locking.rs`). With no blocking acquisition anywhere,
-  there is no wait-for graph to have a cycle in.
+- The one OS lock (std `File::try_lock` in `PosixStorage` — `flock`
+  with `LOCK_NB` on Linux) is non-blocking: it never waits, it refuses
+  instantly with `WouldBlock` (pinned by error kind in `locking.rs`).
+  With no blocking acquisition anywhere, there is no wait-for graph to
+  have a cycle in.
 - The only mutex in the repository is test-only (the locking suite's
   serialization guard): a single lock, never nested, poison-recovering.
 
