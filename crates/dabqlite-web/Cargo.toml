@@ -1,0 +1,43 @@
+[package]
+name = "dabqlite-web"
+description = "OPFS storage backend for dabqlite (browser, dedicated workers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dabqlite-core = { path = "../dabqlite-core" }
+dabqlite-host = { path = "../dabqlite-host" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemReadWriteOptions",
+    "FileSystemRemoveOptions",
+    "FileSystemSyncAccessHandle",
+    "Navigator",
+    "StorageManager",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+]
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Native-only: the three-way equivalence suite drives the simulator and
+# the POSIX backend beside the OPFS one.
+[target.'cfg(unix)'.dev-dependencies]
+dabqlite-sim = { path = "../dabqlite-sim" }
+
+[lints]
+workspace = true

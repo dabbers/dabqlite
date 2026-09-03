@@ -328,6 +328,52 @@ the simulation to real hardware behavior:
 | Identical at-rest damage (flips, truncations) applied to both | fault grid | same | identical recovery outcomes, row for row, error for error |
 | Close and reopen real files (real fsync path) | seeds | same | full recovery, no rollback evidence |
 
+## The browser backend (OPFS, design §8.1 — web-native, not a port)
+
+The design's most load-bearing portability claim is that a database
+written in a browser is the *same* database, not a lookalike. The
+storage trait was shaped by OPFS sync access handles rather than POSIX
+precisely so that could be true; this is where it stops being a design
+intention and becomes a checked property.
+
+The OPFS backend splits deliberately. Everything that could actually be
+wrong — EOF clamping, short-I/O resumption, gap zero-filling, size
+tracking — is portable Rust behind a four-method `SyncHandle` seam
+(`getSize`/`read`/`write`/`flush`, which is the entire OPFS API). Only
+the thin binding to the browser is wasm-only. So the interesting half is
+tested natively and deterministically, and the browser is asked to
+confirm the one remaining assumption: that real OPFS behaves as modeled.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Same workload through simulator, POSIX files, and the OPFS backend | seeds | `dabqlite-web/tests/contract.rs` | **byte-for-byte identical files across all three** — a browser-written database is byte-identical to a server-written one |
+| Identical at-rest damage (flips, truncations) applied to all three | fault grid | same | identical recovery outcomes, row for row, error for error — so the entire simulated fault matrix transfers to the browser |
+| Short I/O: a handle that legally moves fewer bytes than asked (1, 3, 7 at a time) | sweep | same | reads and writes resume until complete; bytes identical to the unchunked run, and recovery still reconstructs everything |
+| Zero-progress I/O (a broken handle) | targeted | same | refused loudly as `ShortRead`/`ShortWrite` — never a half-filled buffer handed to the engine as data |
+| Handle failure (`DOMException`) at every I/O boundary | sweep | same | clean fail-stop through the same path every backend's errors take; never a panic, never a silent success |
+| Recovery from exactly the flushed image (the tab died) | seeds | same | every acknowledged row present and exact; in-flight resolves all-or-nothing |
+| **Real OPFS vs. the model, same workload, same tab** | real Chromium, dedicated worker | `dabqlite-web/tests/opfs_browser.rs` | byte-for-byte agreement — chained with the native suite this gives `real OPFS == model == POSIX files == simulator` |
+| Real reopen: close handles, reacquire, recover | real browser | same | full recovery of every row, no rollback evidence |
+| Write past EOF on real OPFS | real browser | same | the gap really is zero-filled — the assumption the out-of-order superblock layout rests on, asked of the platform instead of assumed |
+| Reads clamping at EOF on real OPFS | real browser | same | past-EOF reads return empty, straddling reads return the tail — the shared contract, verified on the platform |
+| Second sync access handle on an open file | real browser | same | refused by the platform, granted again after `close()` — the browser's `flock` (design §2, §8.1), needing no election protocol for the single-tab case |
+
+Honesty notes:
+
+- **Durability in browsers is best-effort, by the platform's own
+  admission** (§5). `flush()` does not carry POSIX-level crash
+  guarantees, so a tab killed by the OS may lose a flush the engine
+  believed durable. Ordering still holds, which means this degrades to
+  exactly the lying-fsync fault class the simulator sweeps
+  exhaustively: the surviving guarantee is prefix consistency, never
+  silent divergence. What is *not* claimed is that a browser database is
+  as durable as a server one.
+- The browser suite runs in Chromium. Safari and Firefox implement the
+  same specified semantics, but "specified" and "verified here" are
+  different words; cross-browser runs are a known gap, listed below.
+- Safari incognito has no OPFS at all (§8.1). The IndexedDB fallback is
+  not built yet — also listed below.
+
 ## Single-writer enforcement (design §2: one writer, always)
 
 | Scenario | Mode | Suite | Guarantee |
@@ -611,3 +657,19 @@ engine.)
 - Timing/concurrency faults beyond completion-ordering do not exist yet:
   v1 serializes all access by design (docs/DESIGN.md §5). When concurrent
   readers arrive, this matrix grows a new section.
+- **Browser durability is best-effort**, by the platform's own admission
+  (design §5): OPFS `flush()` carries no POSIX-level crash guarantee, so
+  a tab killed by the OS degrades to the lying-fsync class — prefix
+  consistency and detection, never silent divergence.
+- **The browser suite runs in Chromium only.** Safari and Firefox
+  implement the same specified OPFS semantics, and the model asserts
+  those semantics explicitly, so a divergence would surface as a test
+  failure rather than as data loss — but cross-browser runs are not
+  wired up yet.
+- **Multi-tab is refused, not coordinated.** A second worker is rejected
+  by OPFS's exclusive handles (the browser's `flock`); the
+  `BroadcastChannel` leader election design §8.1 contemplates is not
+  built. Refusing is correct and safe; electing would be friendlier.
+- **No IndexedDB fallback yet**, so Safari incognito (which has no OPFS
+  at all) is unsupported rather than degraded — design §8.1 calls for
+  one.

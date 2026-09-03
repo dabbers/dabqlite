@@ -28,6 +28,22 @@ use dabqlite_core::{Capacities, Engine, FileId, Input, Output};
 #[cfg(unix)]
 pub mod posix;
 
+/// The declared file set's names (docs/DESIGN.md §4.4). These are a
+/// design-level fact, not a POSIX detail: every backend — POSIX files,
+/// OPFS, anything later — must name the same files the same way, or a
+/// database written by one could not be read by another. The POSIX
+/// module re-exports them for compatibility.
+pub const SUPERBLOCK_FILE: &str = "superblock.dabq";
+pub const LOCK_FILE: &str = "lock.dabq";
+
+/// Rows files are NAMED by the schema hash that wrote them, so the
+/// superblock's stored hash is also the name of the live rows file. After
+/// a migration flips the superblock, the legacy file is an orphan the
+/// manifest no longer names — inert by construction (docs/DESIGN.md §4.4).
+pub fn rows_file_name(schema_hash: u64) -> String {
+    format!("rows-{schema_hash:016x}.dabq")
+}
+
 #[cfg(unix)]
 pub use posix::PosixStorage;
 

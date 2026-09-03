@@ -1,0 +1,15 @@
+# Browser tests (the OPFS backend) run through wasm-bindgen's harness,
+# which drives a real headless browser over WebDriver. Install it with a
+# version matching the `wasm-bindgen` crate in Cargo.lock:
+#
+#   cargo install wasm-bindgen-cli --version <lock version> --locked
+#
+# then point CHROMEDRIVER at a chromedriver whose major version matches
+# the installed Chrome, and run:
+#
+#   cargo test -p dabqlite-web --target wasm32-unknown-unknown
+#
+# Capabilities (headless, sandbox flags) come from
+# crates/dabqlite-web/webdriver.json.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

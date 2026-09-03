@@ -84,6 +84,12 @@ crates/
                   bit-rot fault models, crash-boundary injection, seeded
                   workloads, model-based oracles, whole-lifetime runs, and
                   the `vopr` soak binary.
+  dabqlite-web    The OPFS backend: the browser half of the storage seam.
+                  The contract logic is portable Rust behind a four-method
+                  handle trait (the whole OPFS API), so it is tested
+                  natively; real Chromium then proves the model matches the
+                  platform. Result: browser bytes == POSIX bytes ==
+                  simulator bytes.
 docs/
   DESIGN.md       The seed design & requirements document. Load-bearing.
 ```
@@ -94,6 +100,14 @@ docs/
 cargo test --workspace                                  # everything
 cargo test -p dabqlite-sim --test crash_recovery        # the §7.3 sweep
 cargo build -p dabqlite-core --target wasm32-unknown-unknown  # determinism gate
+
+# Browser tests: real OPFS, real Chromium, in a dedicated worker. Needs a
+# wasm-bindgen CLI matching the wasm-bindgen version in Cargo.lock, and a
+# chromedriver matching the installed Chrome.
+cargo install wasm-bindgen-cli --version "$(grep -A1 '^name = \"wasm-bindgen\"$' \
+  Cargo.lock | grep '^version' | head -1 | cut -d'\"' -f2)" --locked
+CHROMEDRIVER=/path/to/chromedriver \
+  cargo test -p dabqlite-web --target wasm32-unknown-unknown
 
 # Soak: randomized lifetimes until interrupted; every run prints its seed.
 cargo run --release -p dabqlite-sim --bin vopr

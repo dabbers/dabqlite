@@ -16,16 +16,10 @@ use dabqlite_core::{FileId, SCHEMA_HASH};
 
 use crate::Storage;
 
-pub const SUPERBLOCK_FILE: &str = "superblock.dabq";
-pub const LOCK_FILE: &str = "lock.dabq";
-
-/// Rows files are NAMED by the schema hash that wrote them, so the
-/// superblock's stored hash is also the name of the live rows file. After
-/// a migration flips the superblock, the legacy file is an orphan the
-/// manifest no longer names — inert by construction (docs/DESIGN.md §4.4).
-pub fn rows_file_name(schema_hash: u64) -> String {
-    format!("rows-{schema_hash:016x}.dabq")
-}
+// The file set is backend-independent (docs/DESIGN.md §4.4); these live
+// at the crate root now and are re-exported here so existing callers —
+// the inspector, the test suites — keep working unchanged.
+pub use crate::{rows_file_name, LOCK_FILE, SUPERBLOCK_FILE};
 
 pub struct PosixStorage {
     superblock: File,

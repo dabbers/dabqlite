@@ -34,6 +34,11 @@ jobs:
       - name: Determinism gate (core builds for wasm32-unknown-unknown)
         run: cargo build -p dabqlite-core --target wasm32-unknown-unknown
 
+      # The OPFS backend is a wasm-only crate, so native clippy never sees
+      # it. Lint it on the target it actually ships to.
+      - name: Clippy (wasm32: the OPFS backend)
+        run: cargo clippy -p dabqlite-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+
       - name: Tests (unit, model-based, crash-recovery sweep)
         run: cargo test --workspace
 
@@ -49,6 +54,21 @@ jobs:
           cargo run -p dabqlite-codegen -- schema/records_v1.sql \
             crates/dabqlite-core/src/generated/records_v1.rs
           git diff --exit-code
+
+      # Real OPFS in a real browser (docs/DESIGN.md §8.1). The backend's
+      # contract suite runs natively above; this proves the model of the
+      # sync-access-handle API is not a fiction. GitHub runners ship Chrome
+      # plus a matching chromedriver (CHROMEWEBDRIVER); the wasm-bindgen
+      # CLI must match the wasm-bindgen crate version in Cargo.lock, so it
+      # is derived from the lock file rather than pinned twice.
+      - name: Browser tests (real OPFS, headless Chrome, dedicated worker)
+        run: |
+          VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock \
+            | grep '^version' | head -1 | cut -d'"' -f2)
+          echo "wasm-bindgen $VERSION"
+          cargo install wasm-bindgen-cli --version "$VERSION" --locked
+          export CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
+          cargo test -p dabqlite-web --target wasm32-unknown-unknown
 
       # Scale suites run in release (the profile keeps debug-assertions on,
       # so no assertion coverage is lost): 1M rows simulated, 100k on real
