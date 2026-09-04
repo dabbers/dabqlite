@@ -91,7 +91,23 @@ pub enum DbError {
     /// on disk. Reopen with at least `required` rows.
     CapacityBelowData { required: u64, configured: u64 },
     /// On-disk state violates an invariant the commit protocol guarantees.
+    /// A strict `Open` refuses such a file outright; `OpenSalvage` opens it
+    /// read-only with the damaged rows quarantined, so one bad row costs
+    /// one row rather than the whole database.
     Corrupt { what: &'static str },
+    /// The database is open in SALVAGE mode with `quarantined` unreadable
+    /// rows, and this operation cannot be answered honestly:
+    ///
+    /// - **writes** are refused outright (salvage never mutates);
+    /// - a **`Get` miss** is refused, because "absent" is no longer
+    ///   distinguishable from "was in a quarantined slot". A `Get` HIT is
+    ///   still returned normally: it is checksum-verified and therefore
+    ///   exactly right. Degradation costs certainty about what is missing,
+    ///   never correctness about what is present.
+    ///
+    /// Rebuild with the inspector's `--repair-to` to return to a clean
+    /// database.
+    Degraded { quarantined: u64 },
     /// The host reported an I/O error on this file. The engine fail-stops
     /// (TigerBeetle-style): the in-flight operation is failed, all further
     /// operations are rejected, and the host must restart and re-open. The
@@ -135,6 +151,18 @@ pub enum Input<'a> {
     /// file set (0 = fresh). File creation happens only at open
     /// (docs/DESIGN.md §4.4) and is the host's job.
     Open { superblock_len: u64, rows_len: u64 },
+    /// Begin opening in SALVAGE mode: identical to `Open`, except that a
+    /// committed row which fails verification is QUARANTINED instead of
+    /// failing the open (docs/FAULTS.md, "corruption containment").
+    ///
+    /// The resulting database is read-only and honest about its damage:
+    /// every row it serves is checksum-verified, and every question it
+    /// cannot answer truthfully becomes `DbError::Degraded` rather than a
+    /// confident wrong answer. Salvage writes NO data byte — it only
+    /// fsyncs — so it can never make a damaged file worse.
+    ///
+    /// A salvage open of an undamaged database is exactly a normal open.
+    OpenSalvage { superblock_len: u64, rows_len: u64 },
     /// A read the core requested has completed with these bytes.
     ReadDone { file: FileId, data: &'a [u8] },
     /// A write the core requested has completed.
@@ -219,6 +247,11 @@ pub struct FindPage {
     pub items: [(u64, [u8; VALUE_LEN]); FIND_PAGE],
     pub count: u8,
     pub next: Option<u64>,
+    /// True when the database is open in salvage mode with quarantined
+    /// rows: every row returned is verified and exact, but rows that
+    /// would have matched may be missing. A scan that silently omitted
+    /// them would be indistinguishable from data loss, so it says so.
+    pub incomplete: bool,
 }
 
 /// One bounded page of a range scan, in strictly ascending key order.
@@ -228,6 +261,9 @@ pub struct RangePage {
     pub count: u8,
     /// `Some(k)`: more rows exist; continue with `lo = k`.
     pub next: Option<u64>,
+    /// True when the database is open in salvage mode with quarantined
+    /// rows — see [`FindPage::incomplete`].
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +322,10 @@ enum State {
     InsertWriteSb { copy: u8 },
     /// Insert: superblock fsync in flight (the commit point).
     InsertFsyncSb,
+    /// Open in SALVAGE mode with quarantined rows: READ-ONLY, and honest.
+    /// Verified rows are served exactly; anything the quarantine makes
+    /// unanswerable returns `DbError::Degraded`.
+    Degraded,
     /// Unrecoverable (corrupt or schema-mismatched file). All ops fail.
     Failed(DbError),
 }
@@ -304,6 +344,12 @@ pub struct RecoveryReport {
     /// recovered prefix is still exactly correct; what follows it is gone,
     /// and this flag is the loud version of that fact.
     pub rollback_evidence: bool,
+    /// Committed rows QUARANTINED by a salvage open: they failed checksum
+    /// or padding validation, or duplicated an id already seen, so they
+    /// are not served. Always 0 after a strict `Open` (which refuses such
+    /// a file instead). Nonzero means the database is running degraded and
+    /// should be rebuilt.
+    pub quarantined_rows: u64,
 }
 
 /// The engine. See module docs for the protocol.
@@ -338,6 +384,11 @@ pub struct Engine {
     /// state like the btree — rebuilt at every recovery, updated at the
     /// commit point.
     trigram: TrigramIndex,
+    /// Salvage mode was requested at open: verification failures quarantine
+    /// a row instead of failing the whole database.
+    salvage: bool,
+    /// Committed rows quarantined by a salvage open (0 in every other mode).
+    quarantined: u64,
     /// Negative-space invariant: the allocations must never move. If either
     /// pointer changes, something allocated after init.
     arena_addr: usize,
@@ -371,6 +422,8 @@ impl Engine {
             opened_rows_len: 0,
             orphan_valid_rows: 0,
             pending_repair: None,
+            salvage: false,
+            quarantined: 0,
             arena,
             index,
             ordered,
@@ -407,7 +460,36 @@ impl Engine {
             row_count: self.row_count,
             orphan_valid_rows: self.orphan_valid_rows,
             rollback_evidence: self.orphan_valid_rows >= 2,
+            quarantined_rows: self.quarantined,
         }
+    }
+
+    /// True when this database is open in salvage mode WITH quarantined
+    /// rows: read-only, serving verified rows only, refusing every question
+    /// it cannot answer honestly. Rebuild to clear it.
+    pub fn is_degraded(&self) -> bool {
+        matches!(self.state, State::Degraded)
+    }
+
+    /// Committed rows quarantined by a salvage open — damaged slots that
+    /// exist in the manifest but cannot be verified, so are never served.
+    pub fn quarantined(&self) -> u64 {
+        self.quarantined
+    }
+
+    /// The row indices that ARE readable, ascending. The basis of a rebuild:
+    /// exactly the rows a clean database should contain.
+    pub fn live_rows(&self) -> impl Iterator<Item = (u64, [u8; VALUE_LEN])> + '_ {
+        (0..self.row_count).filter_map(move |row| {
+            let off = (row as usize) * ROW_SIZE;
+            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])?;
+            // Quarantined slots were never copied into the arena, so they
+            // hold zeros — which `decode_row` rejects, since the checksum
+            // of 24 zero bytes is not zero. The index check is the belt to
+            // that braces: a slot is live only if the index agrees THIS row
+            // is where that id lives.
+            (self.index_lookup(id) == Some(row)).then_some((id, value))
+        })
     }
 
     /// Advance the state machine by one input.
@@ -444,6 +526,15 @@ impl Engine {
             debug_assert_eq!(self.ordered.len(), self.row_count);
             debug_assert_eq!(self.trigram.len(), self.row_count);
         }
+        // In salvage mode the manifest still counts the damaged slots, so
+        // the indices are short by exactly the quarantine.
+        if matches!(self.state, State::Degraded) {
+            // The ordered index holds only rows that verified...
+            debug_assert_eq!(self.ordered.len() + self.quarantined, self.row_count);
+            // ...while the trigram's cursor accounts for every slot,
+            // indexed or skipped, so row numbers stay true.
+            debug_assert_eq!(self.trigram.len(), self.row_count);
+        }
         // Pending insert exists exactly in the insert-in-flight states.
         let inserting = matches!(
             self.state,
@@ -461,6 +552,13 @@ impl Engine {
                 superblock_len,
                 rows_len,
             } => self.on_open(superblock_len, rows_len),
+            Input::OpenSalvage {
+                superblock_len,
+                rows_len,
+            } => {
+                self.salvage = true;
+                self.on_open(superblock_len, rows_len)
+            }
             Input::ReadDone { file, data } => self.on_read_done(file, data),
             Input::WriteDone { file } => self.on_write_done(file),
             Input::FsyncDone { file } => self.on_fsync_done(file),
@@ -675,19 +773,39 @@ impl Engine {
                 what: "short read of committed rows",
             });
         }
+        // Verification is per-row, and so is the consequence. A strict open
+        // refuses the whole file (detection over availability); a salvage
+        // open quarantines just the damaged slot, so one bad row costs one
+        // row. Either way a row is only ever SERVED after it verifies —
+        // "never wrong" is not traded away for availability.
+        self.quarantined = 0;
         for row in 0..row_count {
             let off = (row as usize) * ROW_SIZE;
             let chunk = &data[off..off + ROW_SIZE];
             // Pair assertion (docs/DESIGN.md §7.4): rows were verified when
             // encoded on the write path; verify again reading them back.
             let Some((id, value)) = decode_row(chunk) else {
+                if self.salvage {
+                    self.quarantined += 1;
+                    // Account for the slot without indexing it, so every
+                    // later row keeps its true row number.
+                    self.trigram.skip_row(row);
+                    continue;
+                }
                 return self.fail_open(DbError::Corrupt {
-                    what: "committed row failed checksum",
+                    what: crate::defect::ROW_CHECKSUM,
                 });
             };
             if self.index_lookup(id).is_some() {
+                if self.salvage {
+                    // Keep the first occurrence; the later duplicate is the
+                    // damaged one as far as anyone can tell.
+                    self.quarantined += 1;
+                    self.trigram.skip_row(row);
+                    continue;
+                }
                 return self.fail_open(DbError::Corrupt {
-                    what: "duplicate id among committed rows",
+                    what: crate::defect::DUPLICATE_ID,
                 });
             }
             self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
@@ -711,6 +829,23 @@ impl Engine {
             off += ROW_SIZE;
         }
         self.orphan_valid_rows = orphans;
+
+        // Salvage touches NOTHING. A damaged database must not be mutated
+        // by the act of rescuing data from it, and a rescue must work on a
+        // volume that is read-only or failing its writes — so a degraded
+        // open performs no repair write AND no fsync. It reads, verifies,
+        // and reports.
+        //
+        // The visible-implies-durable rule (see `State::RecoverFsyncRows`)
+        // is not weakened: that rule exists so state shown to an
+        // application cannot evaporate underneath later writes built on
+        // it, and a degraded database accepts no writes at all. A salvage
+        // open that finds NO damage is an ordinary open and keeps both the
+        // twin repair and the fsyncs.
+        if self.quarantined > 0 {
+            self.pending_repair = None;
+            return self.finish_open(generation, row_count);
+        }
         self.stage_recovery_fsyncs(generation, row_count)
     }
 
@@ -718,7 +853,13 @@ impl Engine {
         assert!(generation > 0, "committed generation must be positive");
         self.generation = generation;
         self.row_count = row_count;
-        self.state = State::Ready;
+        // A salvage open that found nothing wrong IS a normal open — the
+        // mode is a fallback, not a downgrade.
+        self.state = if self.quarantined > 0 {
+            State::Degraded
+        } else {
+            State::Ready
+        };
         Output::OpenDone {
             result: Ok(row_count),
         }
@@ -746,6 +887,12 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb => Some(DbError::Busy),
+            // Salvage is strictly read-only: appending to a file we know is
+            // damaged, and flipping the manifest over it, could only make a
+            // recoverable situation worse.
+            State::Degraded => Some(DbError::Degraded {
+                quarantined: self.quarantined,
+            }),
             State::Failed(e) => Some(e),
         };
         if let Some(e) = err {
@@ -941,6 +1088,16 @@ impl Engine {
     fn on_get(&mut self, id: u64) -> Output {
         let result = match self.state {
             State::Ready => Ok(self.lookup_value(id)),
+            // A HIT is checksum-verified and therefore exactly right, in
+            // salvage mode as in any other. A MISS is the honest problem:
+            // the id may have lived in a quarantined slot, so `None` would
+            // be a confident answer we cannot justify. Refuse instead.
+            State::Degraded => match self.lookup_value(id) {
+                Some(value) => Ok(Some(value)),
+                None => Err(DbError::Degraded {
+                    quarantined: self.quarantined,
+                }),
+            },
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -960,7 +1117,11 @@ impl Engine {
 
     fn on_range(&mut self, lo: u64, hi: u64) -> Output {
         let result = match self.state {
-            State::Ready => Ok(self.scan_page(lo, hi)),
+            // Served, but every page carries `incomplete: true` — the rows
+            // returned are exact; rows that would have matched may be
+            // missing, and silence about that would be indistinguishable
+            // from data loss.
+            State::Ready | State::Degraded => Ok(self.scan_page(lo, hi)),
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -984,7 +1145,9 @@ impl Engine {
             "needle exceeds the value width"
         );
         let result = match self.state {
-            State::Ready => Ok(self.find_page(&needle[..needle_len as usize], after)),
+            State::Ready | State::Degraded => {
+                Ok(self.find_page(&needle[..needle_len as usize], after))
+            }
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -1012,14 +1175,29 @@ impl Engine {
         let mut rows = [0u64; FIND_PAGE];
         let n = self.trigram.find_page(needle, after, &mut rows, |row| {
             let off = (row as usize) * ROW_SIZE;
-            let (_, value) =
-                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
-            needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
+            match decode_row(&self.arena[off..off + ROW_SIZE]) {
+                Some((_, value)) => {
+                    needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
+                }
+                // A quarantined slot holds no verified row, so it matches
+                // nothing. Short needles scan every row number, so this is
+                // reachable in salvage mode — and ONLY there: in every
+                // other mode an undecodable live row is a bug, and the
+                // assertion still says so.
+                None => {
+                    debug_assert!(
+                        self.quarantined > 0,
+                        "live arena row must decode outside salvage mode"
+                    );
+                    false
+                }
+            }
         });
         let mut page = FindPage {
             items: [(0, [0; VALUE_LEN]); FIND_PAGE],
             count: n as u8,
             next: None,
+            incomplete: self.quarantined > 0,
         };
         for (slot, &row) in page.items.iter_mut().zip(rows.iter().take(n)) {
             let off = (row as usize) * ROW_SIZE;
@@ -1041,6 +1219,7 @@ impl Engine {
             items: [(0, [0; VALUE_LEN]); RANGE_PAGE],
             count: 0,
             next: None,
+            incomplete: self.quarantined > 0,
         };
         if lo > hi {
             return page; // inverted bounds: honestly empty, not an error

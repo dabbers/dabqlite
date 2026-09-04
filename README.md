@@ -114,6 +114,26 @@ cargo run --release -p dabqlite-sim --bin vopr
 cargo run --release -p dabqlite-sim --bin vopr -- 12345   # reproduce a seed
 ```
 
+## When something goes wrong
+
+A row that fails its checksum cannot be repaired on a single disk — but it
+costs one row, not the database:
+
+```sh
+dabqlite-inspect <dir>                      # what is damaged, and where
+dabqlite-inspect <dir> --verify             # full scrub; exit 2 if damaged
+dabqlite-inspect <dir> --repair-to <newdir> # rebuild clean from what verifies
+dabqlite-inspect <dir> --gc                 # reclaim a migration's dead file
+```
+
+Programmatically, `Host::open_salvage()` opens a damaged database
+read-only with the unverifiable rows quarantined. Verified rows are served
+exactly; anything the quarantine makes unanswerable returns `Degraded`
+rather than a confident wrong answer, and scans flag themselves
+`incomplete`. Salvage writes nothing, so it is safe on a read-only mount
+or a failing volume. See [docs/FAULTS.md](docs/FAULTS.md), "corruption
+containment".
+
 The soak reports auditable simulated-time accounting (model documented in
 [docs/FAULTS.md](docs/FAULTS.md)). A 20,000-lifetime sample run:
 

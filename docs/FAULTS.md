@@ -194,6 +194,86 @@ FFI. The one `#![allow(unsafe_code)]` in the entire tree is the counting
 global allocator in `allocation.rs`: `GlobalAlloc` is an unsafe trait by
 language rule, and the impl delegates verbatim to `System`.
 
+## Corruption containment: one bad row costs one row
+
+Detection was never the problem — every row carries a CRC-32 over its
+payload with its padding validated, so damage is always *found*. The
+problem was the consequence: a single failed checksum refused the whole
+database. Correct, but a brutal cliff, and on a single disk there is
+nothing to repair a row *from*, so refusing forever was not an answer
+either.
+
+The resolution is to be precise about what is known rather than trading
+correctness for availability:
+
+- a row that verifies is served, exactly, as always;
+- a row that does not is **quarantined** — never served, never guessed;
+- so a `Get` **hit stays perfect**, while a `Get` **miss becomes
+  `Degraded`**: "absent" and "was in a quarantined slot" are
+  indistinguishable, and answering `None` would be a confident lie;
+- scans return verified rows carrying `incomplete: true`, because a
+  silently short scan is indistinguishable from data loss;
+- salvage is read-only and **touches nothing** — no write, no fsync — so
+  it works on a read-only mount or a failing volume, and rescuing data
+  can never make the damage worse.
+
+The strict `Open` is unchanged and still the default: a database that
+silently degrades is worse than one that says it is damaged. The strict
+error now names the remedy, and `Host::open_salvage()` is the remedy.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Damage **every row in turn** × seeds | exhaustive | `salvage.rs` | strict open still refuses; salvage open serves every OTHER row byte-exact, quarantines exactly one, and refuses the victim's id rather than reporting it absent |
+| **Every byte of every row** | exhaustive | `salvage.rs` | containment is never a panic, never a wrong answer, never a lost neighbour — no dead bytes, padding and checksum included |
+| Many damaged rows at once | targeted | `salvage.rs` | the cost is exactly the damaged rows; a full scan returns precisely the survivors |
+| Duplicate ids (two valid rows, one key — checksums cannot catch this) | targeted | `salvage.rs` | the later duplicate is quarantined, the first still answers exactly; strict open still refuses |
+| Scans under quarantine | pinned | `salvage.rs` | every range/find page carries `incomplete: true` |
+| Salvage inertness | byte + counter pin | `salvage.rs` | zero writes, zero fsyncs, files byte-identical after a full read workload; writes refused with `Degraded` |
+| Salvage of a **healthy** database | seeds | `salvage.rs` | identical to an ordinary open: not degraded, fully writable, recovery fsyncs performed, pages not flagged. Salvage is a fallback, not a downgrade |
+| Unreadable **manifest** (all superblock copies destroyed) | targeted | `salvage.rs` | salvage agrees with strict open and refuses — it widens what can be READ, never what can be BELIEVED |
+| Containment under the full fault schedule | every cycle of every lifetime (floor-asserted) | `lifetime.rs`, `vopr` | a committed row is damaged on a COPY of each cycle's disk and salvaged: ~2,300 episodes per 40 lifetimes, every survivor checked against the insertion log |
+
+### Repair by rebuild, never by surgery
+
+`dabqlite-inspect <dir> --repair-to <newdir>` writes a clean database
+containing every row that still verifies. The safety is structural, not
+careful: the source is opened through a handle that *physically cannot
+write* (`ReadOnlyDir::write` always fails), and the destination is a new
+directory, so the only copy of the truth is never overwritten and an
+interrupted repair costs nothing but a partial copy. It is also the
+compaction path — the rebuilt file is densely packed, with quarantined
+slots and any legacy file left behind.
+
+| Scenario | Suite | Guarantee |
+|---|---|---|
+| Rebuild a damaged database | `repair.rs` | the rebuilt directory opens STRICTLY (not degraded), holds exactly the survivors, is writable, and the loss is reported as a count — this is the one operation that knowingly discards data, so it says so |
+| Source after repair | `repair.rs` | **byte-identical** — the evidence survives for a second opinion |
+| Non-empty destination | `repair.rs` | refused; the one destructive operation does not get to be accidentally destructive too |
+| Repair of a healthy database | `repair.rs` | reproduces the rows file **byte-for-byte** — a copy that skips nothing |
+| Unreadable manifest | `repair.rs` | refused, rather than inventing a plausible empty database |
+| The read-only handle | `repair.rs` | writes fail with `PermissionDenied`; missing files read as empty; takes NO lock, so it works beside a live writer |
+
+### Dead data and vacuum
+
+There is no `DELETE` in v1, which is why there is no tombstone
+compaction: the rows zone is append-only under a manifest, and the bytes
+past the manifest (in-flight and rollback residue) are **overwritten by
+the next insert** rather than accumulating. The superblock zone is four
+fixed slots. So the only dead weight a v1 database can accumulate is the
+legacy rows file a completed migration leaves behind.
+
+`dabqlite-inspect <dir> --gc` reclaims exactly that, and its refusal
+condition is the whole feature: the legacy file is inert **only** once
+the superblock names the current schema — before that it is the only copy
+of the data. `--gc` therefore runs only when recovery would succeed AND
+the live superblock copy is on this binary's schema, and unlike every
+other inspector mode it takes the single-writer lock, because it mutates.
+Pinned both ways in `repair.rs`: it reclaims after a migration, and
+refuses (leaving every byte) before one.
+
+When `DELETE` arrives, this section grows a real vacuum — free lists,
+tombstone retention, and the compaction that follows from them.
+
 ## Read-path faults (in flight; the disk itself is clean)
 
 | Scenario | Mode | Suite | Guarantee |
@@ -661,6 +741,16 @@ engine.)
   (design §5): OPFS `flush()` carries no POSIX-level crash guarantee, so
   a tab killed by the OS degrades to the lying-fsync class — prefix
   consistency and detection, never silent divergence.
+- Row corruption is still **unrepairable in place** on a single disk:
+  containment (salvage) and rebuild (`--repair-to`) make the surviving
+  data reachable, but the damaged row's bytes are gone. Repairing
+  *through* corruption needs a second copy of the truth — replication
+  (design §4.9), deferred.
+- **Scrubbing is on demand, not continuous.** `--verify` re-checks every
+  committed row, and a salvage or strict open verifies the whole file,
+  but a long-running process reads from its arena and will not notice
+  on-disk rot that appears after it opened. There is no background
+  scrubber yet.
 - **The browser suite runs in Chromium only.** Safari and Firefox
   implement the same specified OPFS semantics, and the model asserts
   those semantics explicitly, so a divergence would surface as a test

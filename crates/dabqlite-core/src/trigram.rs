@@ -210,6 +210,26 @@ impl TrigramIndex {
         self.assert_invariants();
     }
 
+    /// Account for a row WITHOUT indexing it, keeping the append cursor
+    /// (and therefore every later row's number) correct.
+    ///
+    /// Used only by a salvage open, where a damaged row is quarantined:
+    /// it must never be searchable — nothing about it was verified — but
+    /// the rows after it must keep their true row numbers, or the whole
+    /// arena would shift under the index. Its `TRIGRAMS_PER_ROW` slots
+    /// simply stay empty, so the `row * TRIGRAMS_PER_ROW + k` bijection
+    /// is preserved exactly.
+    pub fn skip_row(&mut self, row: u64) {
+        self.assert_invariants();
+        assert_eq!(row, self.len, "trigram index rows are append-only");
+        assert!(
+            ((row as usize) + 1) * TRIGRAMS_PER_ROW <= self.next.len(),
+            "trigram pool exhausted: capacity invariant violated"
+        );
+        self.len = row + 1;
+        self.assert_invariants();
+    }
+
     /// The `page` smallest matching rows strictly above `cursor`, in
     /// ascending row order, plus the count of matches found for the
     /// page (callers detect "more" by requesting again from the last

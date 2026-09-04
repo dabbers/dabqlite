@@ -43,6 +43,21 @@ pub mod btree;
 pub mod crc32;
 pub mod engine;
 pub mod generated;
+/// Verdict labels shared by the engine and the inspector.
+///
+/// The inspector is a deliberately independent second implementation of the
+/// recovery rules (cross-checked by agreement tests), but the human-readable
+/// LABEL for a defect is not a rule — duplicating it only invites drift that
+/// the agreement test would report as a disagreement it is not.
+pub mod defect {
+    /// A committed row failed checksum or padding validation.
+    pub const ROW_CHECKSUM: &str =
+        "committed row failed checksum (reopen in salvage mode to read the rest)";
+    /// Two committed rows claim the same primary key.
+    pub const DUPLICATE_ID: &str =
+        "duplicate id among committed rows (reopen in salvage mode to read the rest)";
+}
+
 pub mod inspect;
 pub mod layout;
 pub mod migration;

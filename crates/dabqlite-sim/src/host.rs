@@ -305,6 +305,17 @@ impl SimHost {
         self.drive(input)
     }
 
+    /// Open in SALVAGE mode: damaged rows are quarantined instead of
+    /// failing the whole database (docs/FAULTS.md, "corruption
+    /// containment"). Read-only; writes no data byte.
+    pub fn open_salvage(&mut self) -> Driven {
+        let input = Input::OpenSalvage {
+            superblock_len: self.disk.len(FileId::Superblock),
+            rows_len: self.disk.len(FileId::Rows),
+        };
+        self.drive(input)
+    }
+
     /// Run the offline migration (docs/DESIGN.md §4.8) under the same
     /// fault model as everything else: every crash/EIO/misdirection knob
     /// applies to migration I/O exactly as it does to commits. The row

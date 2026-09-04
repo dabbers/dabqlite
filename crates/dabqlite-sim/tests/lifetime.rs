@@ -58,6 +58,25 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     );
 }
 
+/// Corruption containment is part of the surface too: every cycle damages
+/// a committed row on a COPY of the disk and proves salvage keeps the
+/// rest reachable. A floor keeps that from silently switching itself off.
+#[test]
+fn every_lifetime_exercises_corruption_containment() {
+    let cfg = LifetimeConfig::default();
+    let mut salvage_checks = 0;
+    let mut cycles = 0;
+    for seed in 0..16u64 {
+        let stats = run_lifetime(seed, &cfg);
+        salvage_checks += stats.salvage_checks;
+        cycles += stats.cycles as u64;
+    }
+    assert!(
+        salvage_checks * 2 > cycles,
+        "only {salvage_checks} salvage episodes across {cycles} cycles"
+    );
+}
+
 #[test]
 fn full_disk_episodes_actually_happen_in_the_soak() {
     let cfg = LifetimeConfig {

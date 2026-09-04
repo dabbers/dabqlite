@@ -195,7 +195,7 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                     if scan.duplicate_samples.len() < SAMPLE_CAP {
                         scan.duplicate_samples.push(id);
                     }
-                    first_defect.get_or_insert("duplicate id among committed rows");
+                    first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
                 }
             }
             None => {
@@ -203,7 +203,7 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                 if scan.corrupt_offsets.len() < SAMPLE_CAP {
                     scan.corrupt_offsets.push(off as u64);
                 }
-                first_defect.get_or_insert("committed row failed checksum");
+                first_defect.get_or_insert(crate::defect::ROW_CHECKSUM);
             }
         }
     }

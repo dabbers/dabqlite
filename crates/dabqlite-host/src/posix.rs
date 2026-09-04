@@ -119,3 +119,77 @@ impl Storage for PosixStorage {
         self.file(file).sync_all()
     }
 }
+
+/// A strictly READ-ONLY view of a database directory: no lock, no
+/// creation, no writes. This is what makes forensics and rescue safe on a
+/// database someone else may be using, on a read-only mount, or on a
+/// volume whose writes are failing — the three situations where you most
+/// need them and can least afford a tool that mutates.
+///
+/// `sync` succeeds trivially: nothing was ever written, so there is
+/// nothing to flush. `write` always fails — loudly, since a write here
+/// would be a bug in the caller, not a condition to recover from.
+pub struct ReadOnlyDir {
+    superblock: Option<File>,
+    rows: Option<File>,
+    rows_old: Option<File>,
+}
+
+impl ReadOnlyDir {
+    /// Open the declared file set read-only. Missing files read as empty,
+    /// exactly as a fresh database's would.
+    pub fn open_dir(dir: &Path) -> io::Result<Self> {
+        let open = |name: &str| match File::open(dir.join(name)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        };
+        Ok(ReadOnlyDir {
+            superblock: open(SUPERBLOCK_FILE)?,
+            rows: open(&rows_file_name(SCHEMA_HASH))?,
+            rows_old: open(&rows_file_name(V1_SCHEMA_HASH))?,
+        })
+    }
+
+    fn file(&self, id: FileId) -> Option<&File> {
+        match id {
+            FileId::Superblock => self.superblock.as_ref(),
+            FileId::Rows => self.rows.as_ref(),
+            FileId::RowsOld => self.rows_old.as_ref(),
+        }
+    }
+}
+
+impl Storage for ReadOnlyDir {
+    type Error = io::Error;
+
+    fn len(&mut self, file: FileId) -> Result<u64, io::Error> {
+        match self.file(file) {
+            Some(f) => Ok(f.metadata()?.len()),
+            None => Ok(0),
+        }
+    }
+
+    fn read(&mut self, file: FileId, offset: u64, len: u64) -> Result<Vec<u8>, io::Error> {
+        let file_len = self.len(file)?;
+        let start = offset.min(file_len);
+        let end = offset.saturating_add(len).min(file_len);
+        let mut buf = vec![0u8; (end - start) as usize];
+        if let Some(f) = self.file(file) {
+            f.read_exact_at(&mut buf, start)?;
+        }
+        Ok(buf)
+    }
+
+    fn write(&mut self, _file: FileId, _offset: u64, _data: &[u8]) -> Result<(), io::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "dabqlite: read-only handle — inspection and salvage never write",
+        ))
+    }
+
+    fn sync(&mut self, _file: FileId) -> Result<(), io::Error> {
+        // Nothing was written, so nothing needs flushing.
+        Ok(())
+    }
+}

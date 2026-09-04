@@ -42,6 +42,7 @@ struct Totals {
     recovery_crashes: u64,
     find_checks: u64,
     inspections: u64,
+    salvage_checks: u64,
     migrations: u64,
     migration_attempts: u64,
     disk_full_recoveries: u64,
@@ -59,6 +60,7 @@ impl Totals {
         self.recovery_crashes += s.recovery_crashes;
         self.find_checks += s.find_checks;
         self.inspections += s.inspections;
+        self.salvage_checks += s.salvage_checks;
         self.migrations += s.migrations;
         self.migration_attempts += s.migration_attempts;
         self.disk_full_recoveries += s.disk_full_recoveries;
@@ -80,12 +82,13 @@ impl Totals {
         println!(
             "vopr: full surface: {} migrations ({} attempts under faults), \
              {} substring-search oracle checks, {} inspector agreements, \
-             {} full-disk recovery episodes",
+             {} full-disk recovery episodes, {} salvage episodes",
             self.migrations,
             self.migration_attempts,
             self.find_checks,
             self.inspections,
-            self.disk_full_recoveries
+            self.disk_full_recoveries,
+            self.salvage_checks
         );
         println!(
             "vopr: simulated operational time: {:.1} h ({:.1} h of device I/O + {} restart cycles at {}s)",

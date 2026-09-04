@@ -87,6 +87,10 @@ pub struct LifetimeStats {
     pub find_checks: u64,
     /// Inspector-agreement verifications performed.
     pub inspections: u64,
+    /// Salvage episodes: a committed row damaged on a COPY of this
+    /// lifetime's disk, then read back in salvage mode with every
+    /// surviving row verified against the log.
+    pub salvage_checks: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -397,6 +401,63 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 "[{ctx}] inspector rollback-evidence diverged"
             );
             stats.inspections += 1;
+        }
+
+        // Salvage episode: damage a committed row on a COPY of this
+        // disk (the lifetime itself continues undamaged) and prove
+        // containment holds under whatever fault schedule got us here —
+        // strict open refuses, salvage open serves every OTHER logged
+        // row exactly, and the damaged one is refused rather than
+        // silently reported absent.
+        if !log.is_empty() {
+            let used = host.engine.usage().0;
+            let victim = (rng.next_u64() % used) as usize;
+            let mut damaged = host.disk.clone();
+            damaged.corrupt(
+                FileId::Rows,
+                (victim * dabqlite_core::ROW_SIZE) as u64 + 7,
+                0x20,
+            );
+
+            let mut strict = SimHost::new(cfg.caps, damaged.clone(), None);
+            assert!(
+                matches!(
+                    strict.open(),
+                    Driven::Done(Output::OpenDone {
+                        result: Err(DbError::Corrupt { .. })
+                    })
+                ),
+                "[{ctx}] strict open accepted a damaged row"
+            );
+
+            let mut rescue = SimHost::new(cfg.caps, damaged, None);
+            match rescue.open_salvage() {
+                Driven::Done(Output::OpenDone { result: Ok(n) }) => {
+                    assert_eq!(n, used, "[{ctx}] salvage row count");
+                }
+                other => panic!("[{ctx}] salvage open failed: {other:?}"),
+            }
+            assert_eq!(
+                rescue.engine.quarantined(),
+                1,
+                "[{ctx}] exactly one row should be quarantined"
+            );
+            assert_eq!(rescue.n_writes, 0, "[{ctx}] salvage wrote to the disk");
+            // Every logged row except the victim's is still exact.
+            let survivors = rescue.range_all(0, u64::MAX);
+            assert_eq!(
+                survivors.len(),
+                log.len() - 1,
+                "[{ctx}] salvage lost more than the damaged row"
+            );
+            for (id, value) in &survivors {
+                let expect = log
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .unwrap_or_else(|| panic!("[{ctx}] salvage invented id {id}"));
+                assert_eq!(*value, expect.1, "[{ctx}] salvage served wrong bytes");
+            }
+            stats.salvage_checks += 1;
         }
     }
     absorb_io(&mut stats, &host);

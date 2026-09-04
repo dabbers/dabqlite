@@ -45,7 +45,7 @@ pub fn rows_file_name(schema_hash: u64) -> String {
 }
 
 #[cfg(unix)]
-pub use posix::PosixStorage;
+pub use posix::{PosixStorage, ReadOnlyDir};
 
 /// A storage backend: the declared file set (docs/DESIGN.md §4.4), opened
 /// once, addressed by [`FileId`].
@@ -97,6 +97,23 @@ impl<S: Storage> Host<S> {
         let superblock_len = self.storage.len(FileId::Superblock)?;
         let rows_len = self.storage.len(FileId::Rows)?;
         Ok(self.drive(Input::Open {
+            superblock_len,
+            rows_len,
+        }))
+    }
+
+    /// Open in SALVAGE mode: damaged rows are quarantined rather than
+    /// failing the whole database (docs/FAULTS.md, "corruption
+    /// containment"). Read-only, writes no data byte, and refuses any
+    /// question the quarantine makes unanswerable instead of guessing.
+    ///
+    /// Use after a strict `open()` reports `Corrupt`: the surviving rows
+    /// stay reachable, and `dabqlite-inspect --repair-to` rebuilds a clean
+    /// database from them.
+    pub fn open_salvage(&mut self) -> Result<Output, S::Error> {
+        let superblock_len = self.storage.len(FileId::Superblock)?;
+        let rows_len = self.storage.len(FileId::Rows)?;
+        Ok(self.drive(Input::OpenSalvage {
             superblock_len,
             rows_len,
         }))
