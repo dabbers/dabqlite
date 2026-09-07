@@ -52,7 +52,8 @@ that can be anchored to either end or both; values of any length up to 2
 KiB; atomic
 multi-write batches, with compare-and-set inside them; lock-free readers
 alongside the single writer, and reads that take `&self`; a declared memory
-ceiling recorded in the database itself; three interchangeable backends
+ceiling recorded in the database itself, raisable in place on an open handle
+when a database fills up; three interchangeable backends
 (POSIX files, in-memory, browser OPFS) proven to write byte-identical
 databases; an offline migration path; corruption containment with
 repair-by-rebuild, for a directory or for a snapshot blob; and an inspector

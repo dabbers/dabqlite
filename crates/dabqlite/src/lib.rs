@@ -1699,6 +1699,80 @@ impl<S: Storage> Db<S> {
         }
     }
 
+    /// Raise this database's row capacity, in place, on an OPEN handle.
+    ///
+    /// The answer to [`Error::Full`] when [`Stats::dead`] is zero — the
+    /// database is genuinely out of room rather than merely full of
+    /// retired slots, so compacting would free nothing and the ceiling
+    /// itself has to move.
+    ///
+    /// Until this existed, the only way past that ceiling was to drop the
+    /// handle and reopen at a larger size. For a directory that means
+    /// releasing the single-writer lock and racing anyone waiting for it;
+    /// for an in-memory or browser database it means a snapshot and a
+    /// reload, which copies every byte. And a store that cannot take
+    /// another write, with no way forward that does not go through
+    /// dropping the database, reads to whoever is using it as data loss —
+    /// whatever the file says.
+    ///
+    /// What it costs: recovery, once. The capacity is what every arena is
+    /// sized from (docs/DESIGN.md §4.2), so a larger one is a new set of
+    /// arenas and a replay of the committed rows into them — the same
+    /// replay an open does, against the same storage handle, with the
+    /// lock never let go. No file is rewritten and no byte is moved.
+    ///
+    /// What it does NOT do: shrink. Passing a smaller number returns the
+    /// current capacity unchanged rather than discarding room the data
+    /// might be using. Reopen at a smaller size if that is what you want,
+    /// where the refusal to lose data has a name
+    /// ([`Error::CapacityTooSmall`]).
+    ///
+    /// The new number takes effect immediately for this handle and is
+    /// recorded in the file at the next commit — growing is not itself a
+    /// write, for the same reason opening with a larger capacity is not.
+    ///
+    /// Returns the capacity in force afterwards.
+    pub fn grow(&mut self, rows: u64) -> Result<u64, Error> {
+        let current = self.stats().capacity;
+        let target = rows.max(1);
+        if target <= current {
+            return Ok(current);
+        }
+        if self.is_degraded() {
+            // A salvaged database is read-only and its rows are partly
+            // unverifiable; re-running a STRICT open over them would
+            // refuse, and we would have thrown away the salvage handle to
+            // find out. Rebuild it with the inspector instead.
+            return Err(Error::Degraded {
+                quarantined: self.recovery_report().quarantined_rows,
+            });
+        }
+        let old = self.host.take().expect("an open database has a host");
+        let mut host = Host::new(caps(target), old.storage);
+        match host.open() {
+            Ok(Output::OpenDone { result: Ok(_) }) => {
+                self.host = Some(host);
+                #[cfg(unix)]
+                if let Some((path, _)) = self.origin.take() {
+                    self.origin = Some((path, target));
+                }
+                Ok(target)
+            }
+            Ok(Output::OpenDone { result: Err(e) }) => {
+                // The handle is kept — a failed grow leaves a database
+                // that reports its failure, not one that has vanished.
+                self.host = Some(host);
+                Err(e.into())
+            }
+            Ok(other) => unreachable!("open returned {other:?}"),
+            Err(e) => {
+                let err = io_err::<S>(e);
+                self.host = Some(host);
+                Err(err)
+            }
+        }
+    }
+
     /// True when this database was opened in salvage mode and some rows
     /// could not be verified.
     pub fn is_degraded(&self) -> bool {

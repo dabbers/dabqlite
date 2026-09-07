@@ -588,3 +588,83 @@ fn a_long_crashing_workload_never_diverges_from_the_oracle() {
         );
     }
 }
+
+/// **Growing performs no write, so a fault during it cannot cost a byte.**
+///
+/// `Db::grow` re-runs recovery against the same storage handle at a larger
+/// capacity. Recovery reads, and can also truncate and fsync when it has
+/// residue to clean up — so "growing writes nothing" is a claim about a
+/// path that touches storage, not an obvious one. This sweeps a failure
+/// over every I/O boundary of the grow and holds two things at each: the
+/// call either succeeds or reports its failure, never both and never
+/// neither; and whatever it did, the DURABLE bytes are what they were
+/// before it was called, so the database a later process opens is
+/// untouched.
+#[test]
+fn a_fault_at_every_boundary_of_a_grow_costs_nothing() {
+    let mut swept = 0usize;
+    let mut failures = 0usize;
+    let mut successes = 0usize;
+    for boundary in 0..24u64 {
+        // A database with something in it, including a multi-slot value,
+        // so the replay a grow performs has real work to do.
+        let images = fresh();
+        let mut db = open(&images);
+        for id in 0..8u64 {
+            db.put(id, v(id, 8 + (id as usize % 3) * VALUE_LEN))
+                .expect("put");
+        }
+        db.remove(3).expect("remove");
+        let before = model(&db);
+        let durable_before = images.borrow().durable.clone();
+        drop(db);
+
+        // Reopen with a storage armed to fail from `boundary`. The open
+        // itself may be what fails; that is not this test's subject, so
+        // it is skipped rather than asserted about.
+        let armed = FaultStorage::failing_from(Rc::clone(&images), boundary);
+        let Ok(mut db) = Db::with_storage(armed, ROWS) else {
+            continue;
+        };
+        if model(&db) != before {
+            // The open recovered to a different state; the grow below
+            // would be growing a different database.
+            continue;
+        }
+        swept += 1;
+        match db.grow(ROWS * 4) {
+            Ok(cap) => {
+                successes += 1;
+                assert_eq!(cap, ROWS * 4);
+                assert_eq!(db.stats().capacity, ROWS * 4);
+                assert_eq!(model(&db), before, "a successful grow lost rows");
+            }
+            Err(_) => {
+                failures += 1;
+                // The handle is still there and still answers — it
+                // reports its failure rather than having vanished.
+                assert!(db.stats().capacity >= ROWS);
+            }
+        }
+        assert_eq!(
+            images.borrow().durable,
+            durable_before,
+            "boundary {boundary}: growing made a durable change"
+        );
+        // And the database a later process opens is the one that was
+        // there before the grow was attempted.
+        drop(db);
+        let recovered = Db::with_storage(FaultStorage::new(Rc::clone(&images)), ROWS)
+            .expect("recovery must always succeed");
+        assert_eq!(
+            model(&recovered),
+            before,
+            "boundary {boundary}: the database changed under a failed grow"
+        );
+    }
+    assert!(swept >= 8, "only {swept} boundaries reached the grow");
+    assert!(
+        failures > 0 && successes > 0,
+        "the sweep must see both outcomes, saw {successes} ok and {failures} failed"
+    );
+}

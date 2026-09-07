@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Six of these have since been decided by building the thing. They are kept
+Seven of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -488,6 +488,26 @@ part worth reading.
   stored procedure, and neither is worth what an assertion already buys.
   An assertion stages no row, so a batch of nothing but assertions
   performs no I/O at all.
+
+- **What happens when a database fills up** — DECIDED: it grows, on the
+  handle that is open, and the static-allocation rule survives intact.
+  Capacity is what every arena is sized from (§4.2), so it was fixed for
+  the life of a handle and the only way past the ceiling was to drop the
+  database and reopen it larger. For a directory that means releasing the
+  single-writer lock and racing whoever is waiting for it; for an
+  in-memory or browser database it means a snapshot and a reload, which
+  copies every byte. And a store that cannot take another write, with no
+  way forward that does not go through dropping the database, reads to
+  whoever is using it as data loss — whatever the file says.
+  `Db::grow` re-runs recovery against the SAME storage handle at a larger
+  capacity: new arenas, one replay, lock never let go, no file rewritten.
+  §4.2 is unchanged, because it was never "one allocation per process" —
+  it is "no allocation in steady state, only at named lifecycle points",
+  and a grow is as named a point as an open. It never shrinks (that would
+  be discarding room the data might be using, which belongs at a door
+  where the caller sees the refusal), it writes nothing until the next
+  commit, and a fault at any of its I/O boundaries leaves the durable
+  bytes exactly as they were — swept and asserted, not argued.
 
 Still open:
 
