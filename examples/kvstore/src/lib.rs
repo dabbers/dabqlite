@@ -1,50 +1,49 @@
 //! `kv` — a durable command-line key/value and session store built on
 //! dabqlite.
 //!
-//! dabqlite offers one table of `(u64, [u8; 16])` rows with a capacity
-//! fixed at open. This crate turns that into string keys, arbitrary-length
-//! values, TTLs, listing, substring search and compaction, using only the
-//! public `dabqlite` API.
+//! **One key/value record is one dabqlite value.** That sentence is the
+//! whole port. A value used to be exactly sixteen bytes, so this crate
+//! carried a storage layer of its own: the u64 id was split into a record
+//! number and a chunk ordinal, the payload was cut into 16-byte rows, two
+//! banks were kept so an update could be undone, a header row was written
+//! last as a commit point, and a sidecar file remembered the capacity the
+//! library forgot. All of that is gone.
 //!
-//! The layering is:
+//! What is left is what a key/value store on a `u64`-keyed table still has
+//! to do for itself:
 //!
-//! * [`codec`] — how a record is laid out over row ids and 16-byte rows.
-//! * [`plan`]  — pure functions from a snapshot of rows to row writes.
-//! * [`exec`]  — the only module that touches a `Db`, because an open
-//!   database cannot be named or passed around (see below).
-//! * [`cli`]   — argument parsing and rendering.
+//! * [`record`] — the bytes of one record, and the hash that turns a
+//!   string key into a row id.
+//! * [`store`]  — [`store::Store`], a `Db<S>` plus linear probing, TTL,
+//!   listing and search.
+//! * [`exec`]   — command dispatch.
+//! * [`cli`]    — argument parsing and rendering.
 //!
-//! ## The one thing that shaped this design
+//! ## What the library still makes us do
 //!
-//! `dabqlite::Db<S: Storage>` is public, but `Storage`, `MemoryStorage`
-//! and `PosixStorage` are not re-exported, so no downstream crate can
-//! write the type of an open database:
-//!
-//! ```compile_fail
-//! # use dabqlite::Db;
-//! struct Store { db: Db<???> }          // no nameable type argument
-//! fn get<S>(db: &mut Db<S>) {}          // error: `S: Storage` unsatisfied
-//! ```
-//!
-//! An open database therefore cannot be a struct field, a function
-//! parameter, or a return type. Everything below is arranged around that.
+//! - **String keys are ours.** The table is keyed by `u64`, so a key is
+//!   hashed and collisions are probed past. That means our own tombstones
+//!   (a removed row is indistinguishable from one that never existed, so
+//!   `Db::remove` would cut a probe chain), and it means `list` is a full
+//!   scan and a sort, because id order is hash order.
+//! - **Expiry is ours.** There is no TTL and no expression that can be
+//!   evaluated at read time, so every record carries a timestamp and every
+//!   read compares it.
+//! - **"Is there a database in this directory?" is ours.** The superblock
+//!   filename is not part of the public API and there is no call that
+//!   answers the question, so `exec.rs` hardcodes the name.
 
 pub mod cli;
-pub mod codec;
 pub mod exec;
-pub mod plan;
+pub mod record;
+pub mod store;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The sidecar file that remembers the row capacity, because dabqlite
-/// does not: `Db::open` always applies `DEFAULT_ROWS`, so a database
-/// created with a different capacity silently changes size on reopen.
-pub const CAPACITY_FILE: &str = "kv-capacity";
-
-/// Slots held back so that `del`, `purge` and `compact` still work when
-/// the database is otherwise full. A full dabqlite refuses deletes too —
-/// a delete appends a tombstone row and so needs a free slot.
+/// Slots held back so that `del` and `purge` still work when the database
+/// is otherwise full. A full dabqlite refuses deletes too — a delete
+/// appends a tombstone row and so needs a free slot.
 pub const RESERVED_SLOTS: u64 = 8;
 
 /// Everything `kv` can fail with.
@@ -53,20 +52,44 @@ pub enum KvError {
     /// Straight through from the library.
     Db(dabqlite::Error),
     /// Another process holds the single-writer lock.
-    Locked { dir: PathBuf, detail: String },
+    Locked {
+        dir: PathBuf,
+        detail: String,
+    },
     /// The database is damaged; `kv rescue` may still get the data out.
-    Damaged { dir: PathBuf, what: String },
-    /// Rows exist that this crate's record layout cannot explain.
+    Damaged {
+        dir: PathBuf,
+        what: String,
+    },
+    /// A row exists that this crate's record layout cannot explain.
     Layout(String),
-    KeyTooLong { len: usize, max: usize },
-    ValueTooLong { len: usize, max: usize },
+    KeyTooLong {
+        len: usize,
+        max: usize,
+    },
+    ValueTooLong {
+        len: usize,
+        max: usize,
+    },
     BadKey(String),
-    ProbeExhausted { probes: u64 },
+    ProbeExhausted {
+        probes: u64,
+    },
     /// Not enough row slots left for the write, with the reserve honoured.
-    NoRoom { needed: u64, free: u64, capacity: u64 },
+    NoRoom {
+        needed: u64,
+        free: u64,
+        capacity: u64,
+    },
     /// The requested capacity is below what the data already needs.
-    CapacityTooSmall { asked: u64, required: u64 },
-    Io { what: String, err: std::io::Error },
+    CapacityTooSmall {
+        asked: u64,
+        required: u64,
+    },
+    Io {
+        what: String,
+        err: std::io::Error,
+    },
     Usage(String),
 }
 
@@ -129,7 +152,10 @@ impl From<dabqlite::Error> for KvError {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub dir: PathBuf,
-    /// `--rows`; when absent the sidecar file or `DEFAULT_ROWS` decides.
+    /// `--rows`. When absent the database's own recorded capacity decides:
+    /// it remembers what it was created with, so there is nothing for this
+    /// crate to remember. There used to be a `kv-capacity` sidecar file
+    /// here, because `Db::open` always reopened at `DEFAULT_ROWS`.
     pub rows: Option<u64>,
 }
 
@@ -145,30 +171,6 @@ impl Config {
         self.rows = Some(rows);
         self
     }
-
-    /// The capacity to open with: the flag, else what we recorded last
-    /// time, else the library default.
-    pub fn capacity(&self) -> u64 {
-        if let Some(r) = self.rows {
-            return r.max(1);
-        }
-        read_capacity(&self.dir).unwrap_or(dabqlite::DEFAULT_ROWS)
-    }
-}
-
-fn read_capacity(dir: &Path) -> Option<u64> {
-    std::fs::read_to_string(dir.join(CAPACITY_FILE))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-pub fn write_capacity(dir: &Path, rows: u64) -> Result<(), KvError> {
-    std::fs::write(dir.join(CAPACITY_FILE), format!("{rows}\n")).map_err(|err| KvError::Io {
-        what: format!("writing {}", dir.join(CAPACITY_FILE).display()),
-        err,
-    })
 }
 
 /// Seconds since the Unix epoch.
@@ -191,10 +193,9 @@ pub fn open_error(dir: &Path, e: dabqlite::Error) -> KvError {
             dir: dir.to_path_buf(),
             detail,
         },
-        dabqlite::Error::CapacityTooSmall { required, asked } => KvError::CapacityTooSmall {
-            asked,
-            required,
-        },
+        dabqlite::Error::CapacityTooSmall { required, asked } => {
+            KvError::CapacityTooSmall { asked, required }
+        }
         dabqlite::Error::Corrupt { what } => KvError::Damaged {
             dir: dir.to_path_buf(),
             what: what.to_string(),

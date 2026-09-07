@@ -13,7 +13,11 @@ struct Run {
 
 impl Run {
     fn ok(self) -> Run {
-        assert_eq!(self.code, 0, "expected success\nstdout: {}\nstderr: {}", self.out, self.err);
+        assert_eq!(
+            self.code, 0,
+            "expected success\nstdout: {}\nstderr: {}",
+            self.out, self.err
+        );
         self
     }
     fn lines(&self) -> Vec<&str> {
@@ -120,7 +124,11 @@ fn deleting_removes_the_key_and_reports_it_to_scripts() {
     assert_eq!(missing.code, 2, "a missing key must be distinguishable");
     assert!(missing.err.contains("no such key"), "{}", missing.err);
 
-    assert_eq!(kv(&dir, &["del", "a"]).code, 2, "deleting twice is not success");
+    assert_eq!(
+        kv(&dir, &["del", "a"]).code,
+        2,
+        "deleting twice is not success"
+    );
     assert_eq!(kv(&dir, &["list"]).ok().lines(), vec!["b"]);
     // Survives a restart as a deletion, not as a resurrection.
     assert_eq!(kv(&dir, &["get", "a"]).code, 2);
@@ -140,7 +148,11 @@ fn search_finds_substrings_including_across_row_boundaries() {
     kv(&dir, &["set", "doc/3", "another needle, earlier"]).ok();
 
     let hits = kv(&dir, &["search", "needle"]).ok();
-    let keys: Vec<&str> = hits.lines().iter().map(|l| l.split('\t').next().unwrap()).collect();
+    let keys: Vec<&str> = hits
+        .lines()
+        .iter()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
     assert_eq!(keys, vec!["doc/1", "doc/3"]);
 
     assert!(kv(&dir, &["search", "absent"]).ok().out.is_empty());
@@ -165,7 +177,9 @@ fn listing_is_ordered_and_filterable() {
         vec!["user/a", "user/z"]
     );
     assert_eq!(
-        kv(&dir, &["list", "--values", "--prefix", "user/a"]).ok().out,
+        kv(&dir, &["list", "--values", "--prefix", "user/a"])
+            .ok()
+            .out,
         "user/a\tx\n"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -182,7 +196,10 @@ fn values_may_be_binary_multiline_and_large() {
         .args(["get", "blob", "--raw"])
         .output()
         .unwrap();
-    assert_eq!(got.stdout, value, "binary values must round-trip byte for byte");
+    assert_eq!(
+        got.stdout, value,
+        "binary values must round-trip byte for byte"
+    );
 
     // A value spanning most of a record.
     let big = "z".repeat(2000);
@@ -193,8 +210,16 @@ fn values_may_be_binary_multiline_and_large() {
     let toobig = "z".repeat(4000);
     let refused = kv_stdin(&dir, &["set", "toobig", "-"], Some(toobig.as_bytes()));
     assert_eq!(refused.code, 1);
-    assert!(refused.err.contains("value is 4000 bytes"), "{}", refused.err);
-    assert_eq!(kv(&dir, &["get", "toobig"]).code, 2, "a refused write must not land");
+    assert!(
+        refused.err.contains("value is 4000 bytes"),
+        "{}",
+        refused.err
+    );
+    assert_eq!(
+        kv(&dir, &["get", "toobig"]).code,
+        2,
+        "a refused write must not land"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -204,16 +229,27 @@ fn a_session_expires_and_purge_retires_it() {
     kv(&dir, &["set", "session/live", "keep", "--ttl", "3600"]).ok();
     kv(&dir, &["set", "session/short", "drop", "--ttl", "4"]).ok();
     assert_eq!(kv(&dir, &["get", "session/short"]).ok().out, "drop\n");
-    assert!(kv(&dir, &["info", "session/short"]).ok().out.contains("expires  in"));
+    assert!(kv(&dir, &["info", "session/short"])
+        .ok()
+        .out
+        .contains("expires  in"));
 
     std::thread::sleep(std::time::Duration::from_millis(4500));
 
-    assert_eq!(kv(&dir, &["get", "session/short"]).code, 2, "an expired session must be gone");
+    assert_eq!(
+        kv(&dir, &["get", "session/short"]).code,
+        2,
+        "an expired session must be gone"
+    );
     assert_eq!(kv(&dir, &["list"]).ok().lines(), vec!["session/live"]);
     assert!(kv(&dir, &["stats"]).ok().out.contains("expired     1"));
 
     let purged = kv(&dir, &["purge"]).ok();
-    assert!(purged.out.contains("purged 1 expired key"), "{}", purged.out);
+    assert!(
+        purged.out.contains("purged 1 expired key"),
+        "{}",
+        purged.out
+    );
     assert!(kv(&dir, &["stats"]).ok().out.contains("expired     0"));
     assert_eq!(kv(&dir, &["get", "session/live"]).ok().out, "keep\n");
     let _ = std::fs::remove_dir_all(&dir);
@@ -258,7 +294,10 @@ fn a_full_database_refuses_writes_clearly_and_keeps_serving_reads() {
     kv(&dir, &["compact"]).ok();
     kv(&dir, &["set", "after-compaction", "ok"]).ok();
     assert_eq!(kv(&dir, &["get", "after-compaction"]).ok().out, "ok\n");
-    assert_eq!(kv(&dir, &["get", &format!("k{}", stored - 1)]).ok().out, "value\n");
+    assert_eq!(
+        kv(&dir, &["get", &format!("k{}", stored - 1)]).ok().out,
+        "value\n"
+    );
 
     // A bigger ceiling is also a way out, and it sticks.
     kv(&dir, &["--rows", "200", "set", "roomy", "yes"]).ok();
@@ -266,18 +305,33 @@ fn a_full_database_refuses_writes_clearly_and_keeps_serving_reads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Used to be `the_declared_capacity_is_remembered_across_restarts` in the
+/// sense of "this crate remembers it": `Db::open` reopened every database
+/// at `DEFAULT_ROWS`, so `kv` wrote the number into a `kv-capacity`
+/// sidecar of its own and passed it back on every open. The database
+/// records its own capacity now, so the sidecar is gone and this pins that
+/// no file but the library's is needed to keep the ceiling stable.
 #[test]
-fn the_declared_capacity_is_remembered_across_restarts() {
+fn the_database_remembers_its_own_capacity_with_no_sidecar() {
     let dir = dir_for("capacity");
     kv(&dir, &["--rows", "64", "set", "a", "1"]).ok();
-    // dabqlite itself would silently reopen this at DEFAULT_ROWS; the
-    // sidecar file is what keeps the ceiling stable.
     let stats = kv(&dir, &["stats"]).ok();
     assert!(stats.out.contains("/ 64"), "{}", stats.out);
-    assert!(std::fs::read_to_string(dir.join("kv-capacity")).unwrap().starts_with("64"));
+
+    let ours: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".dabq"))
+        .collect();
+    assert!(ours.is_empty(), "kv keeps files of its own: {ours:?}");
+
+    // And it survives a compaction, which rewrites the directory.
+    kv(&dir, &["compact"]).ok();
+    assert!(kv(&dir, &["stats"]).ok().out.contains("/ 64"));
 
     // Asking for less than the data needs is refused with a true message.
-    let shrunk = kv(&dir, &["--rows", "1", "set", "b", "2"]);
+    kv(&dir, &["set", "big", &"x".repeat(500)]).ok();
+    let shrunk = kv(&dir, &["--rows", "2", "set", "b", "2"]);
     assert_eq!(shrunk.code, 1);
     assert!(shrunk.err.contains("below"), "{}", shrunk.err);
     let _ = std::fs::remove_dir_all(&dir);
@@ -297,18 +351,25 @@ fn compaction_preserves_every_key_and_reclaims_dead_rows() {
     }
     let before = kv(&dir, &["list", "--values"]).ok().out;
     let stats_before = kv(&dir, &["stats"]).ok().out;
-    assert!(stats_before.contains("orphan rows"), "{stats_before}");
+    // There is no "orphan rows" line any more. It used to count payload
+    // rows that no live header pointed at — the debris of hand-rolled
+    // chunking and double buffering, which nothing in the library knew
+    // about. A record is one value now, so the only dead weight is the
+    // library's own, and the library reports it.
+    assert!(!stats_before.contains("orphan rows"), "{stats_before}");
+    assert!(!stats_before.contains("dead rows   0"), "{stats_before}");
 
     let done = kv(&dir, &["compact"]).ok();
     assert!(done.out.contains("compacted 10 keys"), "{}", done.out);
 
-    assert_eq!(kv(&dir, &["list", "--values"]).ok().out, before, "compaction lost data");
+    assert_eq!(
+        kv(&dir, &["list", "--values"]).ok().out,
+        before,
+        "compaction lost data"
+    );
     let stats_after = kv(&dir, &["stats"]).ok().out;
     assert!(stats_after.contains("dead rows   0"), "{stats_after}");
-    assert!(stats_after.contains("orphan rows 0"), "{stats_after}");
     assert!(stats_after.contains("tombstones  0"), "{stats_after}");
-    // The capacity setting survives the directory swap.
-    assert!(dir.join("kv-capacity").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -331,12 +392,19 @@ fn a_backup_round_trips_into_a_fresh_database() {
     assert_eq!(kv(&dest, &["get", "k3"]).code, 2);
     // The restored database is a working database, not a read-only copy.
     kv(&dest, &["set", "new", "written after restore"]).ok();
-    assert_eq!(kv(&dest, &["get", "new"]).ok().out, "written after restore\n");
+    assert_eq!(
+        kv(&dest, &["get", "new"]).ok().out,
+        "written after restore\n"
+    );
 
     // Restoring over a live database is refused rather than silently merging.
     let refused = kv(&dest, &["restore", snap.to_str().unwrap()]);
     assert_eq!(refused.code, 1);
-    assert!(refused.err.contains("already holds a database"), "{}", refused.err);
+    assert!(
+        refused.err.contains("already holds a database"),
+        "{}",
+        refused.err
+    );
 
     let _ = std::fs::remove_file(&snap);
     let _ = std::fs::remove_dir_all(&dir);
@@ -381,21 +449,42 @@ fn a_damaged_database_is_refused_and_then_rescued() {
     let _ = std::fs::remove_dir_all(&dest);
 }
 
+/// Used to end with "reads are blocked too: the store is single-writer,
+/// not reader/writer". `Db::read_only` takes no lock and writes nothing,
+/// so every `kv` read now runs against a database another process is
+/// holding open. Only writes wait.
 #[test]
-fn a_second_writer_is_told_the_database_is_in_use() {
+fn a_second_writer_is_refused_but_readers_are_not() {
     let dir = dir_for("locked");
     kv(&dir, &["set", "a", "1"]).ok();
+    kv(&dir, &["set", "b", "two"]).ok();
     // Hold the single-writer lock the way another process would.
-    let held = dabqlite::Db::open(&dir).expect("hold the lock");
-    let blocked = kv(&dir, &["set", "b", "2"]);
+    let mut held = dabqlite::Db::open(&dir).expect("hold the lock");
+
+    let blocked = kv(&dir, &["set", "c", "3"]);
     assert_eq!(blocked.code, 1);
     assert!(
         blocked.err.contains("already open in another process"),
         "{}",
         blocked.err
     );
-    // Reads are blocked too: the store is single-writer, not reader/writer.
-    assert_ne!(kv(&dir, &["get", "a"]).code, 0);
+    assert_eq!(kv(&dir, &["del", "a"]).code, 1, "a delete is a write too");
+
+    // Reads, while the writer holds the lock.
+    assert_eq!(kv(&dir, &["get", "a"]).ok().out, "1\n");
+    assert_eq!(kv(&dir, &["list"]).ok().lines(), vec!["a", "b"]);
+    assert_eq!(kv(&dir, &["search", "two"]).ok().lines().len(), 1);
+    assert!(kv(&dir, &["stats"]).ok().out.contains("keys        2"));
+
+    // A commit the holder makes is visible to the next reader process
+    // immediately, lock or no lock.
+    held.put(
+        kvstore::record::home_id(b"z"),
+        kvstore::record::encode("z", b"written while locked", 0).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(kv(&dir, &["get", "z"]).ok().out, "written while locked\n");
+
     drop(held);
     assert_eq!(kv(&dir, &["get", "a"]).ok().out, "1\n");
     let _ = std::fs::remove_dir_all(&dir);

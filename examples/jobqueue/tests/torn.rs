@@ -157,7 +157,7 @@ fn a_narrow_torn_commit_after_a_wide_one_no_longer_raises_the_alarm() {
     std::fs::write(rows_file(&victim), &narrow_rows).unwrap();
 
     // ---- restart #2 ---------------------------------------------------
-    let mut db = Db::open_with(&victim, CAP).unwrap();
+    let db = Db::open_with(&victim, CAP).unwrap();
     let rec = db.recovery_report();
     eprintln!("after the narrow tear: {rec:?}");
     assert_eq!(rec.row_count, COMMITTED);
@@ -228,7 +228,7 @@ fn a_torn_long_value_followed_by_a_short_write_does_not_alarm() {
     // A one-row write in flight afterwards.
     let short_rows = rows_after_interrupted(&base, &work, &[Op::put(600, v(0x22))]);
     std::fs::write(rows_file(&victim), &short_rows).unwrap();
-    let mut db = Db::open_with(&victim, CAP).unwrap();
+    let db = Db::open_with(&victim, CAP).unwrap();
     let rec = db.recovery_report();
     assert_eq!(rec.orphan_valid_rows, 1);
     assert!(!rec.rollback_evidence, "{rec:?}");
@@ -331,7 +331,7 @@ fn a_rollback_of_one_commit_is_invisible_to_the_alarm() {
         }
     }
 
-    let mut db = Db::open_with(&dir, CAP).unwrap();
+    let db = Db::open_with(&dir, CAP).unwrap();
     let rec = db.recovery_report();
     eprintln!("after a rolled-back acknowledged commit: {rec:?}");
     assert_eq!(db.len(), COMMITTED, "{WIDE} acknowledged rows are gone");

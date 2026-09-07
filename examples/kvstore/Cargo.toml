@@ -15,3 +15,10 @@ path = "src/main.rs"
 [lib]
 name = "kvstore"
 path = "src/lib.rs"
+
+# This crate is deliberately OUTSIDE the dabqlite workspace (the root
+# manifest excludes `examples/`). Saying so explicitly stops cargo from
+# walking further up the filesystem and adopting some unrelated ancestor
+# workspace when the checkout is nested inside one (e.g. a git worktree
+# under the main clone).
+[workspace]

@@ -43,7 +43,7 @@ fn there_is_no_concurrent_reader_only_a_salvage_open() {
     assert!(matches!(Db::open(&dir), Err(Error::Locked { .. })));
 
     // `salvage` takes no lock, and on a healthy database it reads fine.
-    let mut reader = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
+    let reader = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
     assert_eq!(reader.len(), 10);
     assert_eq!(reader.get(3).unwrap().unwrap().text(), "x");
 
@@ -55,7 +55,7 @@ fn there_is_no_concurrent_reader_only_a_salvage_open() {
         .unwrap();
     assert_eq!(reader.get(99).unwrap(), None, "the salvage handle is stale");
     assert_eq!(reader.len(), 10);
-    let mut fresh = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
+    let fresh = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
     assert_eq!(
         fresh.get(99).unwrap().map(|v| v.text().to_string()),
         Some("new".into())

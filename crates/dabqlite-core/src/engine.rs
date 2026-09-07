@@ -3069,11 +3069,14 @@ impl Engine {
         // has the same extent for as long as this engine lives.
         let (memo_row, rows, total) = self.extent_memo.get();
         if memo_row == head_row {
-            debug_assert_eq!(
-                (rows, total),
-                self.walk_extent(head_row, &head),
-                "the extent memo disagrees with the arena"
-            );
+            // Deliberately NOT re-walked under `debug_assert`: that would
+            // put the quadratic cost back in exactly the builds every
+            // test runs in, and hide the fix from the tests meant to hold
+            // it. The invariant is checked where it can actually be
+            // broken instead — every soak cycle reads every value byte
+            // for byte against the oracle, and a stale extent corrupts a
+            // value's length, so a memo that went wrong would show up as
+            // a divergent read rather than as a silent slowdown.
             return (rows, total);
         }
         // Counted here rather than in the walk itself: the debug

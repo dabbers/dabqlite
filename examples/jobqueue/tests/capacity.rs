@@ -415,7 +415,7 @@ fn an_interrupted_compaction_is_resolved_by_the_next_open() {
         std::fs::rename(&tmp, target).unwrap();
     };
     let ids_of = |p: &PathBuf| {
-        let mut db = Db::open_with(p, 4096).unwrap();
+        let db = Db::open_with(p, 4096).unwrap();
         db.all()
             .unwrap()
             .iter()

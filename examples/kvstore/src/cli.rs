@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use crate::exec::{execute, Command, Outcome, Report};
-use crate::plan::Entry;
+use crate::store::Entry;
 use crate::{now_secs, Config, KvError};
 
 pub const USAGE: &str = "\
@@ -15,7 +15,7 @@ USAGE:
 
 GLOBAL OPTIONS:
     --db DIR     database directory (default: $KV_DB, else ./kvdata)
-    --rows N     row-slot capacity; remembered in DIR/kv-capacity
+    --rows N     row-slot capacity; the database remembers its own
     -h, --help   this text
     --version    version
 
@@ -73,9 +73,10 @@ pub fn parse(args: &[String]) -> Result<Option<(Config, Command)>, KvError> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--db" => {
-                dir = Some(PathBuf::from(
-                    it.next().ok_or_else(|| KvError::Usage("--db needs a directory".into()))?,
-                ))
+                dir =
+                    Some(PathBuf::from(it.next().ok_or_else(|| {
+                        KvError::Usage("--db needs a directory".into())
+                    })?))
             }
             "--rows" => {
                 let v = it
@@ -247,7 +248,12 @@ fn render(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             rows,
         } => {
             let what = if *replaced { "replaced" } else { "stored" };
-            let _ = writeln!(out, "{what} {} ({rows} row{})", show(key.as_bytes()), plural(*rows));
+            let _ = writeln!(
+                out,
+                "{what} {} ({rows} row{})",
+                show(key.as_bytes()),
+                plural(*rows)
+            );
         }
         Outcome::Value { value, raw } => {
             let _ = out.write_all(value);
@@ -274,7 +280,7 @@ fn render(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Outcome::Info(e) => {
             let _ = writeln!(out, "key      {}", show(e.key.as_bytes()));
             let _ = writeln!(out, "bytes    {}", e.value.len());
-            let _ = writeln!(out, "record   {}", e.record);
+            let _ = writeln!(out, "row id   {}", e.id);
             match e.expires_at {
                 0 => {
                     let _ = writeln!(out, "expires  never");
@@ -287,7 +293,12 @@ fn render(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
         Outcome::Report(r) => render_report(r, out),
         Outcome::Purged(keys) => {
-            let _ = writeln!(out, "purged {} expired key{}", keys.len(), plural(keys.len() as u64));
+            let _ = writeln!(
+                out,
+                "purged {} expired key{}",
+                keys.len(),
+                plural(keys.len() as u64)
+            );
             for k in keys {
                 let _ = writeln!(out, "  {}", show(k.as_bytes()));
             }
@@ -313,7 +324,12 @@ fn render(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             let _ = writeln!(out, "wrote {} ({bytes} bytes)", file.display());
         }
         Outcome::Restored { file, keys } => {
-            let _ = writeln!(out, "restored {keys} key{} from {}", plural(*keys as u64), file.display());
+            let _ = writeln!(
+                out,
+                "restored {keys} key{} from {}",
+                plural(*keys as u64),
+                file.display()
+            );
         }
         Outcome::Rescued {
             dest,
@@ -349,7 +365,6 @@ fn render_report(r: &Report, out: &mut dyn Write) {
     );
     let _ = writeln!(out, "live rows   {}", s.live);
     let _ = writeln!(out, "dead rows   {} (reclaim with `kv compact`)", s.dead);
-    let _ = writeln!(out, "orphan rows {} (unreachable payload)", c.unreachable_rows);
     let _ = writeln!(out, "max value   {} bytes per key+value", r.max_payload);
     let _ = writeln!(
         out,

@@ -54,7 +54,7 @@ fn one_damaged_slot_costs_the_bookmark_that_owns_it_and_not_the_others() {
     );
 
     // Salvage is where the containment claim is honoured.
-    let mut rescued = dabqlite::SalvageDb::salvage_with(&dir, 1024).unwrap();
+    let rescued = dabqlite::SalvageDb::salvage_with(&dir, 1024).unwrap();
     assert!(rescued.is_degraded());
     assert!(
         matches!(rescued.get(1), Err(DbErr::Degraded { .. })),
