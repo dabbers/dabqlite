@@ -448,3 +448,104 @@ fn a_full_database_refuses_a_delete_without_touching_anything() {
         assert_eq!(host.get(id), Some([id as u8; VALUE_LEN]));
     }
 }
+
+fn update(host: &mut SimHost, id: u64, value: [u8; VALUE_LEN]) -> Result<(), DbError> {
+    match host.run(ClientOp::Update { id, value }) {
+        Driven::Done(Output::UpdateDone { result, .. }) => result,
+        other => panic!("update({id}): {other:?}"),
+    }
+}
+
+/// An update replaces a value in ONE commit. The alternative —
+/// delete-then-insert — is two commits, and a crash between them loses
+/// the row entirely; this test crashes at every boundary to show that
+/// cannot happen here.
+#[test]
+fn a_crash_at_every_boundary_of_an_update_keeps_one_value_or_the_other() {
+    for seed in 0..3u64 {
+        let (base, ops) = build(seed, 6);
+        let (target, old_value) = ops[1];
+        let new_value = [0xF3; VALUE_LEN];
+
+        for boundary in 0..6u64 {
+            for settle in 0..3u64 {
+                let ctx = format!("seed={seed} boundary={boundary} settle={settle}");
+                let mut host = SimHost::new(CAPS, base.clone(), None);
+                host.open();
+                host.crash_after = Some(host.io_count + boundary);
+                let _ = host.run(ClientOp::Update {
+                    id: target,
+                    value: new_value,
+                });
+
+                let mut disk = std::mem::take(&mut host.disk);
+                let mut rng = crash_rng(0x0FDA7E, settle);
+                disk.crash(&mut rng);
+
+                let (mut host, n) = open(disk);
+                // The row is NEVER missing: an update is not a delete.
+                let got = host
+                    .get(target)
+                    .unwrap_or_else(|| panic!("[{ctx}] the row vanished under an update"));
+                assert!(
+                    got == old_value || got == new_value,
+                    "[{ctx}] neither the old nor the new value: {got:?}"
+                );
+                assert_eq!(n, ops.len() as u64, "[{ctx}] live count changed");
+                for &(id, value) in &ops {
+                    if id == target {
+                        continue;
+                    }
+                    assert_eq!(host.get(id), Some(value), "[{ctx}] neighbour {id}");
+                }
+            }
+        }
+    }
+}
+
+/// Updates are visible everywhere at once, survive restarts, and are
+/// refused for rows that do not exist.
+#[test]
+fn updates_are_atomic_visible_everywhere_and_durable() {
+    let (disk, ops) = build(77, 8);
+    let (mut host, _) = open(disk);
+    let (id, old) = ops[3];
+    let new = *b"UPDATED-VALUE!!!";
+
+    assert_eq!(
+        update(&mut host, 999_999, new),
+        Err(DbError::NotFound { id: 999_999 })
+    );
+    assert_eq!(update(&mut host, id, new), Ok(()));
+    assert_eq!(host.get(id), Some(new));
+    assert_eq!(
+        host.engine.live_count(),
+        ops.len() as u64,
+        "an update is not an insert"
+    );
+
+    // Ordered scan and substring search both see the new value only.
+    let rows = host.range_all(0, u64::MAX);
+    assert_eq!(rows.len(), ops.len());
+    assert!(rows.contains(&(id, new)));
+    assert!(!rows.contains(&(id, old)));
+    assert!(host.find_all(&new[..6]).iter().any(|(k, _)| *k == id));
+    assert!(
+        !host.find_all(&old[..6]).iter().any(|(k, _)| *k == id),
+        "substring search still matches the superseded value"
+    );
+
+    // Durable across a restart.
+    let disk = std::mem::take(&mut host.disk);
+    let (mut host, n) = open(disk);
+    assert_eq!(n, ops.len() as u64);
+    assert_eq!(host.get(id), Some(new));
+    // An updated row can still be deleted, and then re-inserted.
+    assert_eq!(delete(&mut host, id), Ok(()));
+    assert_eq!(host.get(id), None);
+    assert!(matches!(
+        host.run(ClientOp::Insert { id, value: old }),
+        Driven::Done(Output::InsertDone { result: Ok(()), .. })
+    ));
+    assert_eq!(host.get(id), Some(old));
+}

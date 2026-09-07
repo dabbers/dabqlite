@@ -180,6 +180,13 @@ pub enum Input<'a> {
     IoFailed { file: FileId },
     /// Client: insert a row.
     Insert { id: u64, value: [u8; VALUE_LEN] },
+    /// Client: replace the value of an existing row.
+    ///
+    /// ONE atomic commit: a new row is appended superseding the old one.
+    /// Delete-then-insert would be two commits, and a crash between them
+    /// would leave the row gone — which is why this is a first-class
+    /// operation and not a convenience built on the other two.
+    Update { id: u64, value: [u8; VALUE_LEN] },
     /// Client: delete a row by primary key.
     ///
     /// Recorded by APPENDING a tombstone, never by overwriting the record
@@ -223,6 +230,11 @@ pub enum Output {
     OpenDone { result: Result<u64, DbError> },
     /// Insert finished (durably committed if `Ok`).
     InsertDone {
+        id: u64,
+        result: Result<(), DbError>,
+    },
+    /// Update finished (durably committed if `Ok`).
+    UpdateDone {
         id: u64,
         result: Result<(), DbError>,
     },
@@ -340,6 +352,14 @@ enum State {
     InsertWriteSb { copy: u8 },
     /// Insert: superblock fsync in flight (the commit point).
     InsertFsyncSb,
+    /// Update: superseding-row write in flight.
+    UpdateWriteRow,
+    /// Update: rows-file fsync in flight.
+    UpdateFsyncRows,
+    /// Update: superblock-copy write in flight.
+    UpdateWriteSb { copy: u8 },
+    /// Update: superblock fsync in flight (the commit point).
+    UpdateFsyncSb,
     /// Delete: tombstone-slot write in flight.
     DeleteWriteRow,
     /// Delete: rows-file fsync in flight (durability point for the
@@ -414,6 +434,9 @@ pub struct Engine {
     /// The delete in flight: the id, and the row slot holding the record
     /// it retires (cleared at the commit point).
     pending_delete: Option<(u64, u64)>,
+    /// The update in flight: the id, its new value, and the row slot it
+    /// supersedes.
+    pending_update: Option<(u64, [u8; VALUE_LEN], u64)>,
     /// One bit per row slot: set when that slot holds a LIVE record.
     /// Cleared when a tombstone retires it, and never set for a tombstone
     /// slot itself. Derived state, sized at init like every other arena —
@@ -467,6 +490,7 @@ impl Engine {
             orphan_valid_rows: 0,
             pending_repair: None,
             pending_delete: None,
+            pending_update: None,
             live_bits: vec![0u64; (caps.rows as usize).div_ceil(64)],
             live_count: 0,
             retired: 0,
@@ -621,6 +645,14 @@ impl Engine {
                 | State::InsertFsyncSb
         );
         debug_assert_eq!(self.pending.is_some(), inserting);
+        let updating = matches!(
+            self.state,
+            State::UpdateWriteRow
+                | State::UpdateFsyncRows
+                | State::UpdateWriteSb { .. }
+                | State::UpdateFsyncSb
+        );
+        debug_assert_eq!(self.pending_update.is_some(), updating);
         let deleting = matches!(
             self.state,
             State::DeleteWriteRow
@@ -630,7 +662,7 @@ impl Engine {
         );
         debug_assert_eq!(self.pending_delete.is_some(), deleting);
         // Never both.
-        debug_assert!(!(inserting && deleting));
+        debug_assert!(u8::from(inserting) + u8::from(deleting) + u8::from(updating) <= 1);
         // Live records are a subset of the slots, and of the keys the
         // ordered index holds (one per distinct id ever inserted). Only
         // meaningful once open has published `row_count`: during recovery
@@ -647,6 +679,10 @@ impl Engine {
                 | State::DeleteFsyncRows
                 | State::DeleteWriteSb { .. }
                 | State::DeleteFsyncSb
+                | State::UpdateWriteRow
+                | State::UpdateFsyncRows
+                | State::UpdateWriteSb { .. }
+                | State::UpdateFsyncSb
         ) {
             debug_assert!(self.live_count <= self.row_count);
             debug_assert!(self.live_count <= self.ordered.len());
@@ -671,6 +707,7 @@ impl Engine {
             Input::FsyncDone { file } => self.on_fsync_done(file),
             Input::IoFailed { file } => self.on_io_failed(file),
             Input::Insert { id, value } => self.on_insert(id, value),
+            Input::Update { id, value } => self.on_update(id, value),
             Input::Delete { id } => self.on_delete(id),
             Input::Get { id } => self.on_get(id),
             Input::Range { lo, hi } => self.on_range(lo, hi),
@@ -936,6 +973,25 @@ impl Engine {
                     self.set_live(row, true);
                     self.live_count += 1;
                 }
+                RowKind::Update => {
+                    // Supersede: legitimate only for an id that IS live.
+                    let Some(old_row) = self.live_row_of(id) else {
+                        if self.salvage {
+                            self.quarantined += 1;
+                            self.trigram.skip_row(row);
+                            continue;
+                        }
+                        return self.fail_open(DbError::Corrupt {
+                            what: crate::defect::ORPHAN_UPDATE,
+                        });
+                    };
+                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
+                    self.set_live(old_row, false);
+                    self.retired += 1;
+                    self.bind_indices(id, row);
+                    self.trigram.insert(row, &slot.value);
+                    self.set_live(row, true);
+                }
                 RowKind::Tombstone => {
                     // A deletion of something not live cannot be produced by
                     // the engine (it refuses `NotFound` before any I/O), so
@@ -1054,6 +1110,67 @@ impl Engine {
         self.is_live(row).then_some(row)
     }
 
+    fn on_update(&mut self, id: u64, value: [u8; VALUE_LEN]) -> Output {
+        let err = match self.state {
+            State::Ready => None,
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
+            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Some(DbError::Busy),
+            State::Degraded => Some(DbError::Degraded {
+                quarantined: self.quarantined,
+            }),
+            State::Failed(e) => Some(e),
+        };
+        if let Some(e) = err {
+            return Output::UpdateDone { id, result: Err(e) };
+        }
+        let Some(old_row) = self.live_row_of(id) else {
+            return Output::UpdateDone {
+                id,
+                result: Err(DbError::NotFound { id }),
+            };
+        };
+        if self.row_count == self.caps.rows {
+            return Output::UpdateDone {
+                id,
+                result: Err(DbError::Full {
+                    entity: "records",
+                    capacity: self.caps.rows,
+                }),
+            };
+        }
+
+        let off = (self.row_count as usize) * ROW_SIZE;
+        let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
+            .try_into()
+            .expect("fixed slice");
+        encode_row(RowKind::Update, id, &value, slot);
+        self.pending_update = Some((id, value, old_row));
+        self.state = State::UpdateWriteRow;
+        Output::Write {
+            file: FileId::Rows,
+            offset: off as u64,
+            data: WriteBuf::from_slice(&self.arena[off..off + ROW_SIZE]),
+        }
+    }
+
     fn on_delete(&mut self, id: u64) -> Output {
         let err = match self.state {
             State::Ready => None,
@@ -1069,6 +1186,10 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
@@ -1131,6 +1252,10 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
@@ -1210,6 +1335,20 @@ impl Engine {
                     file: FileId::Superblock,
                 }
             }
+            (State::UpdateWriteRow, FileId::Rows) => {
+                self.state = State::UpdateFsyncRows;
+                Output::Fsync { file: FileId::Rows }
+            }
+            (State::UpdateWriteSb { copy: 0 }, FileId::Superblock) => {
+                self.state = State::UpdateWriteSb { copy: 1 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+            }
+            (State::UpdateWriteSb { copy: 1 }, FileId::Superblock) => {
+                self.state = State::UpdateFsyncSb;
+                Output::Fsync {
+                    file: FileId::Superblock,
+                }
+            }
             (State::DeleteWriteRow, FileId::Rows) => {
                 self.state = State::DeleteFsyncRows;
                 Output::Fsync { file: FileId::Rows }
@@ -1281,6 +1420,29 @@ impl Engine {
                 },
                 FileId::Superblock,
             ) => self.finish_open(generation, row_count),
+            (State::UpdateFsyncRows, FileId::Rows) => {
+                self.state = State::UpdateWriteSb { copy: 0 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
+            }
+            (State::UpdateFsyncSb, FileId::Superblock) => {
+                // Commit point: the new value is durable.
+                let (id, value, old_row) = self
+                    .pending_update
+                    .take()
+                    .expect("pending update at commit");
+                self.generation += 1;
+                // The superseded slot stops being live; the new one starts.
+                self.set_live(old_row, false);
+                self.bind_indices(id, self.row_count);
+                self.trigram.insert(self.row_count, &value);
+                self.set_live(self.row_count, true);
+                self.row_count += 1;
+                self.retired += 1;
+                self.state = State::Ready;
+                // Pair assertion: the new value must now be the one read.
+                debug_assert_eq!(self.lookup_value(id), Some(value));
+                Output::UpdateDone { id, result: Ok(()) }
+            }
             (State::DeleteFsyncRows, FileId::Rows) => {
                 // The tombstone is durable; now flip the manifest over it.
                 self.state = State::DeleteWriteSb { copy: 0 };
@@ -1356,6 +1518,8 @@ impl Engine {
             State::RecoverRepairSb { .. } | State::RecoverFsyncSb { .. } => FileId::Superblock,
             State::InsertWriteRow | State::InsertFsyncRows => FileId::Rows,
             State::InsertWriteSb { .. } | State::InsertFsyncSb => FileId::Superblock,
+            State::UpdateWriteRow | State::UpdateFsyncRows => FileId::Rows,
+            State::UpdateWriteSb { .. } | State::UpdateFsyncSb => FileId::Superblock,
             State::DeleteWriteRow | State::DeleteFsyncRows => FileId::Rows,
             State::DeleteWriteSb { .. } | State::DeleteFsyncSb => FileId::Superblock,
             state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
@@ -1372,6 +1536,20 @@ impl Engine {
                 let (id, _) = self.pending.take().expect("pending insert on failure");
                 self.state = State::Failed(err);
                 Output::InsertDone {
+                    id,
+                    result: Err(err),
+                }
+            }
+            State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb => {
+                let (id, _, _) = self
+                    .pending_update
+                    .take()
+                    .expect("pending update on failure");
+                self.state = State::Failed(err);
+                Output::UpdateDone {
                     id,
                     result: Err(err),
                 }
@@ -1421,6 +1599,10 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
@@ -1449,6 +1631,10 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
@@ -1479,6 +1665,10 @@ impl Engine {
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
             | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }

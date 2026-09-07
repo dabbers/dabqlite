@@ -126,6 +126,12 @@ impl<S: Storage> Host<S> {
         self.drive(Input::Insert { id, value })
     }
 
+    /// Replace an existing row's value in ONE atomic commit. Not
+    /// delete-then-insert: a crash between those two would lose the row.
+    pub fn update(&mut self, id: u64, value: [u8; dabqlite_core::VALUE_LEN]) -> Output {
+        self.drive(Input::Update { id, value })
+    }
+
     /// Delete a row. Recorded by appending a tombstone (never by
     /// overwriting the record), so a crash mid-delete resolves
     /// all-or-nothing exactly like a crash mid-insert. Costs a row slot;
@@ -155,6 +161,16 @@ impl<S: Storage> Host<S> {
         let out = self.drive_from(first);
         self.migrating = None;
         Ok(out)
+    }
+
+    /// Drive one client operation to its terminal output.
+    ///
+    /// The typed helpers above cover the common operations; this is the
+    /// escape hatch for the ones that carry richer inputs (paged range and
+    /// substring scans), so callers do not have to reimplement the
+    /// lockstep loop to reach them.
+    pub fn run(&mut self, input: Input<'_>) -> Output {
+        self.drive(input)
     }
 
     fn tick_machine(&mut self, input: Input<'_>) -> Output {

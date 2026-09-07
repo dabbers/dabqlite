@@ -15,6 +15,7 @@ use crate::disk::SimDisk;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientOp {
     Insert { id: u64, value: [u8; VALUE_LEN] },
+    Update { id: u64, value: [u8; VALUE_LEN] },
     Delete { id: u64 },
     Get { id: u64 },
 }
@@ -343,6 +344,7 @@ impl SimHost {
             matches!(
                 input,
                 Input::Insert { .. }
+                    | Input::Update { .. }
                     | Input::Delete { .. }
                     | Input::Get { .. }
                     | Input::Range { .. }
@@ -356,6 +358,7 @@ impl SimHost {
     pub fn run(&mut self, op: ClientOp) -> Driven {
         match op {
             ClientOp::Insert { id, value } => self.drive(Input::Insert { id, value }),
+            ClientOp::Update { id, value } => self.drive(Input::Update { id, value }),
             ClientOp::Delete { id } => self.drive(Input::Delete { id }),
             ClientOp::Get { id } => self.drive(Input::Get { id }),
         }

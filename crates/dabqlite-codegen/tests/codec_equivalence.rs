@@ -14,7 +14,7 @@ use dabqlite_core::layout::RowKind;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
 use generated::{
     decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_RECORD,
-    RECORDS_KIND_TOMBSTONE, RECORDS_ROW_SIZE,
+    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_ROW_SIZE,
 };
 
 /// Deterministic pseudo-random stream without pulling rand into this crate:
@@ -46,10 +46,10 @@ fn generated_encode_is_byte_identical_to_hand_written() {
         rng.fill(&mut value);
         // Both row kinds, so the discriminant byte is covered by the
         // equivalence too — not just the record path.
-        let (kind, kind_byte) = if round % 3 == 0 {
-            (RowKind::Tombstone, RECORDS_KIND_TOMBSTONE)
-        } else {
-            (RowKind::Record, RECORDS_KIND_RECORD)
+        let (kind, kind_byte) = match round % 3 {
+            0 => (RowKind::Tombstone, RECORDS_KIND_TOMBSTONE),
+            1 => (RowKind::Update, RECORDS_KIND_UPDATE),
+            _ => (RowKind::Record, RECORDS_KIND_RECORD),
         };
 
         let mut hand_bytes = [0u8; ROW_SIZE];
@@ -82,10 +82,10 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
             let id = rng.next();
             let mut value = [0u8; VALUE_LEN];
             rng.fill(&mut value);
-            let kind = if round % 6 == 0 {
-                RowKind::Tombstone
-            } else {
-                RowKind::Record
+            let kind = match round % 6 {
+                0 => RowKind::Tombstone,
+                2 => RowKind::Update,
+                _ => RowKind::Record,
             };
             hand::encode_row(kind, id, &value, &mut slot);
             if round % 4 == 0 {
@@ -111,6 +111,7 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                 let hand_kind = match hand_slot.kind {
                     RowKind::Record => RECORDS_KIND_RECORD,
                     RowKind::Tombstone => RECORDS_KIND_TOMBSTONE,
+                    RowKind::Update => RECORDS_KIND_UPDATE,
                 };
                 assert_eq!(
                     hand_kind, row.kind,
@@ -133,7 +134,11 @@ fn generated_codec_has_no_dead_bytes_either() {
     // Both kinds: a tombstone's bytes must be as fully covered as a
     // record's, or a flip could turn a deletion back into data.
     let mut slot = [0u8; RECORDS_ROW_SIZE];
-    for kind in [RECORDS_KIND_RECORD, RECORDS_KIND_TOMBSTONE] {
+    for kind in [
+        RECORDS_KIND_RECORD,
+        RECORDS_KIND_TOMBSTONE,
+        RECORDS_KIND_UPDATE,
+    ] {
         let row = RecordsRow {
             kind,
             id: 0xDAB0_0001,

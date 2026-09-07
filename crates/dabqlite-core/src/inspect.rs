@@ -69,6 +69,11 @@ pub struct RowScan {
     pub corrupt_offsets: Vec<u64>,
     /// Committed rows that are deletions rather than records.
     pub tombstones: u64,
+    /// Committed rows that supersede an earlier value for the same id.
+    pub superseded: u64,
+    /// Updates referring to an id that was not live at that point in the
+    /// commit order — impossible for the engine to write.
+    pub orphan_updates: u64,
     /// Deletions referring to an id that was not live at that point in the
     /// commit order — impossible for the engine to write, so evidence of
     /// damage or of a file we did not produce.
@@ -211,6 +216,17 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                                 scan.duplicate_samples.push(id);
                             }
                             first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
+                        }
+                    }
+                    RowKind::Update => {
+                        // A superseding row is legitimate only for an id
+                        // that is live at this point in the commit order.
+                        if seen.contains(&id) {
+                            scan.committed_valid += 1;
+                            scan.superseded += 1;
+                        } else {
+                            scan.orphan_updates += 1;
+                            first_defect.get_or_insert(crate::defect::ORPHAN_UPDATE);
                         }
                     }
                     RowKind::Tombstone => {

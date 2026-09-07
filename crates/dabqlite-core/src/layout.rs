@@ -10,7 +10,7 @@
 //! offset  size  field
 //!      0     8  id        (u64 LE)
 //!      8    16  value     (fixed-width payload)
-//!     24     1  kind      (0 = record, 1 = tombstone)
+//!     24     1  kind      (0 = record, 1 = tombstone, 2 = update)
 //!     25     4  crc32     (over bytes 0..25 — the kind byte INCLUDED)
 //!     29     3  padding   (zero)
 //!
@@ -65,6 +65,14 @@ pub enum RowKind {
     /// removes, so the rows file stays append-only and a crash mid-delete
     /// resolves all-or-nothing like every other commit.
     Tombstone,
+    /// A NEW value for an id that already has one. Appended, like
+    /// everything else, so an overwrite is ONE atomic commit — a delete
+    /// followed by an insert would be two, and a crash between them would
+    /// lose the row entirely.
+    ///
+    /// Kept distinct from `Record` so that two records for one id remains
+    /// what it has always been: evidence of damage.
+    Update,
 }
 
 impl RowKind {
@@ -72,12 +80,14 @@ impl RowKind {
         match self {
             RowKind::Record => records::RECORDS_KIND_RECORD,
             RowKind::Tombstone => records::RECORDS_KIND_TOMBSTONE,
+            RowKind::Update => records::RECORDS_KIND_UPDATE,
         }
     }
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             records::RECORDS_KIND_RECORD => Some(RowKind::Record),
             records::RECORDS_KIND_TOMBSTONE => Some(RowKind::Tombstone),
+            records::RECORDS_KIND_UPDATE => Some(RowKind::Update),
             _ => None,
         }
     }
@@ -95,7 +105,7 @@ impl RowSlot {
     /// The record this slot holds, or `None` if it is a deletion.
     pub fn record(&self) -> Option<(u64, [u8; VALUE_LEN])> {
         match self.kind {
-            RowKind::Record => Some((self.id, self.value)),
+            RowKind::Record | RowKind::Update => Some((self.id, self.value)),
             RowKind::Tombstone => None,
         }
     }
@@ -175,6 +185,7 @@ pub mod reference {
         out[24] = match kind {
             RowKind::Record => 0,
             RowKind::Tombstone => 1,
+            RowKind::Update => 2,
         };
         let crc = crc32(&out[0..25]);
         out[25..29].copy_from_slice(&crc.to_le_bytes());
@@ -195,6 +206,7 @@ pub mod reference {
         let kind = match bytes[24] {
             0 => RowKind::Record,
             1 => RowKind::Tombstone,
+            2 => RowKind::Update,
             _ => return None,
         };
         let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
@@ -373,7 +385,7 @@ mod tests {
         // Both kinds. The KIND byte is the one this matters most for: if
         // a flip there went undetected, a deletion would silently become a
         // record again and deleted data would reappear.
-        for kind in [RowKind::Record, RowKind::Tombstone] {
+        for kind in [RowKind::Record, RowKind::Tombstone, RowKind::Update] {
             let mut row = [0u8; ROW_SIZE];
             encode_row(kind, 42, &[7u8; VALUE_LEN], &mut row);
             for byte in 0..ROW_SIZE {

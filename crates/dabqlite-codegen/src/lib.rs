@@ -73,6 +73,14 @@ pub const CURRENT_ROW_FORMAT: u8 = 2;
 /// Row kinds, v2 and later. The discriminant lives inside the checksum.
 pub const ROW_KIND_RECORD: u8 = 0;
 pub const ROW_KIND_TOMBSTONE: u8 = 1;
+/// A new value for an id that already has one. Distinct from `RECORD` so
+/// that two RECORDs for one id stays exactly what it always was —
+/// evidence of damage — while a legitimate overwrite is ONE atomic
+/// appended row rather than a delete followed by an insert, which a crash
+/// could split and lose the row between.
+pub const ROW_KIND_UPDATE: u8 = 2;
+/// Largest kind this format defines; anything above is damaged or foreign.
+pub const ROW_KIND_MAX: u8 = ROW_KIND_UPDATE;
 
 /// Computed record layout: sequential field offsets, then the CRC, then
 /// zero padding to an 8-byte multiple. Every byte of the row is covered:
@@ -607,8 +615,8 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     ));
     if let Some(kind) = layout.kind_offset {
         o.push_str(&format!(
-            "/// Offset of the row-kind discriminant. INSIDE the checksummed\n             /// region: a bit flip here must not be able to turn a deletion\n             /// back into a record.\n             pub const {upper}_KIND_OFFSET: usize = {kind};\n             pub const {upper}_KIND_RECORD: u8 = {};\n             pub const {upper}_KIND_TOMBSTONE: u8 = {};\n",
-            ROW_KIND_RECORD, ROW_KIND_TOMBSTONE
+            "/// Offset of the row-kind discriminant. INSIDE the checksummed\n             /// region: a bit flip here must not be able to turn a deletion\n             /// back into a record.\n             pub const {upper}_KIND_OFFSET: usize = {kind};\n             pub const {upper}_KIND_RECORD: u8 = {};\n             pub const {upper}_KIND_TOMBSTONE: u8 = {};\n             pub const {upper}_KIND_UPDATE: u8 = {};\n             pub const {upper}_KIND_MAX: u8 = {};\n",
+            ROW_KIND_RECORD, ROW_KIND_TOMBSTONE, ROW_KIND_UPDATE, ROW_KIND_MAX
         ));
     }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
@@ -713,7 +721,7 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     if layout.kind_offset.is_some() {
         o.push_str(&format!(
             "    let kind = bytes[{upper}_KIND_OFFSET];\n\
-             \x20   if kind != {upper}_KIND_RECORD && kind != {upper}_KIND_TOMBSTONE {{\n\
+             \x20   if kind > {upper}_KIND_MAX {{\n\
              \x20       return None;\n\
              \x20   }}\n"
         ));

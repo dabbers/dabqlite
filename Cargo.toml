@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
+# Sample projects are standalone crates that depend on dabqlite the way a
+# real consumer would — by path, from outside. Keeping them out of the
+# workspace is the point: if a sample needs something the published API
+# does not expose, it fails to build instead of quietly reaching inside.
+exclude = ["examples"]
 members = [
+    "crates/dabqlite",
     "crates/dabqlite-codegen",
     "crates/dabqlite-core",
     "crates/dabqlite-host",

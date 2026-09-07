@@ -12,6 +12,8 @@ pub const RECORDS_CRC_OFFSET: usize = 25;
              pub const RECORDS_KIND_OFFSET: usize = 24;
              pub const RECORDS_KIND_RECORD: u8 = 0;
              pub const RECORDS_KIND_TOMBSTONE: u8 = 1;
+             pub const RECORDS_KIND_UPDATE: u8 = 2;
+             pub const RECORDS_KIND_MAX: u8 = 2;
 pub const RECORDS_COL_ID_OFFSET: usize = 0;
 pub const RECORDS_COL_VALUE_OFFSET: usize = 8;
 
@@ -71,7 +73,7 @@ pub fn decode_records_row(bytes: &[u8]) -> Option<RecordsRow> {
         return None;
     }
     let kind = bytes[RECORDS_KIND_OFFSET];
-    if kind != RECORDS_KIND_RECORD && kind != RECORDS_KIND_TOMBSTONE {
+    if kind > RECORDS_KIND_MAX {
         return None;
     }
     let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);

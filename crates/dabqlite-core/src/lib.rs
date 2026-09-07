@@ -57,6 +57,10 @@ pub mod defect {
     /// in the commit order.
     pub const ORPHAN_TOMBSTONE: &str =
         "deletion of a row that was not live (reopen in salvage mode to read the rest)";
+    /// An update refers to an id that holds no live record at that point
+    /// in the commit order.
+    pub const ORPHAN_UPDATE: &str =
+        "update of a row that was not live (reopen in salvage mode to read the rest)";
     /// Two committed rows claim the same primary key.
     pub const DUPLICATE_ID: &str =
         "duplicate id among committed rows (reopen in salvage mode to read the rest)";

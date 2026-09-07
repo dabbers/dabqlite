@@ -1,0 +1,18 @@
+[package]
+name = "dabqlite"
+description = "An embeddable, crash-safe record store — the public API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dabqlite-core = { path = "../dabqlite-core" }
+dabqlite-host = { path = "../dabqlite-host" }
+
+[dev-dependencies]
+dabqlite-core = { path = "../dabqlite-core" }
+dabqlite-host = { path = "../dabqlite-host" }
+
+[lints]
+workspace = true
