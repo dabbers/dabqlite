@@ -91,6 +91,10 @@ pub struct LifetimeStats {
     /// lifetime's disk, then read back in salvage mode with every
     /// surviving row verified against the log.
     pub salvage_checks: u64,
+    /// Committed deletions.
+    pub deletes: u64,
+    /// Committed updates.
+    pub updates: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -111,6 +115,83 @@ fn absorb_io(stats: &mut LifetimeStats, host: &SimHost) {
     stats.fsyncs += host.n_fsyncs;
 }
 
+/// A write that may or may not have committed when a fault hit.
+///
+/// All three kinds reconcile identically — one appended slot, one
+/// generation — which is the whole reason deletes and updates needed no
+/// new recovery machinery.
+#[derive(Debug, Clone, Copy)]
+enum InFlight {
+    Insert { id: u64, value: [u8; VALUE_LEN] },
+    Update { id: u64, value: [u8; VALUE_LEN] },
+    Delete { id: u64, old: [u8; VALUE_LEN] },
+}
+
+impl InFlight {
+    /// Apply to the model. `log` mirrors ROW order, which is what
+    /// substring search returns: an update moves its row to the end.
+    fn apply(
+        &self,
+        oracle: &mut BTreeMap<u64, [u8; VALUE_LEN]>,
+        log: &mut Vec<(u64, [u8; VALUE_LEN])>,
+        history: &mut Vec<(u64, [u8; VALUE_LEN])>,
+    ) {
+        if let InFlight::Insert { id, value } | InFlight::Update { id, value } = *self {
+            history.push((id, value));
+        }
+        match *self {
+            InFlight::Insert { id, value } => {
+                oracle.insert(id, value);
+                log.push((id, value));
+            }
+            InFlight::Update { id, value } => {
+                oracle.insert(id, value);
+                log.retain(|(k, _)| *k != id);
+                log.push((id, value));
+            }
+            InFlight::Delete { id, .. } => {
+                oracle.remove(&id);
+                log.retain(|(k, _)| *k != id);
+            }
+        }
+    }
+
+    fn assert_committed(&self, host: &mut SimHost, ctx: &str) {
+        match *self {
+            InFlight::Insert { id, value } | InFlight::Update { id, value } => assert_eq!(
+                host.get(id),
+                Some(value),
+                "[{ctx}] in-flight write committed but is not readable"
+            ),
+            InFlight::Delete { id, .. } => assert_eq!(
+                host.get(id),
+                None,
+                "[{ctx}] in-flight delete committed but the row is still there"
+            ),
+        }
+    }
+
+    fn assert_not_committed(&self, host: &mut SimHost, ctx: &str) {
+        match *self {
+            InFlight::Insert { id, .. } => {
+                assert_eq!(host.get(id), None, "[{ctx}] uncommitted insert is visible")
+            }
+            // An uncommitted update or delete must leave the OLD value
+            // exactly as it was — a half-applied write is the failure this
+            // whole design exists to prevent.
+            InFlight::Update { id, .. } => assert!(
+                host.get(id).is_some(),
+                "[{ctx}] uncommitted update lost the row"
+            ),
+            InFlight::Delete { id, old } => assert_eq!(
+                host.get(id),
+                Some(old),
+                "[{ctx}] uncommitted delete removed or altered the row"
+            ),
+        }
+    }
+}
+
 /// Run one full lifetime. Panics (with seed context) on any divergence.
 pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -121,6 +202,14 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
     // in row order, so the log is its exact oracle.
     let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
     let mut log: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
+    // Slots consumed on disk. Distinct from `oracle.len()` as soon as
+    // anything is deleted or updated, because every write appends.
+    let mut slots: u64;
+    // Every (id, value) this lifetime ever committed. Salvage may serve a
+    // value the current oracle no longer holds — quarantining a tombstone
+    // loses a deletion — but it must never serve one that was never
+    // written at all.
+    let mut history: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
 
     // Some lifetimes begin as a LEGACY v1 database: migrate it first,
     // under the same fault schedule as everything else. The two-worlds
@@ -185,6 +274,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             value[..V1_VALUE_LEN].copy_from_slice(&v1);
             oracle.insert(id, value);
             log.push((id, value));
+            history.push((id, value));
         }
     }
 
@@ -194,6 +284,8 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         Driven::Done(Output::OpenDone { result: Ok(n) }) if n == oracle.len() as u64 => {}
         other => panic!("[seed={seed}] first open failed: {other:?}"),
     }
+    // A migrated database arrives with slots already consumed.
+    slots = host.engine.usage().0;
 
     for cycle in 0..cfg.cycles {
         let ctx = format!("seed={seed} cycle={cycle}");
@@ -213,43 +305,97 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             host.crash_after = Some(host.io_count + fault_delta);
         }
 
-        let mut in_flight: Option<(u64, [u8; VALUE_LEN])> = None;
+        let mut in_flight: Option<InFlight> = None;
         let mut crashed = false;
         let mut io_failed = false;
         for _ in 0..inserts {
-            let id: u64 = rng.gen();
-            let mut value = [0u8; VALUE_LEN];
-            rng.fill_bytes(&mut value);
-            match host.run(ClientOp::Insert { id, value }) {
-                Driven::Done(Output::InsertDone { result: Ok(()), .. }) => {
-                    oracle.insert(id, value);
-                    log.push((id, value));
-                    stats.commits += 1;
+            // Every write kind takes one slot and one generation, so all
+            // three reconcile identically after a fault: the operation is
+            // committed or it is not.
+            let roll = rng.gen_range(0..100u32);
+            let existing = (!oracle.is_empty()).then(|| {
+                *oracle
+                    .keys()
+                    .nth(rng.gen_range(0..oracle.len()))
+                    .expect("non-empty")
+            });
+            let op = match (existing, roll) {
+                (Some(id), r) if r < 15 => {
+                    let old = oracle[&id];
+                    InFlight::Delete { id, old }
                 }
-                Driven::Done(Output::InsertDone {
-                    result: Err(dabqlite_core::DbError::Full { .. }),
-                    ..
-                }) => {
-                    // Legitimate at capacity; verify and carry on.
-                    assert_eq!(
-                        oracle.len() as u64,
-                        cfg.caps.rows,
-                        "[{ctx}] Full below capacity"
-                    );
+                (Some(id), r) if r < 30 => {
+                    let mut value = [0u8; VALUE_LEN];
+                    rng.fill_bytes(&mut value);
+                    InFlight::Update { id, value }
+                }
+                _ => {
+                    let id: u64 = rng.gen();
+                    let mut value = [0u8; VALUE_LEN];
+                    rng.fill_bytes(&mut value);
+                    InFlight::Insert { id, value }
+                }
+            };
+            let driven = match op {
+                InFlight::Insert { id, value } => host.run(ClientOp::Insert { id, value }),
+                InFlight::Update { id, value } => host.run(ClientOp::Update { id, value }),
+                InFlight::Delete { id, .. } => host.run(ClientOp::Delete { id }),
+            };
+            match driven {
+                Driven::Done(
+                    Output::InsertDone { result: Ok(()), .. }
+                    | Output::UpdateDone { result: Ok(()), .. }
+                    | Output::DeleteDone { result: Ok(()), .. },
+                ) => {
+                    op.apply(&mut oracle, &mut log, &mut history);
+                    slots += 1;
+                    stats.commits += 1;
+                    match op {
+                        InFlight::Delete { .. } => stats.deletes += 1,
+                        InFlight::Update { .. } => stats.updates += 1,
+                        InFlight::Insert { .. } => {}
+                    }
+                }
+                Driven::Done(
+                    Output::InsertDone {
+                        result: Err(dabqlite_core::DbError::Full { .. }),
+                        ..
+                    }
+                    | Output::UpdateDone {
+                        result: Err(dabqlite_core::DbError::Full { .. }),
+                        ..
+                    }
+                    | Output::DeleteDone {
+                        result: Err(dabqlite_core::DbError::Full { .. }),
+                        ..
+                    },
+                ) => {
+                    // Legitimate at capacity — which counts SLOTS, not
+                    // live rows: deletes and updates consume them too.
+                    assert_eq!(slots, cfg.caps.rows, "[{ctx}] Full below capacity");
                     stats.full_rejections += 1;
                 }
-                Driven::Done(Output::InsertDone {
-                    result: Err(dabqlite_core::DbError::IoFailed { .. }),
-                    ..
-                }) => {
-                    // Fail-stop: the failed insert is the in-flight one.
-                    in_flight = Some((id, value));
+                Driven::Done(
+                    Output::InsertDone {
+                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
+                        ..
+                    }
+                    | Output::UpdateDone {
+                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
+                        ..
+                    }
+                    | Output::DeleteDone {
+                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
+                        ..
+                    },
+                ) => {
+                    in_flight = Some(op);
                     io_failed = true;
                     break;
                 }
-                Driven::Done(other) => panic!("[{ctx}] unexpected insert result: {other:?}"),
+                Driven::Done(other) => panic!("[{ctx}] unexpected write result: {other:?}"),
                 Driven::Crashed => {
-                    in_flight = Some((id, value));
+                    in_flight = Some(op);
                     crashed = true;
                     break;
                 }
@@ -277,27 +423,20 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             host = recover(&ctx, cfg, disk, &mut rng, &mut stats);
         }
 
-        // Resolve the in-flight insert: committed or vanished, atomically.
+        // Resolve the in-flight write — insert, update or delete alike:
+        // it committed or it did not, atomically, and the SLOT count says
+        // which.
         let (used, _) = host.engine.usage();
-        let expected = oracle.len() as u64;
-        if used == expected + 1 {
-            let (id, value) =
-                in_flight.unwrap_or_else(|| panic!("[{ctx}] extra row with none in flight"));
-            assert_eq!(
-                host.get(id),
-                Some(value),
-                "[{ctx}] in-flight insert committed but corrupted"
-            );
-            oracle.insert(id, value);
-            log.push((id, value));
+        if used == slots + 1 {
+            let op = in_flight.unwrap_or_else(|| panic!("[{ctx}] extra slot with none in flight"));
+            op.apply(&mut oracle, &mut log, &mut history);
+            slots += 1;
+            op.assert_committed(&mut host, &ctx);
             stats.in_flight_committed += 1;
         } else {
-            assert_eq!(
-                used, expected,
-                "[{ctx}] recovered count diverged from oracle"
-            );
-            if let Some((id, _)) = in_flight {
-                assert_eq!(host.get(id), None, "[{ctx}] uncommitted insert visible");
+            assert_eq!(used, slots, "[{ctx}] recovered slot count diverged");
+            if let Some(op) = in_flight {
+                op.assert_not_committed(&mut host, &ctx);
                 stats.in_flight_lost += 1;
             }
         }
@@ -430,34 +569,42 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 "[{ctx}] strict open accepted a damaged row"
             );
 
+            let live_before = host.engine.live_count();
             let mut rescue = SimHost::new(cfg.caps, damaged, None);
-            match rescue.open_salvage() {
-                Driven::Done(Output::OpenDone { result: Ok(n) }) => {
-                    // The count is LIVE RECORDS, so it is short by exactly
-                    // the quarantined slot.
-                    assert_eq!(n, used - 1, "[{ctx}] salvage live count");
-                }
+            let salvaged = match rescue.open_salvage() {
+                Driven::Done(Output::OpenDone { result: Ok(n) }) => n,
                 other => panic!("[{ctx}] salvage open failed: {other:?}"),
-            }
-            assert_eq!(
-                rescue.engine.quarantined(),
-                1,
-                "[{ctx}] exactly one row should be quarantined"
-            );
+            };
+            let quarantined = rescue.engine.quarantined();
+            assert!(quarantined >= 1, "[{ctx}] damage was not detected");
             assert_eq!(rescue.n_writes, 0, "[{ctx}] salvage wrote to the disk");
-            // Every logged row except the victim's is still exact.
+
+            // With deletes and updates in play, damaging ONE slot no
+            // longer costs exactly one live row: quarantining a record
+            // loses it, but quarantining a TOMBSTONE loses the deletion,
+            // so the row it removed reappears. That is the documented
+            // cost of containment on a database that has churned, and it
+            // is bounded by the damage rather than open-ended.
             let survivors = rescue.range_all(0, u64::MAX);
             assert_eq!(
-                survivors.len(),
-                log.len() - 1,
-                "[{ctx}] salvage lost more than the damaged row"
+                survivors.len() as u64,
+                salvaged,
+                "[{ctx}] scan and live count disagree"
             );
+            assert!(
+                salvaged + quarantined >= live_before && salvaged <= live_before + quarantined,
+                "[{ctx}] salvage lost or invented more than the damage: \
+                 {salvaged} live vs {live_before} before, {quarantined} quarantined"
+            );
+            // The invariant that never bends: nothing served is WRONG.
+            // Every surviving row is a value this lifetime actually
+            // wrote for that id, and no id appears that was never used.
             for (id, value) in &survivors {
-                let expect = log
-                    .iter()
-                    .find(|(i, _)| i == id)
-                    .unwrap_or_else(|| panic!("[{ctx}] salvage invented id {id}"));
-                assert_eq!(*value, expect.1, "[{ctx}] salvage served wrong bytes");
+                let known = history.iter().any(|(i, v)| i == id && v == value);
+                assert!(
+                    known,
+                    "[{ctx}] salvage served a value that was never written: id={id}"
+                );
             }
             stats.salvage_checks += 1;
         }

@@ -1,0 +1,19 @@
+[package]
+name = "jobqueue"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A real consumer: dabqlite by path, and NOTHING else. No dabqlite-core,
+# no dabqlite-host, no third-party crates. If the sample needs something
+# the published API does not expose, it fails to build.
+[dependencies]
+dabqlite = { path = "../../crates/dabqlite" }
+
+[lib]
+name = "jobqueue"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jobqueue"
+path = "src/main.rs"

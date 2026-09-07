@@ -1,0 +1,17 @@
+[package]
+name = "kvstore"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A durable command-line key/value + session store built on dabqlite."
+
+[dependencies]
+dabqlite = { path = "../../crates/dabqlite" }
+
+[[bin]]
+name = "kv"
+path = "src/main.rs"
+
+[lib]
+name = "kvstore"
+path = "src/lib.rs"

@@ -194,6 +194,64 @@ FFI. The one `#![allow(unsafe_code)]` in the entire tree is the counting
 global allocator in `allocation.rs`: `GlobalAlloc` is an unsafe trait by
 language rule, and the impl delegates verbatim to `System`.
 
+## Writes: insert, update and delete are the same shape
+
+There is no second write path. An update appends a superseding row and a
+delete appends a tombstone; both then flip the superblock, exactly as an
+insert does. That is not a stylistic choice — it is why deletes and
+updates needed no new recovery machinery, and why the crash argument for
+them is the crash argument that was already proven:
+
+- the rows file stays **append-only**, so nothing ever overwrites the
+  only copy of a live record;
+- the file's order **is** the commit order, so replaying it replays
+  history: insert, delete, insert again reconstructs to the last one;
+- one appended slot plus one generation means a fault leaves the
+  operation entirely applied or entirely not, and the SLOT COUNT says
+  which.
+
+An update is deliberately not delete-then-insert. That would be two
+commits, and a crash between them would lose the row outright — the one
+outcome the contract does not permit.
+
+The indices are never mutated to remove anything. A one-bit-per-slot
+liveness map decides, in one place, whether the slot an index points at
+still holds a record; every read path asks it. So the append-only hash
+table, B+tree and trigram index are untouched by deletion, and the
+trigram's `row*14+k` bijection survives because tombstone slots are
+accounted for without being indexed.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Crash at **every boundary** of a delete × settle seeds | exhaustive | `delete.rs` | the row is entirely present or entirely gone; its value never changes under a half-applied delete; no neighbour moves; the database is writable afterwards |
+| Crash at **every boundary** of an update × settle seeds | exhaustive | `delete.rs` | the row is **never missing** — it holds either the old value or the new one, nothing else |
+| I/O failure at every boundary of a delete | exhaustive | `delete.rs` | clean fail-stop, then the restart resolves all-or-nothing |
+| insert → delete → insert of one id | targeted | `delete.rs` | replays to the LAST version; an ordered scan sees the reused id exactly once |
+| Deleting an absent row, or the same row twice | pinned | `delete.rs` | refused with **zero I/O**; a real delete costs exactly 5 I/Os, like an insert |
+| No read path returns a deleted row | oracle, after every deletion | `delete.rs` | get, range and find stop seeing it at the same instant |
+| Long interleaved insert/update/delete workload | seeded × restarts | `delete.rs` | matches a `BTreeMap` exactly, every round |
+| Delete at the capacity wall | targeted | `delete.rs` | refused (a tombstone needs a slot), naming the ceiling, nothing applied |
+| Deletes and updates under the **full fault schedule** | every cycle of every lifetime, floor-asserted | `lifetime.rs`, `vopr` | reconciled by the same all-or-nothing rule as inserts; oracle-exact after every recovery |
+
+### Dead weight, and the vacuum for it
+
+Every write appends, so deletes and updates leave dead slots: the retired
+record, plus the tombstone that retired it. `Engine::dead_slots()` (and
+`Db::stats()`) report it, and the vacuum is the rebuild that already
+existed — `dabqlite-inspect --repair-to` compacts the file to exactly the
+survivors, verified to shrink it and to carry no dead weight across.
+Because compaction IS repair-by-rebuild, it inherits all of repair's
+safety for free: the source is opened read-only and never written.
+
+Honesty note: on a database that has churned, containment gets one degree
+harder to state. Quarantining a damaged RECORD loses that row; quarantining
+a damaged TOMBSTONE loses a *deletion*, so the row it removed reappears.
+Salvage therefore bounds the damage rather than eliminating it — the soak
+asserts `live + quarantined >= before` and `live <= before + quarantined`,
+and asserts the invariant that never bends: every value served was one
+actually written for that id. A strict open still refuses the file
+outright, which is why it remains the default.
+
 ## Corruption containment: one bad row costs one row
 
 Detection was never the problem — every row carries a CRC-32 over its

@@ -58,6 +58,26 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     );
 }
 
+/// Deletes and updates must actually happen in the soak, or the
+/// "every feature in one pass" claim quietly stops covering them.
+#[test]
+fn every_lifetime_exercises_deletes_and_updates() {
+    let cfg = LifetimeConfig::default();
+    let (mut deletes, mut updates, mut commits) = (0u64, 0u64, 0u64);
+    for seed in 0..16u64 {
+        let stats = run_lifetime(seed, &cfg);
+        deletes += stats.deletes;
+        updates += stats.updates;
+        commits += stats.commits;
+    }
+    assert!(deletes > 20, "only {deletes} deletes across the sweep");
+    assert!(updates > 20, "only {updates} updates across the sweep");
+    assert!(
+        deletes + updates < commits,
+        "deletes and updates should be a minority of writes, not all of them"
+    );
+}
+
 /// Corruption containment is part of the surface too: every cycle damages
 /// a committed row on a COPY of the disk and proves salvage keeps the
 /// rest reachable. A floor keeps that from silently switching itself off.

@@ -1,0 +1,17 @@
+[package]
+name = "bookmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A browser-style bookmark/tag index built on dabqlite: in memory, persisted as one snapshot blob."
+
+[dependencies]
+dabqlite = { path = "../../crates/dabqlite" }
+
+[[bin]]
+name = "bookmarks"
+path = "src/main.rs"
+
+[lib]
+name = "bookmarks"
+path = "src/lib.rs"
