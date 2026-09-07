@@ -944,6 +944,57 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// "Is there a database here?" has an answer that does not create one.
+///
+/// `Db::open` creates, which is right for most callers and exactly wrong
+/// for the one who needs to tell "no database at this path" from "a
+/// database with nothing in it". A key/value store hardcoded the
+/// superblock's filename to answer it — a sample reaching for a private
+/// detail is the API saying it is missing something.
+#[cfg(unix)]
+#[test]
+fn a_directory_can_be_asked_whether_it_holds_a_database() {
+    let dir = scratch("exists");
+    assert!(
+        !Db::exists(&dir),
+        "a path that does not exist holds nothing"
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(!Db::exists(&dir), "an empty directory holds nothing");
+    std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+    assert!(!Db::exists(&dir), "someone else's files hold nothing");
+
+    {
+        let mut db = Db::open(&dir).expect("create");
+        assert!(Db::exists(&dir), "and now there is one");
+        db.insert(1, Value::from_text("x").unwrap()).unwrap();
+        // Asking takes no lock, so it is safe while a writer holds it.
+        assert!(Db::exists(&dir));
+    }
+    assert!(Db::exists(&dir), "still there once the writer is gone");
+
+    // A file that is not one of ours is not one of ours.
+    let other = scratch("exists-foreign");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("superblock.dabq"), vec![0xAB; 256]).unwrap();
+    assert!(!Db::exists(&other));
+
+    // The capacity a snapshot was built for is readable without
+    // allocating that much arena to find out.
+    let mut db = Db::open(&dir).expect("open");
+    let snapshot = db.snapshot().expect("snapshot");
+    assert_eq!(snapshot.capacity(), Some(db.stats().capacity));
+    assert_eq!(
+        Snapshot::from_bytes(&snapshot.to_bytes())
+            .unwrap()
+            .capacity(),
+        Some(db.stats().capacity)
+    );
+    drop(db);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&other).ok();
+}
+
 /// Compare-and-set: the read inside the commit.
 ///
 /// Every read-then-write a sample application wrote — "take the job at

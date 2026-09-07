@@ -26,7 +26,8 @@
 
 use dabqlite_core::layout::{encode_row, RowKind};
 use dabqlite_core::{
-    Capacities, DbError, FileId, Input, Output, MAX_COMMIT_ROWS, MAX_VALUE_LEN, ROW_SIZE, VALUE_LEN,
+    BatchOp, Capacities, DbError, FileId, Input, Output, MAX_COMMIT_ROWS, MAX_VALUE_LEN, ROW_SIZE,
+    VALUE_LEN,
 };
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{Driven, SimDisk, SimHost};
@@ -482,6 +483,72 @@ fn substring_search_crosses_slot_seams_and_stays_exact() {
     let disk = std::mem::take(&mut host.disk);
     let (mut host, _) = open(disk);
     assert_eq!(find_ids(&mut host, b"needle"), vec![1, 3]);
+}
+
+/// Reading a value is LINEAR in its length, not quadratic.
+///
+/// A value is read one slot at a time, and every window has to carry the
+/// whole value's length — so measuring the run once per WINDOW meant a
+/// k-slot read walked the run k times and decoded k²/2 rows. A key/value
+/// store measured the consequence: 0.5 us for a 16-byte value against
+/// 720 us for 2 KiB, a 1,400x jump for 128x the bytes, with the cost per
+/// slot itself growing linearly.
+///
+/// Counting run measurements is the honest way to test it: it is the work
+/// that was being repeated, and it does not depend on how fast this
+/// machine happens to be.
+#[test]
+fn reading_a_value_measures_its_run_once_not_once_per_slot() {
+    let caps = Capacities { rows: 1024 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+
+    // Values from one slot to the longest the format allows.
+    let sizes = [
+        1usize,
+        VALUE_LEN,
+        4 * VALUE_LEN,
+        64 * VALUE_LEN,
+        MAX_VALUE_LEN,
+    ];
+    for (i, &len) in sizes.iter().enumerate() {
+        let value: Vec<u8> = (0..len).map(|k| (k as u8).wrapping_mul(31)).collect();
+        assert!(matches!(
+            host.batch(&[BatchOp::Insert {
+                id: i as u64,
+                value: &value
+            }]),
+            Driven::Done(Output::BatchDone { result: Ok(()), .. })
+        ));
+
+        let before = host.engine.extent_walks();
+        let got = host.get_bytes(i as u64).expect("readable");
+        let walks = host.engine.extent_walks() - before;
+        assert_eq!(got, value, "len={len}");
+        assert!(
+            walks <= 1,
+            "reading a {len}-byte value measured its run {walks} times; it \
+             should be measured once however many slots it spans"
+        );
+    }
+
+    // The property that was actually broken: cost per SLOT must not grow
+    // with the number of slots.
+    let short = {
+        let before = host.engine.extent_walks();
+        host.get_bytes(1).unwrap();
+        host.engine.extent_walks() - before
+    };
+    let longest = {
+        let before = host.engine.extent_walks();
+        host.get_bytes(4).unwrap();
+        host.engine.extent_walks() - before
+    };
+    assert_eq!(
+        short, longest,
+        "a 128-slot value must cost the same number of run measurements as \
+         a one-slot one"
+    );
 }
 
 /// Every match, in ascending id order. Pages arrive newest-first.

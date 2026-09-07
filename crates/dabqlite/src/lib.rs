@@ -99,6 +99,13 @@ fn recorded_capacity(superblock: &[u8]) -> Option<u64> {
 /// Capacity is declared at open and the arena is allocated once, so this
 /// is a memory decision as much as a size one: 64 Ki rows is about 2 MiB
 /// of row arena. Use [`Db::open_with`] or [`Db::in_memory_with`] to pick.
+///
+/// It is a LATENCY decision too, and that is easier to miss. The arena
+/// and the indices are allocated and zeroed at every open, so the cost is
+/// paid per open rather than once per database: a command-line tool that
+/// reopens for each command and declares sixteen million rows waits over
+/// a second before it reads anything. Declare what the data needs, and
+/// reopen larger when [`Error::Full`] says to rather than up front.
 pub const DEFAULT_ROWS: u64 = 65_536;
 
 /// A stored value: any byte string up to [`MAX_VALUE_LEN`].
@@ -400,8 +407,17 @@ pub enum Error {
     /// itself — or shorten the values.
     BatchTooLong { rows: usize, max: usize },
     /// A [`Db::batch`] was refused, and nothing in it was applied. `at` is
-    /// the index of the operation that stopped it and `cause` is the error
-    /// that operation would have returned on its own.
+    /// the index of the operation the batch stopped AT, and `cause` is
+    /// why.
+    ///
+    /// "Stopped at", not "was wrong": most causes are about that one
+    /// operation — a duplicate id, a missing row, a failed [`Op::Expect`]
+    /// — but [`Error::BatchTooLong`] and [`Error::Full`] are about the
+    /// commit as a whole running out of room at that point, and the
+    /// operation named may be perfectly legal on its own. Two
+    /// maximum-length values are each a valid write and together are one
+    /// commit too many; the batch stops at the second, and the second is
+    /// not at fault.
     ///
     /// The batch is validated in full before any byte is written, so this
     /// is never a partial write to clean up — the database is exactly as
@@ -600,6 +616,17 @@ impl Snapshot {
         out
     }
 
+    /// The row capacity this database was created with, as recorded in
+    /// its own superblock — the number [`Db::load`] will use. `None` when
+    /// the bytes carry no readable superblock.
+    ///
+    /// Worth having separately from loading: sizing a rebuild, or telling
+    /// an operator how much room a blob was built for, should not require
+    /// allocating that much arena first.
+    pub fn capacity(&self) -> Option<u64> {
+        recorded_capacity(&self.superblock)
+    }
+
     /// Parse a blob from [`Snapshot::to_bytes`]. Refuses anything it does
     /// not recognise rather than guessing at a layout.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
@@ -781,6 +808,39 @@ impl Db<MemoryStorage> {
 
 #[cfg(unix)]
 impl Db<PosixStorage> {
+    /// Does this directory already hold a database?
+    ///
+    /// [`Db::open`] CREATES, which is what most callers want and exactly
+    /// wrong for the ones who need to tell "no database here" from "a
+    /// database with nothing in it" — a command-line tool asked to read a
+    /// path that does not exist should say so, not quietly make one. A
+    /// key/value store hardcoded the superblock's filename to answer this
+    /// question, which is the kind of thing a sample doing it means the
+    /// API should.
+    ///
+    /// Answers from the file's presence and its magic, taking no lock and
+    /// reading no rows, so it is safe to ask about a database another
+    /// process is writing. `false` for a directory that does not exist, a
+    /// directory with no superblock, and a superblock that is not one of
+    /// ours; `true` says the bytes are a dabqlite superblock, not that
+    /// they are undamaged — [`Db::open`] is what decides that.
+    pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
+        use dabqlite_core::layout::{decode_sb_any, SB_COPIES, SB_COPY_SIZE};
+        let sb = path.as_ref().join(dabqlite_host::SUPERBLOCK_FILE);
+        let Ok(bytes) = std::fs::read(sb) else {
+            return false;
+        };
+        // `decode_sb_any`, so a LEGACY database counts: it is a database,
+        // and the answer to "is there one here" must not depend on
+        // whether it has been migrated yet.
+        (0..SB_COPIES).any(|slot| {
+            let at = slot * SB_COPY_SIZE;
+            bytes
+                .get(at..at + SB_COPY_SIZE)
+                .is_some_and(|c| decode_sb_any(c).is_ok())
+        })
+    }
+
     /// Open (or create) a database in a directory, with real files and
     /// real fsyncs. Takes the single-writer lock for as long as it lives.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {

@@ -833,6 +833,20 @@ pub struct Engine {
     /// directly rather than by wall clock, and this is the work that
     /// would grow if a page ever went back to re-walking the chain.
     find_verifications: core::cell::Cell<u64>,
+    /// The last value run `value_extent` measured: `(head_row, rows,
+    /// total)`, with `u64::MAX` for "nothing yet".
+    ///
+    /// Reading a value is one input per slot and every one of them needs
+    /// the whole value's length, so measuring the run once per read
+    /// instead of once per slot is the difference between linear and
+    /// quadratic. Correct without invalidation because a run is
+    /// immutable: rows are appended and never rewritten.
+    extent_memo: core::cell::Cell<(u64, u64, u32)>,
+    /// Runs measured the long way since this engine opened. Diagnostic,
+    /// and exposed for the same reason `find_verifications` is: "reading
+    /// a value is linear in its length" is a property worth testing
+    /// directly rather than by wall clock.
+    extent_walks: core::cell::Cell<u64>,
     /// Head rows whose value spans more than one slot. Zero is the fast
     /// path for reads: a value occupies exactly one row, so nothing has
     /// to be looked ahead for (`value_extent`). Search does not depend on
@@ -978,6 +992,8 @@ impl Engine {
             dead_chunks: 0,
             long_values: 0,
             find_verifications: core::cell::Cell::new(0),
+            extent_memo: core::cell::Cell::new((u64::MAX, 0, 0)),
+            extent_walks: core::cell::Cell::new(0),
             salvage: false,
             quarantined: 0,
             arena,
@@ -1045,6 +1061,13 @@ impl Engine {
     /// Rows verified by substring search since open. See the field.
     pub fn find_verifications(&self) -> u64 {
         self.find_verifications.get()
+    }
+
+    /// Value runs measured the long way since this engine opened — the
+    /// work `value_extent` does when its memo misses. Reading a k-slot
+    /// value should cost ONE of these, not k.
+    pub fn extent_walks(&self) -> u64 {
+        self.extent_walks.get()
     }
 
     /// The readable values, ascending by row. The basis of a rebuild:
@@ -3036,6 +3059,35 @@ impl Engine {
         if self.long_values == 0 {
             return (1, head.len as u32);
         }
+        // Second fast path: the run just asked about. Reading a value is
+        // one `GetFrom` per slot and every one of them needs the value's
+        // total length, so without this a k-slot read walked the run k
+        // times — quadratic in the length of the value, which a key/value
+        // store measured at 720 us for 2 KiB against 0.5 us for 16 bytes.
+        // The memo is always right because a run is immutable: rows are
+        // appended and never rewritten, so the value at a given head row
+        // has the same extent for as long as this engine lives.
+        let (memo_row, rows, total) = self.extent_memo.get();
+        if memo_row == head_row {
+            debug_assert_eq!(
+                (rows, total),
+                self.walk_extent(head_row, &head),
+                "the extent memo disagrees with the arena"
+            );
+            return (rows, total);
+        }
+        // Counted here rather than in the walk itself: the debug
+        // assertion above walks too, and a counter a debug build moves is
+        // a counter no test can trust.
+        self.extent_walks.set(self.extent_walks.get() + 1);
+        let extent = self.walk_extent(head_row, &head);
+        self.extent_memo.set((head_row, extent.0, extent.1));
+        extent
+    }
+
+    /// Walk a value's run from its head, adding up its slots. The
+    /// uncached half of `value_extent`.
+    fn walk_extent(&self, head_row: u64, head: &RowSlot) -> (u64, u32) {
         let mut rows = 1u64;
         let mut total = head.len as u32;
         let mut r = head_row + 1;
