@@ -898,6 +898,38 @@ impl Db<PosixStorage> {
     /// capacity is genuinely full of live rows needs a larger capacity,
     /// not a rebuild, and says so.
     pub fn compact(&mut self) -> Result<(), Error> {
+        self.rebuild_with(|rows| rows)
+    }
+
+    /// Rebuild the database THROUGH a transform, without ever letting go
+    /// of the single-writer lock.
+    ///
+    /// [`Db::compact`] keeps every id where it is, which is right for
+    /// reclaiming dead slots and wrong for anything whose ids are a
+    /// PLACEMENT. A store that hashes string keys onto ids and probes
+    /// past collisions has to re-place its rows when it rebuilds —
+    /// dropping a tombstone re-homes every key that probed past it — and
+    /// the only way to write a rebuilt database back used to be
+    /// [`Db::restore`], which refuses to run while a writer holds the
+    /// directory. So the application had to drop the lock, rebuild, and
+    /// swap; anything committed in that window was durable and then
+    /// thrown away, with no error and no evidence.
+    ///
+    /// This closes that window. The transform sees every live row, and
+    /// what it returns becomes the database. The lock is held throughout:
+    /// the handle detaches only for the rename, and nothing between the
+    /// read and the reopen can yield to a caller, so there is no interval
+    /// for a write to be lost in.
+    ///
+    /// The rows it returns must have unique ids and must fit the
+    /// capacity. If they do not, the staging build fails and the call
+    /// returns the error with the database untouched — the swap has not
+    /// happened yet.
+    #[cfg(unix)]
+    pub fn rebuild_with<F>(&mut self, transform: F) -> Result<(), Error>
+    where
+        F: FnOnce(Vec<Row>) -> Vec<Row>,
+    {
         let (path, rows) = self.origin.clone().ok_or_else(|| Error::Io {
             kind: std::io::ErrorKind::Unsupported,
             detail: "this database was not opened from a path".into(),
@@ -905,7 +937,7 @@ impl Db<PosixStorage> {
         let staging = sibling(&path, COMPACT_STAGING);
         let retired = sibling(&path, COMPACT_RETIRED);
 
-        let live = self.all()?;
+        let live = transform(self.all()?);
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_dir_all(&retired);
         {
@@ -1549,7 +1581,17 @@ impl<S: Storage> Db<S> {
     /// Copy every readable row into a fresh in-memory database — the
     /// compaction path, and the way to get data out of a degraded one.
     pub fn compact_to_memory(&mut self) -> Result<Db<MemoryStorage>, Error> {
-        let rows = self.all()?;
+        self.rebuild_to_memory_with(|rows| rows)
+    }
+
+    /// [`Db::compact_to_memory`] through a transform — the backend-free
+    /// half of [`Db::rebuild_with`], and the only form available to a
+    /// database that has no directory to swap.
+    pub fn rebuild_to_memory_with<F>(&mut self, transform: F) -> Result<Db<MemoryStorage>, Error>
+    where
+        F: FnOnce(Vec<Row>) -> Vec<Row>,
+    {
+        let rows = transform(self.all()?);
         let mut out = Db::in_memory_with(self.stats().capacity)?;
         out.refill(rows)?;
         Ok(out)

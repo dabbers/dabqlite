@@ -194,6 +194,11 @@ dabqlite-inspect <dir> --repair-to <newdir> # rebuild clean from what verifies
 dabqlite-inspect <dir> --gc                 # reclaim a migration's dead file
 ```
 
+`Db::compact` reclaims dead slots in place; `Db::rebuild_with` does the
+same THROUGH a transform, for a store whose ids are a placement and have
+to move when it rebuilds. Both hold the single-writer lock throughout, so
+there is no window for an acknowledged write to be lost in.
+
 Programmatically, `Db::salvage` opens a damaged directory and
 `Db::load_salvaged` a damaged snapshot — the browser case, where the
 database is bytes in IndexedDB and there is no directory to point at.

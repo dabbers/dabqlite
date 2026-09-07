@@ -944,6 +944,107 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Rebuilding can MOVE rows, without ever letting go of the writer lock.
+///
+/// `compact` keeps every id where it is, which is right for reclaiming
+/// dead slots and wrong for anything whose ids are a placement. A store
+/// that hashes keys onto ids and probes past collisions must re-place its
+/// rows when it rebuilds, and the only way to write a rebuilt database
+/// back was `Db::restore` — which refuses while a writer holds the
+/// directory. So the application dropped the lock, rebuilt, and swapped,
+/// and anything committed in that window was acknowledged, fsynced, and
+/// then silently discarded.
+#[cfg(unix)]
+#[test]
+fn a_rebuild_can_re_place_rows_and_never_drops_the_lock() {
+    let dir = scratch("rebuild-with");
+    let mut db = Db::open_with(&dir, 256).expect("open");
+    for i in 0..10u64 {
+        db.insert(i, Value::from_text(&format!("row {i}")).unwrap())
+            .unwrap();
+    }
+    // Churn, so there is dead weight for the rebuild to reclaim as well.
+    for i in 0..5u64 {
+        db.put(i, Value::from_text(&format!("edited {i}")).unwrap())
+            .unwrap();
+    }
+    let before: Vec<Value> = db.all().unwrap().into_iter().map(|(_, v)| v).collect();
+    assert!(db.stats().dead > 0);
+
+    // Re-place every row, in one call. A hash store would recompute
+    // placements here; renumbering is the same operation with a simpler
+    // rule.
+    db.rebuild_with(|rows| {
+        rows.into_iter()
+            .map(|(id, value)| (id * 2 + 1000, value))
+            .collect()
+    })
+    .expect("rebuild");
+
+    let after = db.all().unwrap();
+    assert_eq!(after.len(), 10);
+    assert_eq!(
+        after.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        (0..10u64).map(|i| i * 2 + 1000).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        before,
+        "the values are the same rows in new places"
+    );
+    assert_eq!(db.stats().dead, 0, "and the dead weight went with it");
+
+    // The handle is still the writer, and the database is still usable.
+    db.insert(7, Value::from_text("after").unwrap()).unwrap();
+    assert_eq!(db.len(), 11);
+
+    // Reopening finds exactly that, so the swap really happened.
+    drop(db);
+    let reopened = Db::open_with(&dir, 256).expect("reopen");
+    assert_eq!(reopened.len(), 11);
+    assert_eq!(reopened.get(1000).unwrap().unwrap().text(), "edited 0");
+    drop(reopened);
+
+    // A transform that returns an impossible set fails BEFORE the swap,
+    // leaving the database exactly as it was.
+    let mut db = Db::open_with(&dir, 256).expect("open");
+    let intact = db.all().unwrap();
+    let e = db
+        .rebuild_with(|rows| rows.into_iter().map(|(_, v)| (42, v)).collect())
+        .expect_err("every row on one id is not a database");
+    match &e {
+        Error::BatchRejected { at: 1, cause } => {
+            assert!(
+                matches!(**cause, Error::AlreadyExists { id: 42 }),
+                "{cause:?}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(db.all().unwrap(), intact);
+    assert_eq!(db.len(), 11);
+
+    // The in-memory form does the same for a database with no directory.
+    let mut mem = Db::in_memory_with(64).expect("open");
+    mem.insert(1, Value::from_text("a").unwrap()).unwrap();
+    mem.insert(2, Value::from_text("b").unwrap()).unwrap();
+    let moved = mem
+        .rebuild_to_memory_with(|rows| rows.into_iter().map(|(id, v)| (id + 100, v)).collect())
+        .expect("rebuild");
+    assert_eq!(
+        moved
+            .all()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![101, 102]
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// "Is there a database here?" has an answer that does not create one.
 ///
 /// `Db::open` creates, which is right for most callers and exactly wrong
