@@ -65,11 +65,11 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
     let mut padded = [0u8; VALUE_LEN];
     padded[..5].copy_from_slice(b"hello");
     assert_eq!(
-        find_records(b"hello", Some(4)),
+        find_records(b"hello", Some(dabqlite_core::FindCursor::below(4))),
         Input::Find {
             needle: padded,
             needle_len: 5,
-            after: Some(4),
+            after: Some(dabqlite_core::FindCursor::below(4)),
         }
     );
     assert_eq!(

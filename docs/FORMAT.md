@@ -49,12 +49,21 @@ all three impossible to miss.
 
 | offset | size | field | encoding |
 |---|---|---|---|
-| 0 | 8 | magic | `"DABQSB01"` |
+| 0 | 8 | magic | `"DABQSB02"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
 | 24 | 8 | schema_hash | u64 LE (`0x84EE7F59F027FA5F` for this schema) |
-| 32 | 4 | crc32 | IEEE, over bytes 0..32 |
-| 36 | 28 | padding | must be zero (validated) |
+| 32 | 8 | capacity | u64 LE, the row capacity this database was created with |
+| 40 | 4 | crc32 | IEEE, over bytes 0..40 |
+| 44 | 20 | padding | must be zero (validated) |
+
+The capacity is recorded so that reopening a database does not have to
+be told how big it was declared — a capacity is a property of the
+database, not of the caller. The previous layout (`"DABQSB01"`, CRC at
+32, no capacity) is still DECODED, and only for the migration path: a
+legacy database's superblock is what names its legacy schema, so a
+binary that could not read it could not offer to migrate anything. It
+is never written.
 
 Generation `g` is written to both slots of pair `g % 2` (slots 0,1 or
 2,3): a commit never touches the previous generation's pair, and every

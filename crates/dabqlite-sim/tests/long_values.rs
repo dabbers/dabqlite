@@ -484,6 +484,7 @@ fn substring_search_crosses_slot_seams_and_stays_exact() {
     assert_eq!(find_ids(&mut host, b"needle"), vec![1, 3]);
 }
 
+/// Every match, in ascending id order. Pages arrive newest-first.
 fn find_ids(host: &mut SimHost, needle: &[u8]) -> Vec<u64> {
     let mut padded = [0u8; VALUE_LEN];
     padded[..needle.len()].copy_from_slice(needle);
@@ -501,7 +502,10 @@ fn find_ids(host: &mut SimHost, needle: &[u8]) -> Vec<u64> {
         out.extend(page.items[..page.count as usize].iter().map(|r| r.id));
         match page.next {
             Some(n) => after = Some(n),
-            None => return out,
+            None => {
+                out.reverse();
+                return out;
+            }
         }
     }
 }
@@ -589,9 +593,9 @@ fn a_batch_of_long_values_is_bounded_by_the_commit_not_the_op_count() {
             );
             assert_eq!(
                 reject.error,
-                DbError::Full {
-                    entity: "batch rows",
-                    capacity: MAX_COMMIT_ROWS as u64
+                DbError::BatchTooLong {
+                    rows: MAX_COMMIT_ROWS as u64 * 2,
+                    max: MAX_COMMIT_ROWS as u64
                 }
             );
         }

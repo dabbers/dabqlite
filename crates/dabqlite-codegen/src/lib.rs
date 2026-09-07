@@ -666,14 +666,23 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
     w(String::new());
     w("| offset | size | field | encoding |".into());
     w("|---|---|---|---|".into());
-    w("| 0 | 8 | magic | `\"DABQSB01\"` |".into());
+    w("| 0 | 8 | magic | `\"DABQSB02\"` |".into());
     w("| 8 | 8 | generation | u64 LE, monotonic; the atomicity point |".into());
     w("| 16 | 8 | row_count | u64 LE, authoritative committed rows |".into());
     w(format!(
         "| 24 | 8 | schema_hash | u64 LE (`0x{hash:016X}` for this schema) |"
     ));
-    w("| 32 | 4 | crc32 | IEEE, over bytes 0..32 |".into());
-    w("| 36 | 28 | padding | must be zero (validated) |".into());
+    w("| 32 | 8 | capacity | u64 LE, the row capacity this database was created with |".into());
+    w("| 40 | 4 | crc32 | IEEE, over bytes 0..40 |".into());
+    w("| 44 | 20 | padding | must be zero (validated) |".into());
+    w(String::new());
+    w("The capacity is recorded so that reopening a database does not have to".into());
+    w("be told how big it was declared — a capacity is a property of the".into());
+    w("database, not of the caller. The previous layout (`\"DABQSB01\"`, CRC at".into());
+    w("32, no capacity) is still DECODED, and only for the migration path: a".into());
+    w("legacy database's superblock is what names its legacy schema, so a".into());
+    w("binary that could not read it could not offer to migrate anything. It".into());
+    w("is never written.".into());
     w(String::new());
     w("Generation `g` is written to both slots of pair `g % 2` (slots 0,1 or".into());
     w("2,3): a commit never touches the previous generation's pair, and every".into());
@@ -1384,7 +1393,7 @@ pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) 
                      /// (trigram-accelerated, verification-exact). Answered by `FindDone`\n\
                      /// with one bounded page in insertion order; continue with\n\
                      /// `after = page.next`. Panics if the needle exceeds the value width.\n\
-                     pub fn {}(needle: &[u8], after: Option<u64>) -> crate::engine::Input<'static> {{\n\
+                     pub fn {}(needle: &[u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'static> {{\n\
                      \x20   assert!(needle.len() <= {width}, \"needle exceeds the value width\");\n\
                      \x20   let mut padded = [0u8; {width}];\n\
                      \x20   padded[..needle.len()].copy_from_slice(needle);\n\

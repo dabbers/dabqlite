@@ -91,3 +91,4 @@ pub use engine::{
 pub use layout::{
     MAX_COMMIT_ROWS, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
+pub use trigram::FindCursor;

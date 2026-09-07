@@ -51,13 +51,16 @@
 //!
 //! ```text
 //! offset  size  field
-//!      0     8  magic       "DABQSB01"
+//!      0     8  magic       "DABQSB02"
 //!      8     8  generation  (u64 LE, monotonic; the atomicity point)
 //!     16     8  row_count   (u64 LE, authoritative committed row count)
 //!     24     8  schema_hash (u64 LE; an old binary opening a new file fails
 //!                            at startup instead of misreading offsets, §4.8)
-//!     32     4  crc32       (over bytes 0..32)
-//!     36    28  padding     (zero)
+//!     32     8  capacity    (u64 LE, the row capacity this database was
+//!                            created with, so reopening it does not have to
+//!                            be told again)
+//!     40     4  crc32       (over bytes 0..40)
+//!     44    20  padding     (zero)
 //! ```
 
 use crate::crc32::crc32;
@@ -183,7 +186,36 @@ pub const SB_COPIES: usize = 4;
 pub const SB_ZONE_SIZE: usize = SB_COPY_SIZE * SB_COPIES;
 
 /// Magic bytes identifying a superblock copy.
-pub const SB_MAGIC: [u8; 8] = *b"DABQSB01";
+pub const SB_MAGIC: [u8; 8] = *b"DABQSB02";
+/// The previous superblock layout's magic: same fields, but no recorded
+/// capacity, so its CRC sat at offset 32 and covered only bytes 0..32.
+///
+/// Still decoded, and only for the migration path: a legacy database's
+/// superblock is the thing that names its legacy schema, so a binary that
+/// could not read it could not offer to migrate anything. It is never
+/// written, and a v1 copy reports a capacity of 0 — "not recorded" — which
+/// callers must not mistake for "capacity zero".
+pub const SB_MAGIC_V1: [u8; 8] = *b"DABQSB01";
+
+/// Decode the pre-capacity superblock layout. See [`SB_MAGIC_V1`].
+fn decode_sb_v1(bytes: &[u8]) -> Result<(SbCopy, u64), SbDecodeError> {
+    let stored = u32::from_le_bytes(bytes[32..36].try_into().expect("fixed slice"));
+    if crc32(&bytes[0..32]) != stored {
+        return Err(SbDecodeError::Invalid);
+    }
+    if bytes[36..SB_COPY_SIZE] != [0u8; SB_COPY_SIZE - 36] {
+        return Err(SbDecodeError::Invalid);
+    }
+    let file_schema = u64::from_le_bytes(bytes[24..32].try_into().expect("fixed slice"));
+    Ok((
+        SbCopy {
+            generation: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
+            row_count: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
+            capacity: 0,
+        },
+        file_schema,
+    ))
+}
 
 /// Hash of the compiled schema, derived by `dabqlite-codegen` from
 /// `schema/records.sql` (FNV-1a 64 over the canonical schema rendering).
@@ -339,6 +371,12 @@ pub mod reference {
 pub struct SbCopy {
     pub generation: u64,
     pub row_count: u64,
+    /// The row capacity this database was opened with. Stored so that
+    /// reopening it does not have to be told again — a capacity is a
+    /// property of the database, not of the caller, and every application
+    /// built against this store before it was recorded ended up keeping a
+    /// sidecar file to remember it.
+    pub capacity: u64,
 }
 
 /// Why a superblock copy was rejected.
@@ -353,20 +391,21 @@ pub enum SbDecodeError {
 }
 
 /// Encode a superblock copy into a 64-byte slot.
-pub fn encode_sb(generation: u64, row_count: u64, out: &mut [u8; SB_COPY_SIZE]) {
+pub fn encode_sb(generation: u64, row_count: u64, capacity: u64, out: &mut [u8; SB_COPY_SIZE]) {
     // Negative-space assertion: generation 0 is reserved as "never written".
     debug_assert!(generation > 0, "superblock generation must be positive");
     out[0..8].copy_from_slice(&SB_MAGIC);
     out[8..16].copy_from_slice(&generation.to_le_bytes());
     out[16..24].copy_from_slice(&row_count.to_le_bytes());
     out[24..32].copy_from_slice(&SCHEMA_HASH.to_le_bytes());
-    let crc = crc32(&out[0..32]);
-    out[32..36].copy_from_slice(&crc.to_le_bytes());
-    out[36..].fill(0);
+    out[32..40].copy_from_slice(&capacity.to_le_bytes());
+    let crc = crc32(&out[0..40]);
+    out[40..44].copy_from_slice(&crc.to_le_bytes());
+    out[44..].fill(0);
     // Pair assertion: encode/decode roundtrip.
     debug_assert!(matches!(
         decode_sb(out),
-        Ok(c) if c.generation == generation && c.row_count == row_count
+        Ok(c) if c.generation == generation && c.row_count == row_count && c.capacity == capacity
     ));
 }
 
@@ -380,16 +419,19 @@ pub fn decode_sb_any(bytes: &[u8]) -> Result<(SbCopy, u64), SbDecodeError> {
     if bytes.len() < SB_COPY_SIZE {
         return Err(SbDecodeError::Invalid);
     }
+    if bytes[0..8] == SB_MAGIC_V1 {
+        return decode_sb_v1(bytes);
+    }
     if bytes[0..8] != SB_MAGIC {
         return Err(SbDecodeError::Invalid);
     }
-    let stored = u32::from_le_bytes(bytes[32..36].try_into().expect("fixed slice"));
-    if crc32(&bytes[0..32]) != stored {
+    let stored = u32::from_le_bytes(bytes[40..44].try_into().expect("fixed slice"));
+    if crc32(&bytes[0..40]) != stored {
         return Err(SbDecodeError::Invalid);
     }
     // Padding validated for full-slot coverage: no byte of a superblock
     // copy is exempt from corruption detection.
-    if bytes[36..SB_COPY_SIZE] != [0u8; SB_COPY_SIZE - 36] {
+    if bytes[44..SB_COPY_SIZE] != [0u8; SB_COPY_SIZE - 44] {
         return Err(SbDecodeError::Invalid);
     }
     let file_schema = u64::from_le_bytes(bytes[24..32].try_into().expect("fixed slice"));
@@ -397,6 +439,7 @@ pub fn decode_sb_any(bytes: &[u8]) -> Result<(SbCopy, u64), SbDecodeError> {
         SbCopy {
             generation: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
             row_count: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
+            capacity: u64::from_le_bytes(bytes[32..40].try_into().expect("fixed slice")),
         },
         file_schema,
     ))
@@ -501,7 +544,7 @@ mod tests {
         assert_eq!(reference::decode_row(&long_row), Some(want));
 
         let mut sb = [0u8; SB_COPY_SIZE];
-        encode_sb(7, 123, &mut sb);
+        encode_sb(7, 123, 4096, &mut sb);
         let mut long_sb = [0u8; SB_COPY_SIZE + 1];
         long_sb[..SB_COPY_SIZE].copy_from_slice(&sb);
         assert_eq!(
@@ -512,7 +555,8 @@ mod tests {
             decode_sb(&long_sb),
             Ok(SbCopy {
                 generation: 7,
-                row_count: 123
+                row_count: 123,
+                capacity: 4096
             })
         );
     }
@@ -574,7 +618,7 @@ mod tests {
             }
         }
         let mut sb = [0u8; SB_COPY_SIZE];
-        encode_sb(7, 123, &mut sb);
+        encode_sb(7, 123, 4096, &mut sb);
         for byte in 0..SB_COPY_SIZE {
             for bit in 0..8 {
                 let mut damaged = sb;
@@ -590,12 +634,13 @@ mod tests {
     #[test]
     fn sb_roundtrip() {
         let mut slot = [0u8; SB_COPY_SIZE];
-        encode_sb(7, 123, &mut slot);
+        encode_sb(7, 123, 4096, &mut slot);
         assert_eq!(
             decode_sb(&slot),
             Ok(SbCopy {
                 generation: 7,
-                row_count: 123
+                row_count: 123,
+                capacity: 4096
             })
         );
     }
@@ -603,7 +648,7 @@ mod tests {
     #[test]
     fn sb_rejects_torn_write() {
         let mut slot = [0u8; SB_COPY_SIZE];
-        encode_sb(7, 123, &mut slot);
+        encode_sb(7, 123, 4096, &mut slot);
         // A torn write: only the first 20 bytes reached disk.
         let mut torn = [0u8; SB_COPY_SIZE];
         torn[..20].copy_from_slice(&slot[..20]);
@@ -613,12 +658,12 @@ mod tests {
     #[test]
     fn sb_rejects_schema_mismatch() {
         let mut slot = [0u8; SB_COPY_SIZE];
-        encode_sb(7, 123, &mut slot);
+        encode_sb(7, 123, 4096, &mut slot);
         // Rewrite the schema hash and fix up the checksum: structurally
         // valid, wrong schema.
         slot[24..32].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
-        let crc = crc32(&slot[0..32]);
-        slot[32..36].copy_from_slice(&crc.to_le_bytes());
+        let crc = crc32(&slot[0..40]);
+        slot[40..44].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             decode_sb(&slot),
             Err(SbDecodeError::SchemaMismatch {

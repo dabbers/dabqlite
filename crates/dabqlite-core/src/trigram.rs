@@ -51,6 +51,27 @@ use crate::layout::VALUE_LEN;
 pub const TRIGRAMS_PER_ROW: usize = VALUE_LEN;
 
 const NIL: u32 = u32::MAX;
+
+/// Where a paged substring search left off.
+///
+/// Opaque to callers: `row` is the last row returned and `slot` the chain
+/// position it came from. Carrying the chain position is what makes
+/// paging linear rather than quadratic; carrying the row as well means a
+/// cursor stays usable when the search switches between the chain and the
+/// scan path between pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindCursor {
+    pub row: u64,
+    slot: u32,
+}
+
+impl FindCursor {
+    /// A cursor that resumes strictly below `row`, with no chain position.
+    /// Used when a caller reconstructs one from a row alone.
+    pub fn below(row: u64) -> Self {
+        FindCursor { row, slot: NIL }
+    }
+}
 /// Table entry sentinel: no trigram ever hashes to this packed form
 /// because trigrams are 24-bit and the tag bit marks occupancy.
 const EMPTY: u64 = 0;
@@ -265,83 +286,125 @@ impl TrigramIndex {
         self.assert_invariants();
     }
 
-    /// The `page` smallest matching rows strictly above `cursor`, in
-    /// ascending row order, plus the count of matches found for the
-    /// page (callers detect "more" by requesting again from the last
-    /// row returned). `matches(row)` is the caller's verifier — the
-    /// index never trusts itself.
+    /// One bounded page of matching rows, NEWEST FIRST, resuming exactly
+    /// where the previous page stopped.
     ///
-    /// Exactness argument: for needles >= 3 bytes, any row containing
-    /// the needle contains its first trigram, so walking that one chain
-    /// visits a superset of the answer; verification removes the rest.
-    /// For shorter needles there is no trigram to look up: scan all
+    /// `matches(row)` is the caller's verifier — the index never trusts
+    /// itself.
+    ///
+    /// ## Why newest-first, and why the cursor is not just a row number
+    ///
+    /// Postings are prepended, so a trigram's chain visits rows in
+    /// strictly descending order. Emitting pages in that order lets a
+    /// continuation resume at a chain POSITION, which makes paging cost
+    /// `O(page)` per page and `O(matches)` overall.
+    ///
+    /// Emitting them ascending cannot: the smallest matches are at the far
+    /// END of the chain, so every page had to walk the whole chain and
+    /// verify nearly every match again. That is quadratic in the number of
+    /// matches, and it was not theoretical — a bookmark store measured a
+    /// needle matching 50,000 of 50,000 rows at 31 SECONDS, against 58 ms
+    /// for a brute-force scan of the same data. The index was 538x slower
+    /// than no index at all, and got worse the more it matched.
+    ///
+    /// Descending is also the more useful order for a search box, and it
+    /// is exactly as deterministic and stable as ascending was.
+    ///
+    /// A page walks the chain as it stood when paging began: rows written
+    /// during a paged scan are prepended ahead of the cursor and are not
+    /// visited. That is the same snapshot property ascending order had
+    /// from the other end, and the same one a `range` scan gives.
+    ///
+    /// Exactness argument, unchanged: for needles >= 3 bytes, any row
+    /// containing the needle contains its first trigram, so walking that
+    /// one chain visits a superset of the answer; verification removes the
+    /// rest. For shorter needles there is no trigram to look up: scan all
     /// rows (bounded by len; still exact).
+    ///
     /// `exhaustive` forces the scan path even for a long needle. The
-    /// caller asks for it when the index is no longer guaranteed to hold a
-    /// superset of the answer — the engine sets it once any value spans
-    /// more than one row, because such a value's postings all hang off its
-    /// head row and a chain walk would still be right, but the engine
-    /// would have to map every candidate back to a head to know it. The
-    /// scan is bounded by the row count and exact either way; taking it is
-    /// a cost, never a compromise.
+    /// caller asks for it when the index no longer holds a superset of the
+    /// answer for the way it wants to use it — the engine sets it once any
+    /// value spans more than one row. The scan is bounded by the row count
+    /// and exact either way; taking it is a cost, never a compromise.
     pub fn find_page<F: Fn(u64) -> bool>(
         &self,
         needle: &[u8],
-        cursor: Option<u64>,
+        cursor: Option<FindCursor>,
         page: &mut [u64],
         exhaustive: bool,
         matches: F,
-    ) -> usize {
+    ) -> (usize, Option<FindCursor>) {
         self.assert_invariants();
-        let lo = cursor.map_or(0, |c| c + 1);
         let mut found = 0usize;
-        let consider = |row: u64, page: &mut [u64], found: &mut usize| {
-            if row < lo || !matches(row) {
-                return;
-            }
-            // Insertion into the bounded ascending page (page.len() is
-            // small and fixed: this is O(page) per candidate, O(1) mem).
-            let mut i = *found;
-            if i == page.len() {
-                if row >= page[i - 1] {
-                    return;
-                }
-                i -= 1;
-            } else {
-                *found += 1;
-            }
-            while i > 0 && page[i - 1] > row {
-                page[i] = page[i - 1];
-                i -= 1;
-            }
-            page[i] = row;
-        };
 
         if needle.len() < 3 || exhaustive {
-            for row in lo..self.len {
-                consider(row, page, &mut found);
-                // Ascending scan: a full page of the smallest is final.
-                if found == page.len() {
-                    break;
+            // Descending scan from just below the cursor.
+            let mut row = match cursor {
+                Some(c) if c.row == 0 => return (0, None),
+                Some(c) => c.row - 1,
+                None if self.len == 0 => return (0, None),
+                None => self.len - 1,
+            };
+            loop {
+                if matches(row) {
+                    page[found] = row;
+                    found += 1;
+                    if found == page.len() {
+                        return (found, (row > 0).then_some(FindCursor { row, slot: NIL }));
+                    }
                 }
+                if row == 0 {
+                    return (found, None);
+                }
+                row -= 1;
             }
-            return found;
         }
 
         let tri = tri_key(&needle[0..3]);
-        let mut slot = self.head(tri);
+        // Resume where the last page stopped, or start at the chain head.
+        // A resume point is a slot the previous page already returned, so
+        // the walk continues from the slot AFTER it.
+        let mut slot = match cursor {
+            Some(c) if c.slot != NIL => self.next[c.slot as usize],
+            Some(_) => self.head(tri),
+            None => self.head(tri),
+        };
+        let below = cursor.map(|c| c.row);
         let mut steps = 0u64;
+        let mut previous: Option<u64> = None;
         while slot != NIL {
             assert!(
                 steps <= self.len * TRIGRAMS_PER_ROW as u64,
                 "trigram chain cycle"
             );
             let row = (slot as usize / TRIGRAMS_PER_ROW) as u64;
-            consider(row, page, &mut found);
+            // Postings are prepended in row order and deduplicated per
+            // value, so a chain visits rows STRICTLY descending. Checking
+            // it here is what makes the walk safe to stop early: a page
+            // that fills after four steps never reaches the step bound, so
+            // without this a corrupted chain would quietly return the same
+            // row four times instead of saying the chain is broken.
+            if let Some(prev) = previous {
+                assert!(
+                    row < prev,
+                    "trigram chain cycle: row {row} follows {prev}, but a chain descends"
+                );
+            }
+            previous = Some(row);
+            // A cursor whose slot was lost (the caller crossed between the
+            // chain and the scan path) still bounds the walk by row.
+            let past = below.is_some_and(|b| row >= b);
+            if !past && matches(row) {
+                page[found] = row;
+                found += 1;
+                if found == page.len() {
+                    return (found, Some(FindCursor { row, slot }));
+                }
+            }
             slot = self.next[slot as usize];
             steps += 1;
         }
-        found
+        (found, None)
     }
 }
 
@@ -359,19 +422,31 @@ mod tests {
         needle.is_empty() || hay.windows(needle.len().max(1)).any(|w| w == needle)
     }
 
+    /// Every match, in ascending row order — pages arrive newest-first, so
+    /// the oracle comparison reverses them at the end.
     fn find_all(t: &TrigramIndex, values: &[[u8; VALUE_LEN]], needle: &[u8]) -> Vec<u64> {
         let mut out = Vec::new();
         let mut cursor = None;
+        let mut pages = 0;
         loop {
+            pages += 1;
+            assert!(pages <= 1 + values.len(), "paging did not terminate");
             let mut page = [0u64; 4];
-            let n = t.find_page(needle, cursor, &mut page, false, |row| {
+            let (n, next) = t.find_page(needle, cursor, &mut page, false, |row| {
                 contains(&values[row as usize], needle)
             });
-            out.extend_from_slice(&page[..n]);
-            if n < page.len() {
-                return out;
+            // Pages descend, and never repeat a row.
+            for w in page[..n].windows(2) {
+                assert!(w[0] > w[1], "a page was not descending: {page:?}");
             }
-            cursor = Some(page[n - 1]);
+            out.extend_from_slice(&page[..n]);
+            match next {
+                Some(c) => cursor = Some(c),
+                None => {
+                    out.reverse();
+                    return out;
+                }
+            }
         }
     }
 
@@ -454,7 +529,7 @@ mod tests {
         t.insert_value(0, 3, &long);
 
         let mut page = [0u64; 4];
-        let n = t.find_page(b"needle", None, &mut page, false, |row| {
+        let (n, _) = t.find_page(b"needle", None, &mut page, false, |row| {
             row == 0 && long.windows(6).any(|w| w == b"needle")
         });
         assert_eq!(
@@ -465,7 +540,7 @@ mod tests {
 
         // And the exhaustive path agrees, which is the guarantee the
         // engine leans on once any value is long.
-        let n = t.find_page(b"needle", None, &mut page, true, |row| {
+        let (n, _) = t.find_page(b"needle", None, &mut page, true, |row| {
             row == 0 && long.windows(6).any(|w| w == b"needle")
         });
         assert_eq!(&page[..n], &[0]);
@@ -515,6 +590,6 @@ mod tests {
         assert_ne!(head, NIL);
         t.next[head as usize] = head;
         let mut page = [0u64; 4];
-        t.find_page(b"abc", None, &mut page, false, |_| true);
+        let _ = t.find_page(b"abc", None, &mut page, false, |_| true);
     }
 }

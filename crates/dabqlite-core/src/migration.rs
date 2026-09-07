@@ -278,7 +278,7 @@ impl MigrationEngine {
                     row_count,
                     copy: 0,
                 };
-                Engine::sb_copy_write(generation + 1, row_count, 0)
+                Engine::sb_copy_write(generation + 1, row_count, self.caps.rows, 0)
             }
             (
                 MState::WriteSb {
@@ -294,7 +294,7 @@ impl MigrationEngine {
                     row_count,
                     copy: 1,
                 };
-                Engine::sb_copy_write(generation + 1, row_count, 1)
+                Engine::sb_copy_write(generation + 1, row_count, self.caps.rows, 1)
             }
             (
                 MState::WriteSb {
@@ -454,7 +454,7 @@ impl MigrationEngine {
                 row_count: 0,
                 copy: 0,
             };
-            return Engine::sb_copy_write(generation + 1, 0, 0);
+            return Engine::sb_copy_write(generation + 1, 0, self.caps.rows, 0);
         }
         self.state = MState::ReadOldRows {
             generation,
@@ -499,7 +499,7 @@ impl MigrationEngine {
                 row_count: 0,
                 copy: 0,
             };
-            return Engine::sb_copy_write(base + 1, 0, 0);
+            return Engine::sb_copy_write(base + 1, 0, self.caps.rows, 0);
         }
         self.state = MState::ReadOldRows {
             generation: base,

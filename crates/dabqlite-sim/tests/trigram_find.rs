@@ -23,7 +23,7 @@ fn oracle(ops: &[(u64, [u8; VALUE_LEN])], needle: &[u8]) -> Vec<(u64, [u8; VALUE
         .collect()
 }
 
-fn find_input(needle: &[u8], after: Option<u64>) -> Input<'static> {
+fn find_input(needle: &[u8], after: Option<dabqlite_core::FindCursor>) -> Input<'static> {
     let mut padded = [0u8; VALUE_LEN];
     padded[..needle.len()].copy_from_slice(needle);
     Input::Find {
@@ -92,16 +92,61 @@ fn paging_walks_large_results_exactly() {
     assert_eq!(host.find_all(b"needle"), oracle(&ops, b"needle"));
     assert_eq!(host.find_all(b"needle").len(), 24);
 
-    // Single pages are bounded and ascending by row.
+    // Single pages are bounded and NEWEST FIRST — the order a paged
+    // search box wants, and the order that makes a continuation resume
+    // where it stopped instead of walking the chain again.
     match host.run_input(find_input(b"needle", None)) {
         Driven::Done(Output::FindDone { result: Ok(page) }) => {
             assert_eq!(page.count, 8);
             assert!(page.next.is_some());
             let ids: Vec<u64> = page.items[..8].iter().map(|r| r.id).collect();
-            assert_eq!(ids, (0..8u64).map(|i| i * 7 + 1).collect::<Vec<_>>());
+            assert_eq!(
+                ids,
+                (16..24u64).rev().map(|i| i * 7 + 1).collect::<Vec<_>>()
+            );
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Paging is LINEAR in the number of matches, not quadratic.
+///
+/// The old cursor was a row number, and since a trigram's chain descends,
+/// resuming "above row N" meant walking the chain from its head and
+/// verifying nearly every match again on every page. A bookmark store
+/// measured the consequence: a needle matching all 50,000 rows took 31
+/// SECONDS, against 58 ms for a brute-force scan of the same data — an
+/// index 538x slower than no index.
+///
+/// Counting verifications is the honest way to test that: it is the work
+/// the old shape repeated, and it does not depend on how fast this
+/// machine happens to be.
+#[test]
+fn paging_a_common_needle_verifies_each_row_about_once() {
+    const N: u64 = 400;
+    let caps = Capacities { rows: 1024 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    for i in 0..N {
+        let mut value = [0u8; VALUE_LEN];
+        value[..6].copy_from_slice(b"needle");
+        value[6..14].copy_from_slice(&i.to_le_bytes());
+        host.run(ClientOp::Insert { id: i, value });
+    }
+
+    let hits = host.find_all(b"needle");
+    assert_eq!(hits.len(), N as usize, "every row matches this needle");
+
+    // Every row is verified about once across the whole paged walk. The
+    // quadratic shape would be ~N^2/8 = 20,000 verifications for N=400;
+    // the bound below is generous enough to be stable and tight enough
+    // that the old shape fails it by two orders of magnitude.
+    let verifications = host.engine.find_verifications();
+    assert!(
+        verifications <= 3 * N,
+        "paging {N} matches cost {verifications} row verifications; a page \
+         is re-walking the chain instead of resuming in it"
+    );
 }
 
 #[test]

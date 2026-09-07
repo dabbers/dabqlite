@@ -449,9 +449,9 @@ fn every_refusal_is_whole_and_performs_no_io() {
                 })
                 .collect(),
             MAX_COMMIT_ROWS as u16,
-            DbError::Full {
-                entity: "batch rows",
-                capacity: MAX_COMMIT_ROWS as u64,
+            DbError::BatchTooLong {
+                rows: MAX_COMMIT_ROWS as u64 + 1,
+                max: MAX_COMMIT_ROWS as u64,
             },
         ),
     ];

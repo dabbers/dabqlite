@@ -39,7 +39,7 @@ use crate::layout::{
     decode_row, decode_sb, encode_row, encode_sb, RowKind, RowSlot, SbDecodeError, MAX_COMMIT_ROWS,
     ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
-use crate::trigram::TrigramIndex;
+use crate::trigram::{FindCursor, TrigramIndex};
 
 /// The declared file set (docs/DESIGN.md §4.4): derived from the schema,
 /// knowable before the program runs. One file per zone.
@@ -112,6 +112,12 @@ pub enum DbError {
     /// Rebuild with the inspector's `--repair-to` to return to a clean
     /// database.
     Degraded { quarantined: u64 },
+    /// The batch names more operations, or needs more row slots, than one
+    /// commit can carry. Distinct from `Full`, which is about the
+    /// DATABASE being out of room: a batch can be too long for a commit
+    /// while the database is nearly empty, and reporting that as "full at
+    /// capacity 128" states the reverse of the truth.
+    BatchTooLong { rows: u64, max: u64 },
     /// The value is longer than a single commit can carry. A value is
     /// stored as a run of row slots inside ONE commit, so its ceiling is
     /// the longest commit the format can describe (see `MAX_VALUE_LEN`).
@@ -399,7 +405,7 @@ pub enum Input<'a> {
     Find {
         needle: [u8; VALUE_LEN],
         needle_len: u8,
-        after: Option<u64>,
+        after: Option<FindCursor>,
     },
 }
 
@@ -479,7 +485,9 @@ pub const FIND_PAGE: usize = 8;
 pub struct FindPage {
     pub items: [RowRef; FIND_PAGE],
     pub count: u8,
-    pub next: Option<u64>,
+    /// Where to continue from; `None` ends the search. Opaque — pass it
+    /// back unchanged.
+    pub next: Option<FindCursor>,
     /// True when the database is open in salvage mode with quarantined
     /// rows: every row returned is verified and exact, but rows that
     /// would have matched may be missing. A scan that silently omitted
@@ -623,6 +631,10 @@ pub struct RecoveryReport {
     /// recovered prefix is still exactly correct; what follows it is gone,
     /// and this flag is the loud version of that fact.
     pub rollback_evidence: bool,
+    /// The row capacity this database was created with, as recorded in
+    /// its superblock — which may differ from the capacity this engine
+    /// was opened with, if the caller asked for a different one.
+    pub declared_capacity: u64,
     /// Committed rows QUARANTINED by a salvage open: they failed checksum
     /// or padding validation, or duplicated an id already seen, so they
     /// are not served. Always 0 after a strict `Open` (which refuses such
@@ -640,6 +652,10 @@ pub struct Engine {
     generation: u64,
     /// Committed row count. Rows `0..row_count` in the arena are live.
     row_count: u64,
+    /// The capacity recorded in the file's superblock. Equal to
+    /// `caps.rows` for a database this engine created, and possibly
+    /// different for one it was handed.
+    file_capacity: u64,
     /// The insert currently in flight, if any.
     pending: Option<(u64, [u8; VALUE_LEN])>,
     /// Rows file length reported at open; used to cross-check recovery.
@@ -701,6 +717,13 @@ pub struct Engine {
     /// for one slot. Not records and not deletions, but every slot has to
     /// be accounted for somewhere or the counting invariant is a lie.
     chunks: u64,
+    /// Rows a substring search has verified since this engine opened.
+    ///
+    /// Diagnostic only, and exposed on purpose: "paging a search is
+    /// linear in the number of matches" is a property worth testing
+    /// directly rather than by wall clock, and this is the work that
+    /// would grow if a page ever went back to re-walking the chain.
+    find_verifications: core::cell::Cell<u64>,
     /// Head rows whose value spans more than one slot. While this is
     /// nonzero, substring search takes the exhaustive path: the trigram
     /// index only holds single-slot values, so a chain walk would be a
@@ -821,6 +844,7 @@ impl Engine {
             caps,
             generation: 0,
             row_count: 0,
+            file_capacity: caps.rows,
             pending: None,
             opened_rows_len: 0,
             orphan_valid_rows: 0,
@@ -836,6 +860,7 @@ impl Engine {
             tombstones: 0,
             chunks: 0,
             long_values: 0,
+            find_verifications: core::cell::Cell::new(0),
             salvage: false,
             quarantined: 0,
             arena,
@@ -873,6 +898,7 @@ impl Engine {
     pub fn recovery_report(&self) -> RecoveryReport {
         RecoveryReport {
             row_count: self.row_count,
+            declared_capacity: self.file_capacity,
             orphan_valid_rows: self.orphan_valid_rows,
             rollback_evidence: self.orphan_rollback,
             quarantined_rows: self.quarantined,
@@ -890,6 +916,11 @@ impl Engine {
     /// exist in the manifest but cannot be verified, so are never served.
     pub fn quarantined(&self) -> u64 {
         self.quarantined
+    }
+
+    /// Rows verified by substring search since open. See the field.
+    pub fn find_verifications(&self) -> u64 {
+        self.find_verifications.get()
     }
 
     /// The readable values, ascending by row. The basis of a rebuild:
@@ -1135,10 +1166,18 @@ impl Engine {
     }
 
     /// Build the write request for copy `copy` (0 or 1) of a generation.
-    pub(crate) fn sb_copy_write(generation: u64, row_count: u64, copy: u8) -> Output {
+    ///
+    /// `capacity` rides along in every copy so that reopening a database
+    /// does not have to be told how big it was declared.
+    pub(crate) fn sb_copy_write(
+        generation: u64,
+        row_count: u64,
+        capacity: u64,
+        copy: u8,
+    ) -> Output {
         debug_assert!(copy < 2);
         let mut bytes = [0u8; SB_COPY_SIZE];
-        encode_sb(generation, row_count, &mut bytes);
+        encode_sb(generation, row_count, capacity, &mut bytes);
         let slot = Self::sb_slots_for(generation)[copy as usize];
         Output::Write {
             file: FileId::Superblock,
@@ -1149,7 +1188,7 @@ impl Engine {
 
     fn stage_initial_superblock(&mut self) -> Output {
         self.state = State::InitWriteSb { copy: 0 };
-        Self::sb_copy_write(1, 0, 0)
+        Self::sb_copy_write(1, 0, self.caps.rows, 0)
     }
 
     fn on_read_done(&mut self, file: FileId, data: &[u8]) -> Output {
@@ -1239,6 +1278,10 @@ impl Engine {
             return self.stage_initial_superblock();
         };
 
+        // What the file says it was created with. Kept whatever this
+        // engine's own capacity is, so a caller can see that it opened a
+        // database smaller (or larger) than the one that was written.
+        self.file_capacity = copy.capacity;
         if copy.row_count > self.caps.rows {
             return self.fail_open(DbError::CapacityBelowData {
                 required: copy.row_count,
@@ -1764,9 +1807,9 @@ impl Engine {
                 rows: 0,
                 result: Err(BatchReject {
                     at: MAX_COMMIT_ROWS as u16,
-                    error: DbError::Full {
-                        entity: "batch rows",
-                        capacity: MAX_COMMIT_ROWS as u64,
+                    error: DbError::BatchTooLong {
+                        rows: ops.len() as u64,
+                        max: MAX_COMMIT_ROWS as u64,
                     },
                 }),
             };
@@ -1834,9 +1877,9 @@ impl Engine {
                 self.batch.clear();
                 return reject(
                     i,
-                    DbError::Full {
-                        entity: "batch rows",
-                        capacity: MAX_COMMIT_ROWS as u64,
+                    DbError::BatchTooLong {
+                        rows: staged_rows as u64 + need as u64,
+                        max: MAX_COMMIT_ROWS as u64,
                     },
                 );
             }
@@ -2059,7 +2102,7 @@ impl Engine {
         match (self.state, file) {
             (State::InitWriteSb { copy: 0 }, FileId::Superblock) => {
                 self.state = State::InitWriteSb { copy: 1 };
-                Self::sb_copy_write(1, 0, 1)
+                Self::sb_copy_write(1, 0, self.caps.rows, 1)
             }
             (State::InitWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::InitFsyncSb;
@@ -2089,7 +2132,7 @@ impl Engine {
             }
             (State::UpdateWriteSb { copy: 0 }, FileId::Superblock) => {
                 self.state = State::UpdateWriteSb { copy: 1 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 1)
             }
             (State::UpdateWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::UpdateFsyncSb;
@@ -2103,7 +2146,7 @@ impl Engine {
             }
             (State::DeleteWriteSb { copy: 0 }, FileId::Superblock) => {
                 self.state = State::DeleteWriteSb { copy: 1 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 1)
             }
             (State::DeleteWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::DeleteFsyncSb;
@@ -2129,6 +2172,7 @@ impl Engine {
                 Self::sb_copy_write(
                     self.generation + 1,
                     self.row_count + self.batch_rows as u64,
+                    self.caps.rows,
                     1,
                 )
             }
@@ -2144,7 +2188,7 @@ impl Engine {
             }
             (State::InsertWriteSb { copy: 0 }, FileId::Superblock) => {
                 self.state = State::InsertWriteSb { copy: 1 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 1)
             }
             (State::InsertWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::InsertFsyncSb;
@@ -2177,7 +2221,7 @@ impl Engine {
                         row_count,
                         copy,
                     };
-                    Self::sb_copy_write(generation, row_count, copy)
+                    Self::sb_copy_write(generation, row_count, self.caps.rows, copy)
                 } else {
                     self.state = State::RecoverFsyncSb {
                         generation,
@@ -2197,7 +2241,7 @@ impl Engine {
             ) => self.finish_open(generation, row_count),
             (State::UpdateFsyncRows, FileId::Rows) => {
                 self.state = State::UpdateWriteSb { copy: 0 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 0)
             }
             (State::UpdateFsyncSb, FileId::Superblock) => {
                 // Commit point: the new value is durable.
@@ -2221,7 +2265,7 @@ impl Engine {
             (State::DeleteFsyncRows, FileId::Rows) => {
                 // The tombstone is durable; now flip the manifest over it.
                 self.state = State::DeleteWriteSb { copy: 0 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 0)
             }
             (State::DeleteFsyncSb, FileId::Superblock) => {
                 // Commit point: the deletion is durable.
@@ -2250,7 +2294,7 @@ impl Engine {
                 // generation goes to the *other* pair of slots, so the live
                 // generation's copies are untouched no matter what tears.
                 self.state = State::InsertWriteSb { copy: 0 };
-                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, self.caps.rows, 0)
             }
             (State::BatchFsyncRows, FileId::Rows) => {
                 // Every row of the batch is durable; now flip the manifest
@@ -2259,6 +2303,7 @@ impl Engine {
                 Self::sb_copy_write(
                     self.generation + 1,
                     self.row_count + self.batch_rows as u64,
+                    self.caps.rows,
                     0,
                 )
             }
@@ -2480,7 +2525,12 @@ impl Engine {
         Output::RangeDone { result }
     }
 
-    fn on_find(&mut self, needle: [u8; VALUE_LEN], needle_len: u8, after: Option<u64>) -> Output {
+    fn on_find(
+        &mut self,
+        needle: [u8; VALUE_LEN],
+        needle_len: u8,
+        after: Option<FindCursor>,
+    ) -> Output {
         assert!(
             (needle_len as usize) <= VALUE_LEN,
             "needle exceeds the value width"
@@ -2525,7 +2575,7 @@ impl Engine {
     /// bytes, so results are exact regardless of index state — the index
     /// can only make this slower, never wrong. Committed state only:
     /// like the btree, the trigram index is updated at the commit point.
-    fn find_page(&self, needle: &[u8], after: Option<u64>) -> FindPage {
+    fn find_page(&self, needle: &[u8], after: Option<FindCursor>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
         // Once any value spans more than one slot, the chain walk stops
         // being the cheapest way to reach every candidate, so take the
@@ -2533,9 +2583,11 @@ impl Engine {
         // correct — a cost, never a compromise (see `find_page` in the
         // trigram index).
         let exhaustive = self.long_values > 0;
-        let n = self
+        let (n, next) = self
             .trigram
             .find_page(needle, after, &mut rows, exhaustive, |row| {
+                self.find_verifications
+                    .set(self.find_verifications.get() + 1);
                 // Postings survive their record's retirement (the trigram
                 // index is append-only); liveness filters them out here.
                 if !self.is_live(row) {
@@ -2585,9 +2637,7 @@ impl Engine {
                 .expect("live arena row must decode");
             *slot = self.row_ref(id, row);
         }
-        if n == FIND_PAGE {
-            page.next = Some(rows[n - 1]);
-        }
+        page.next = next;
         page
     }
 

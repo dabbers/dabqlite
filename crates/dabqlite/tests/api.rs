@@ -275,6 +275,10 @@ fn errors_are_all_displayable_and_say_something_useful() {
             at: 3,
             cause: Box::new(Error::NotFound { id: 7 }),
         },
+        Error::BatchTooLong {
+            rows: 200,
+            max: MAX_BATCH,
+        },
     ];
     // Every variant must appear above. This match exists to break the
     // build when a new one is added: a variant with no case here is a
@@ -291,6 +295,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             Error::Corrupt { .. } => "Corrupt",
             Error::SchemaMismatch { .. } => "SchemaMismatch",
             Error::Io { .. } => "Io",
+            Error::BatchTooLong { .. } => "BatchTooLong",
             Error::BatchRejected { .. } => "BatchRejected",
         }
     }
@@ -331,7 +336,7 @@ fn compaction_reclaims_dead_slots_in_place_and_survives_interruption() {
     assert!(before.dead > 0, "the workload should have left dead weight");
 
     // In place: same path, same data, no dead weight.
-    let mut db = db.compact().expect("compact");
+    db.compact().expect("compact");
     let after = db.stats();
     assert_eq!(after.live, before.live);
     assert_eq!(after.dead, 0, "compaction left dead slots behind");
@@ -610,16 +615,27 @@ fn an_over_long_batch_is_refused_rather_than_silently_split() {
     let ops: Vec<Op> = (0..MAX_BATCH as u64 + 1)
         .map(|i| Op::put(i, Value::from_text("x").unwrap()))
         .collect();
+    // The refusal must not claim the DATABASE is full: it is empty, and
+    // its capacity is not MAX_BATCH. Three separate sample applications
+    // reported the old message as stating the reverse of the truth.
     match db.batch(&ops) {
-        Err(Error::BatchRejected { cause, .. }) => {
-            assert!(
-                matches!(*cause, Error::Full { .. }),
-                "expected a capacity error, got {cause:?}"
-            );
-        }
+        Err(Error::BatchRejected { cause, .. }) => match *cause {
+            Error::BatchTooLong { rows, max } => {
+                assert_eq!(max, MAX_BATCH);
+                assert_eq!(rows, MAX_BATCH + 1);
+                let msg = cause.to_string();
+                assert!(!msg.contains("full"), "this database is not full: {msg}");
+                assert!(msg.contains("atomic"), "{msg}");
+            }
+            other => panic!("expected BatchTooLong, got {other:?}"),
+        },
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert!(db.is_empty(), "an over-long batch wrote rows anyway");
+    assert!(
+        db.stats().capacity > MAX_BATCH as u64,
+        "the test needs a database bigger than one commit to be meaningful"
+    );
 
     // Exactly at the limit is fine.
     let ops: Vec<Op> = (0..MAX_BATCH as u64)
@@ -663,4 +679,87 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
         "a clean reopen after a batch must not report lost data"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A database remembers how big it was declared, so reopening it does not
+/// have to be told again.
+///
+/// Every sample application built against this library before the
+/// capacity was recorded ended up keeping a sidecar file to remember it —
+/// and one of them then discovered that compaction deleted the sidecar.
+/// The number belongs in the database.
+#[cfg(unix)]
+#[test]
+fn a_database_remembers_the_capacity_it_was_created_with() {
+    let dir = scratch("remembered-capacity");
+    {
+        let mut db = Db::open_with(&dir, 100).expect("open");
+        db.insert(1, Value::from_text("one").unwrap()).unwrap();
+        assert_eq!(db.stats().capacity, 100);
+    }
+    // Reopened without saying anything: the same ceiling, not the default.
+    {
+        let mut db = Db::open(&dir).expect("reopen");
+        assert_eq!(
+            db.stats().capacity,
+            100,
+            "reopening forgot the declared capacity"
+        );
+        assert_eq!(db.recovery_report().declared_capacity, 100);
+        assert_eq!(db.get(1).unwrap().unwrap().text(), "one");
+    }
+    // And it survives a compaction, which rebuilds the directory.
+    {
+        let mut db = Db::open(&dir).expect("reopen");
+        db.compact().expect("compact");
+        assert_eq!(db.stats().capacity, 100, "compaction forgot the capacity");
+    }
+    // Asking for a different one explicitly still wins for that session,
+    // and the file learns it at the next commit — a capacity is recorded
+    // by writing, not by opening, so an open never rewrites a database it
+    // was only asked to read.
+    {
+        let db = Db::open_with(&dir, 250).expect("resize");
+        assert_eq!(db.stats().capacity, 250);
+    }
+    {
+        let db = Db::open(&dir).expect("reopen after a resize that wrote nothing");
+        assert_eq!(
+            db.stats().capacity,
+            100,
+            "an open that wrote nothing should not have changed the file"
+        );
+    }
+    {
+        let mut db = Db::open_with(&dir, 250).expect("resize");
+        db.insert(2, Value::from_text("two").unwrap()).unwrap();
+    }
+    {
+        let mut db = Db::open(&dir).expect("reopen after a resize that wrote");
+        assert_eq!(
+            db.stats().capacity,
+            250,
+            "the new capacity was not recorded"
+        );
+        assert_eq!(db.get(2).unwrap().unwrap().text(), "two");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same for a snapshot: the bytes carry the capacity, so a round trip
+/// through `to_bytes`/`from_bytes` does not quietly resize the database.
+#[test]
+fn a_snapshot_carries_the_capacity_it_was_written_with() {
+    let mut db = Db::in_memory_with(64).expect("open");
+    db.insert(1, Value::from_text("one").unwrap()).unwrap();
+    let bytes = db.snapshot().unwrap().to_bytes();
+
+    let snapshot = Snapshot::from_bytes(&bytes).expect("parse");
+    let mut reloaded = Db::load(&snapshot).expect("load");
+    assert_eq!(
+        reloaded.stats().capacity,
+        64,
+        "a reloaded snapshot got a different ceiling than the one saved"
+    );
+    assert_eq!(reloaded.get(1).unwrap().unwrap().text(), "one");
 }

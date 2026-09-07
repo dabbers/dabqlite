@@ -426,6 +426,9 @@ impl SimHost {
 
     /// Full paged substring search, concatenated: a test convenience over
     /// the bounded-page protocol (each page is one `Input::Find`).
+    /// Every match, in ROW order. Pages arrive newest-first, so this
+    /// reverses at the end — tests that compare against an oracle built
+    /// by scanning forwards want the forward order.
     pub fn find_all(&mut self, needle: &[u8]) -> Vec<(u64, [u8; VALUE_LEN])> {
         assert!(needle.len() <= VALUE_LEN);
         let mut padded = [0u8; VALUE_LEN];
@@ -450,7 +453,10 @@ impl SimHost {
             }));
             match page.next {
                 Some(n) => after = Some(n),
-                None => return out,
+                None => {
+                    out.reverse();
+                    return out;
+                }
             }
         }
     }

@@ -30,7 +30,7 @@ pub fn list_records(lo: u64, hi: u64) -> crate::engine::Input<'static> {
 /// (trigram-accelerated, verification-exact). Answered by `FindDone`
 /// with one bounded page in insertion order; continue with
 /// `after = page.next`. Panics if the needle exceeds the value width.
-pub fn find_records(needle: &[u8], after: Option<u64>) -> crate::engine::Input<'static> {
+pub fn find_records(needle: &[u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'static> {
     assert!(needle.len() <= 16, "needle exceeds the value width");
     let mut padded = [0u8; 16];
     padded[..needle.len()].copy_from_slice(needle);

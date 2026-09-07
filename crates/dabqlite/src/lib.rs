@@ -45,7 +45,7 @@
 use dabqlite_core::{BatchOp, Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
 use dabqlite_host::Host;
 
-pub use dabqlite_core::{DbError as EngineError, RecoveryReport, VALUE_LEN};
+pub use dabqlite_core::{DbError as EngineError, FindCursor, RecoveryReport, VALUE_LEN};
 
 // The backends, re-exported so that `Db<S>` can actually be WRITTEN DOWN by
 // a caller. Without these a database could only ever be a local binding
@@ -65,6 +65,25 @@ pub type MemDb = Db<MemoryStorage>;
 /// A damaged database opened read-only for rescue (see [`Db::salvage`]).
 #[cfg(unix)]
 pub type SalvageDb = Db<ReadOnlyDir>;
+
+/// The capacity recorded in a superblock image, if it holds one.
+///
+/// Read directly rather than through the engine because the arena has to
+/// be sized before the engine exists — the capacity is the one thing that
+/// must be known before anything else can be.
+fn recorded_capacity(superblock: &[u8]) -> Option<u64> {
+    use dabqlite_core::layout::{decode_sb, SB_COPIES, SB_COPY_SIZE};
+    // The highest generation among valid copies is the live one, exactly
+    // as recovery decides it.
+    (0..SB_COPIES)
+        .filter_map(|slot| {
+            let at = slot * SB_COPY_SIZE;
+            decode_sb(superblock.get(at..at + SB_COPY_SIZE)?).ok()
+        })
+        .max_by_key(|c| c.generation)
+        .map(|c| c.capacity)
+        .filter(|&c| c > 0)
+}
 
 /// Rows a database can hold when you do not say otherwise.
 ///
@@ -282,6 +301,12 @@ pub enum Error {
     SchemaMismatch { file_schema: u64, binary: u64 },
     /// Storage failed. The database has fail-stopped; reopen it.
     Io { detail: String },
+    /// The batch needs more row slots than one commit can carry. NOT the
+    /// same as [`Error::Full`], which is the database being out of room:
+    /// a batch can be too long while the database is nearly empty.
+    /// Split the work into several batches — each one still atomic in
+    /// itself — or shorten the values.
+    BatchTooLong { rows: usize, max: usize },
     /// A [`Db::batch`] was refused, and nothing in it was applied. `at` is
     /// the index of the operation that stopped it and `cause` is the error
     /// that operation would have returned on its own.
@@ -327,6 +352,11 @@ impl core::fmt::Display for Error {
                  0x{binary:016X}"
             ),
             Error::Io { detail } => write!(f, "storage failed: {detail}"),
+            Error::BatchTooLong { rows, max } => write!(
+                f,
+                "this batch needs {rows} row slots and one commit holds {max}; \
+                 split it into several batches, each still atomic in itself"
+            ),
             Error::BatchRejected { at, cause } => write!(
                 f,
                 "batch refused at operation {at} ({cause}); nothing in it was applied"
@@ -369,6 +399,10 @@ impl From<DbError> for Error {
             } => Error::CapacityTooSmall {
                 required,
                 asked: configured,
+            },
+            DbError::BatchTooLong { rows, max } => Error::BatchTooLong {
+                rows: rows as usize,
+                max: max as usize,
             },
             DbError::ValueTooLong { len, max } => Error::ValueTooLong {
                 len: len as usize,
@@ -460,12 +494,31 @@ pub type Page = (Vec<Row>, Option<u64>);
 
 /// An open database.
 pub struct Db<S: Storage> {
-    host: Host<S>,
+    /// `None` only while [`Db::compact`] has released the old handle and
+    /// not yet attached the new one. That window cannot yield, so no
+    /// caller can observe it — unless the reattachment itself fails, in
+    /// which case the accessors below say so and say what to do.
+    host: Option<Host<S>>,
     /// Where this database lives, when it lives somewhere. Kept so it can
     /// compact itself in place without the caller having to hand the path
     /// back.
     #[cfg(unix)]
     origin: Option<(std::path::PathBuf, u64)>,
+}
+
+/// What a detached handle says when used. Reachable only after a
+/// `compact` whose final reopen failed — the data is safe either way,
+/// because the swap is crash-safe and the next open resolves it.
+const DETACHED: &str = "this database handle was detached by a failed compaction; \
+                        the directory is intact — reopen it with Db::open";
+
+impl<S: Storage> Db<S> {
+    fn h(&self) -> &Host<S> {
+        self.host.as_ref().expect(DETACHED)
+    }
+    fn hm(&mut self) -> &mut Host<S> {
+        self.host.as_mut().expect(DETACHED)
+    }
 }
 
 impl<S: Storage> core::fmt::Debug for Db<S> {
@@ -496,7 +549,8 @@ impl Db<MemoryStorage> {
     /// Reopen a snapshot taken by [`Db::snapshot`] — or produced by a
     /// file-backed database, since the bytes are the same.
     pub fn load(snapshot: &Snapshot) -> Result<Self, Error> {
-        Self::load_with(snapshot, DEFAULT_ROWS)
+        let rows = recorded_capacity(&snapshot.superblock).unwrap_or(DEFAULT_ROWS);
+        Self::load_with(snapshot, rows)
     }
 
     /// As [`Db::load`], with a chosen row capacity.
@@ -515,10 +569,25 @@ impl Db<PosixStorage> {
     /// Open (or create) a database in a directory, with real files and
     /// real fsyncs. Takes the single-writer lock for as long as it lives.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
-        Self::open_with(path, DEFAULT_ROWS)
+        let path = path.as_ref();
+        // A database remembers the capacity it was created with, so
+        // reopening it does not have to be told again — and a caller who
+        // forgets does not silently get a different ceiling (and a
+        // different memory footprint) than the one they chose.
+        let rows = recorded_capacity(
+            &std::fs::read(path.join(dabqlite_host::SUPERBLOCK_FILE)).unwrap_or_default(),
+        )
+        .unwrap_or(DEFAULT_ROWS);
+        Self::open_with(path, rows)
     }
 
-    /// As [`Db::open`], with a chosen row capacity. The capacity must be
+    /// As [`Db::open`], with a chosen row capacity, overriding whatever
+    /// the database recorded.
+    ///
+    /// The new number takes effect immediately for this handle and is
+    /// recorded in the file at the next commit — a capacity is written by
+    /// writing, never by opening, so an open cannot modify a database it
+    /// was only asked to read. The capacity must be
     /// at least as large as the data already there.
     pub fn open_with(path: impl AsRef<std::path::Path>, rows: u64) -> Result<Self, Error> {
         let path = path.as_ref();
@@ -553,18 +622,14 @@ impl Db<PosixStorage> {
     /// Note that compaction reclaims DEAD slots only. A database whose
     /// capacity is genuinely full of live rows needs a larger capacity,
     /// not a rebuild, and says so.
-    pub fn compact(self) -> Result<Self, Error> {
+    pub fn compact(&mut self) -> Result<(), Error> {
         let (path, rows) = self.origin.clone().ok_or_else(|| Error::Io {
             detail: "this database was not opened from a path".into(),
         })?;
         let staging = sibling(&path, COMPACT_STAGING);
         let retired = sibling(&path, COMPACT_RETIRED);
 
-        let mut source = self;
-        let live = source.all()?;
-        // Release the single-writer lock before touching the directory.
-        drop(source);
-
+        let live = self.all()?;
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_dir_all(&retired);
         {
@@ -574,16 +639,31 @@ impl Db<PosixStorage> {
         }
         sync_dir(&staging)?;
 
-        // The swap. Each step is a rename, and the recovery below resolves
-        // every point a crash can land between them.
-        std::fs::rename(&path, &retired).map_err(io_err)?;
-        std::fs::rename(&staging, &path).map_err(io_err)?;
-        if let Some(parent) = path.parent() {
-            let _ = sync_dir(parent);
-        }
-        let _ = std::fs::remove_dir_all(&retired);
+        // Release the single-writer lock before touching the directory.
+        // From here to the reopen at the bottom this handle is detached,
+        // and nothing between the two can yield to a caller.
+        drop(self.host.take());
 
-        Db::open_with(&path, rows)
+        // The swap. Each step is a rename, and the reopen below resolves
+        // every point a crash can land between them.
+        let swap = (|| -> Result<(), Error> {
+            std::fs::rename(&path, &retired).map_err(io_err)?;
+            std::fs::rename(&staging, &path).map_err(io_err)?;
+            if let Some(parent) = path.parent() {
+                let _ = sync_dir(parent);
+            }
+            let _ = std::fs::remove_dir_all(&retired);
+            Ok(())
+        })();
+
+        // Reattach whatever the directory now holds, whether or not the
+        // swap got all the way through: `open_with` finishes an
+        // interrupted compaction, so this lands on a correct database
+        // either way.
+        let reopened = Db::open_with(&path, rows)?;
+        self.host = reopened.host;
+        self.origin = reopened.origin;
+        swap
     }
 }
 
@@ -605,7 +685,10 @@ impl Db<ReadOnlyDir> {
         let storage = ReadOnlyDir::open_dir(path.as_ref()).map_err(io_err)?;
         let mut host = Host::new(caps(rows), storage);
         match host.open_salvage().map_err(io_err)? {
-            Output::OpenDone { result: Ok(_) } => Ok(Db { host, origin: None }),
+            Output::OpenDone { result: Ok(_) } => Ok(Db {
+                host: Some(host),
+                origin: None,
+            }),
             Output::OpenDone { result: Err(e) } => Err(e.into()),
             other => unreachable!("open returned {other:?}"),
         }
@@ -679,7 +762,7 @@ impl<S: Storage> Db<S> {
     fn start(mut host: Host<S>) -> Result<Self, Error> {
         match host.open().map_err(io_err)? {
             Output::OpenDone { result: Ok(_) } => Ok(Db {
-                host,
+                host: Some(host),
                 #[cfg(unix)]
                 origin: None,
             }),
@@ -768,7 +851,7 @@ impl<S: Storage> Db<S> {
         // public surface free of `[u8; 16]`.
         let mut core_ops = Vec::with_capacity(ops.len());
         core_ops.extend(ops.iter().map(|op| op.to_core()));
-        match self.host.batch(&core_ops) {
+        match self.hm().batch(&core_ops) {
             Output::BatchDone { result: Ok(()), .. } => Ok(()),
             Output::BatchDone {
                 result: Err(reject),
@@ -797,7 +880,7 @@ impl<S: Storage> Db<S> {
     /// and the caller never sees a partial value.
     pub fn get(&mut self, id: u64) -> Result<Option<Value>, Error> {
         use dabqlite_core::Input;
-        let first = match self.host.get(id) {
+        let first = match self.hm().get(id) {
             Output::GetDone { result: Ok(v), .. } => v,
             Output::GetDone { result: Err(e), .. } => return Err(e.into()),
             other => unreachable!("get returned {other:?}"),
@@ -807,7 +890,7 @@ impl<S: Storage> Db<S> {
         bytes.extend_from_slice(first.payload());
         let mut next = first.next_offset();
         while let Some(offset) = next {
-            let window = match self.host.run(Input::GetFrom { id, offset }) {
+            let window = match self.hm().run(Input::GetFrom { id, offset }) {
                 Output::GetDone {
                     result: Ok(Some(w)),
                     ..
@@ -852,7 +935,7 @@ impl<S: Storage> Db<S> {
     /// One bounded page of a range, plus where to continue from.
     pub fn range_page(&mut self, lo: u64, hi: u64) -> Result<Page, Error> {
         use dabqlite_core::Input;
-        match self.host.run(Input::Range { lo, hi }) {
+        match self.hm().run(Input::Range { lo, hi }) {
             Output::RangeDone { result: Ok(page) } => {
                 let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
                 let next = page.next;
@@ -886,9 +969,39 @@ impl<S: Storage> Db<S> {
         self.range(0, u64::MAX)
     }
 
-    /// Every row whose value contains `needle`, in insertion order.
-    /// Exact: the index only narrows candidates, and each is verified.
+    /// Every row whose value contains `needle`, NEWEST FIRST.
+    ///
+    /// Exact: the index only narrows candidates, and each one is verified
+    /// against the actual bytes — including bytes that straddle the slot
+    /// boundary of a value too long for one row.
+    ///
+    /// Newest-first because that is the order the index can page cheaply
+    /// and the order a search box wants; see [`Db::find_page`] to stop
+    /// early rather than collecting every match.
     pub fn find(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = self.find_page(needle, cursor)?;
+            out.extend(page);
+            match next {
+                Some(c) => cursor = Some(c),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One bounded page of a substring search, plus where to continue
+    /// from. `None` for `after` starts at the newest match.
+    ///
+    /// Paging costs the same per page however many matches there are, so
+    /// a search box can show its first results without paying for the
+    /// long tail — which is the point of stopping early.
+    pub fn find_page(
+        &mut self,
+        needle: &[u8],
+        after: Option<FindCursor>,
+    ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
         use dabqlite_core::Input;
         if needle.len() > VALUE_LEN {
             return Err(Error::ValueTooLong {
@@ -898,26 +1011,18 @@ impl<S: Storage> Db<S> {
         }
         let mut padded = [0u8; VALUE_LEN];
         padded[..needle.len()].copy_from_slice(needle);
-        let mut out = Vec::new();
-        let mut after = None;
-        loop {
-            let page = match self.host.run(Input::Find {
-                needle: padded,
-                needle_len: needle.len() as u8,
-                after,
-            }) {
-                Output::FindDone { result: Ok(p) } => p,
-                Output::FindDone { result: Err(e) } => return Err(e.into()),
-                other => unreachable!("find returned {other:?}"),
-            };
-            let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
-            let next = page.next;
-            out.extend(self.rows_from(&items)?);
-            match next {
-                Some(n) => after = Some(n),
-                None => return Ok(out),
-            }
-        }
+        let page = match self.hm().run(Input::Find {
+            needle: padded,
+            needle_len: needle.len() as u8,
+            after,
+        }) {
+            Output::FindDone { result: Ok(p) } => p,
+            Output::FindDone { result: Err(e) } => return Err(e.into()),
+            other => unreachable!("find returned {other:?}"),
+        };
+        let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+        let next = page.next;
+        Ok((self.rows_from(&items)?, next))
     }
 
     /// Text convenience over [`Db::find`].
@@ -927,7 +1032,7 @@ impl<S: Storage> Db<S> {
 
     /// How many rows you can read.
     pub fn len(&self) -> u64 {
-        self.host.engine.live_count()
+        self.h().engine.live_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -936,11 +1041,11 @@ impl<S: Storage> Db<S> {
 
     /// Capacity and dead-weight accounting.
     pub fn stats(&self) -> Stats {
-        let (slots, capacity) = self.host.engine.usage();
+        let (slots, capacity) = self.h().engine.usage();
         Stats {
-            live: self.host.engine.live_count(),
+            live: self.h().engine.live_count(),
             slots,
-            dead: self.host.engine.dead_slots(),
+            dead: self.h().engine.dead_slots(),
             capacity,
         }
     }
@@ -948,7 +1053,7 @@ impl<S: Storage> Db<S> {
     /// True when this database was opened in salvage mode and some rows
     /// could not be verified.
     pub fn is_degraded(&self) -> bool {
-        self.host.engine.is_degraded()
+        self.h().engine.is_degraded()
     }
 
     /// What recovery found when this database was opened. Check
@@ -956,7 +1061,7 @@ impl<S: Storage> Db<S> {
     /// acknowledged writes were lost to a fault outside the design's
     /// budget, and the on-disk evidence survived to prove it.
     pub fn recovery_report(&self) -> RecoveryReport {
-        self.host.engine.recovery_report()
+        self.h().engine.recovery_report()
     }
 
     /// The database's bytes, right now — whatever backend it lives on.
@@ -970,8 +1075,8 @@ impl<S: Storage> Db<S> {
     pub fn snapshot(&mut self) -> Result<Snapshot, Error> {
         use dabqlite_core::FileId;
         let mut read_all = |file| -> Result<Vec<u8>, Error> {
-            let len = self.host.storage.len(file).map_err(io_err)?;
-            self.host.storage.read(file, 0, len).map_err(io_err)
+            let len = self.hm().storage.len(file).map_err(io_err)?;
+            self.hm().storage.read(file, 0, len).map_err(io_err)
         };
         Ok(Snapshot {
             superblock: read_all(FileId::Superblock)?,
