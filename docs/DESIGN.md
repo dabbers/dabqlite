@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Three of these have since been decided by building the thing. They are kept
+Four of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -421,6 +421,18 @@ part worth reading.
 - **Which hard index ships in v1** — DECIDED: trigram, for the reason §4.6
   gives. Its oracle is exact, and every other index in this project is held
   to equality against an oracle.
+- **Whether a transaction can read** — DECIDED: it can assert, which is the
+  part that matters, and it costs nothing. A batch may carry `Expect { id,
+  value }`, checked against the state the batch's earlier ops would leave
+  and refusing the whole batch if the row holds anything else. That is
+  compare-and-set, and it is what read-then-write needs to be safe: "claim
+  the head of the queue if it is still pending" stops being a `get` and a
+  `put` with a gap between them. A general read returning bytes INTO the
+  batch was considered and rejected — it would need somewhere to put the
+  answer, which means either a result buffer in the commit protocol or a
+  stored procedure, and neither is worth what an assertion already buys.
+  An assertion stages no row, so a batch of nothing but assertions
+  performs no I/O at all.
 
 Still open:
 
