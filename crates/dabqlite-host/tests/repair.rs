@@ -140,7 +140,9 @@ fn a_damaged_database_is_rebuilt_clean_and_the_loss_is_reported() {
     assert_eq!(host.engine.quarantined(), 0);
     for i in 0..N {
         let got = match host.get(i) {
-            Output::GetDone { result: Ok(v), .. } => v.map(|w| w.bytes),
+            Output::GetDone { result: Ok(v), .. } => {
+                v.map(|w| <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value"))
+            }
             other => panic!("get {i}: {other:?}"),
         };
         if i == 7 {
@@ -527,7 +529,9 @@ fn rebuilding_compacts_away_deleted_rows_and_their_tombstones() {
     );
     for i in 0..N {
         let got = match host.get(i) {
-            Output::GetDone { result: Ok(v), .. } => v.map(|w| w.bytes),
+            Output::GetDone { result: Ok(v), .. } => {
+                v.map(|w| <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value"))
+            }
             other => panic!("get {i}: {other:?}"),
         };
         if survivors.contains(&i) {

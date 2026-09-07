@@ -236,7 +236,7 @@ fn salvage_and_repair_at_a_hundred_thousand_rows() {
             assert!(got.is_none(), "row {id} was resurrected");
         } else {
             assert_eq!(
-                got.map(|w| w.bytes),
+                got.map(|w| <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value")),
                 Some(value_for(id)),
                 "rebuilt row {id}"
             );

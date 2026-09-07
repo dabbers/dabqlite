@@ -107,7 +107,9 @@ fn atomicity_no_observer_ever_sees_a_partial_write() {
             assert_eq!(scanned.len() as u64, n, "[{ctx}] scan vs count");
             if let Some((id, value)) = in_flight {
                 let via_get = match rec.run_input(get_record(id)) {
-                    Driven::Done(Output::GetDone { result: Ok(v), .. }) => v.map(|w| w.bytes),
+                    Driven::Done(Output::GetDone { result: Ok(v), .. }) => v.map(|w| {
+                        <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value")
+                    }),
                     other => panic!("[{ctx}] {other:?}"),
                 };
                 let via_scan = scanned.iter().find(|&&(k, _)| k == id).map(|&(_, v)| v);

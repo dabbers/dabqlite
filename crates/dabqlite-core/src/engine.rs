@@ -153,6 +153,15 @@ pub enum DbError {
 /// in object storage with a reference stored here (docs/DESIGN.md §4.5).
 pub const MAX_VALUE_LEN: usize = VALUE_LEN * MAX_COMMIT_ROWS;
 
+/// Bytes one [`ValueWindow`] can carry: sixteen row slots.
+///
+/// A value is read one window at a time, so this is how many protocol
+/// round trips a read costs — a 2 KiB value was 128 of them when a window
+/// was one row wide, and is 8 now. Wider than that buys little and costs
+/// every `Output` the space, since the whole enum is as large as its
+/// largest variant and a range page is already this size.
+pub const WINDOW_LEN: usize = 16 * VALUE_LEN;
+
 /// A bounded window onto a value, which may be longer than one row.
 ///
 /// Reads are windowed rather than whole because every buffer the core
@@ -167,8 +176,8 @@ pub struct ValueWindow {
     /// Where this window starts within the value.
     pub offset: u32,
     /// Bytes valid in `bytes`.
-    pub len: u8,
-    pub bytes: [u8; VALUE_LEN],
+    pub len: u16,
+    pub bytes: [u8; WINDOW_LEN],
 }
 
 impl ValueWindow {
@@ -183,7 +192,7 @@ impl ValueWindow {
         (end < self.total).then_some(end)
     }
     /// The whole value, when it fits in one window. `None` means the
-    /// value is longer than a row and the caller must read the rest —
+    /// value is longer than a window and the caller must read the rest —
     /// deliberately not a truncated `&[u8]`, so a prefix cannot be
     /// mistaken for the value.
     pub fn whole(&self) -> Option<&[u8]> {
@@ -3156,27 +3165,32 @@ impl Engine {
             "a window must start on a slot boundary"
         );
         let skip = offset as usize / VALUE_LEN;
+        let mut window = ValueWindow {
+            total,
+            offset,
+            len: 0,
+            bytes: [0; WINDOW_LEN],
+        };
         if skip as u64 >= rows {
             // Reading exactly at the end is an empty final window rather
             // than an error; reading past it is the caller's mistake, and
             // an empty window is still the honest answer.
-            return Some(ValueWindow {
-                total,
-                offset,
-                len: 0,
-                bytes: [0; VALUE_LEN],
-            });
+            return Some(window);
         }
-        let off = ((head_row as usize) + skip) * ROW_SIZE;
-        let slot =
-            decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
-        debug_assert_eq!(slot.id, id, "the index must point at the row it claims");
-        Some(ValueWindow {
-            total,
-            offset,
-            len: slot.len,
-            bytes: slot.value,
-        })
+        // As many slots as the window holds, so a value is read in
+        // `ceil(rows / 16)` round trips rather than `rows` of them.
+        let take = (rows - skip as u64).min((WINDOW_LEN / VALUE_LEN) as u64);
+        for k in 0..take {
+            let off = ((head_row as usize) + skip + k as usize) * ROW_SIZE;
+            let slot =
+                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            debug_assert_eq!(slot.id, id, "the index must point at the row it claims");
+            let at = window.len as usize;
+            window.bytes[at..at + slot.len as usize]
+                .copy_from_slice(&slot.value[..slot.len as usize]);
+            window.len += slot.len as u16;
+        }
+        Some(window)
     }
 
     /// A scan-result reference for the value living at `head_row`.
@@ -3366,11 +3380,13 @@ mod tests {
 
     /// The window a full-width value comes back in.
     fn win(b: u8) -> ValueWindow {
+        let mut bytes = [0u8; WINDOW_LEN];
+        bytes[..VALUE_LEN].copy_from_slice(&val(b));
         ValueWindow {
             total: VALUE_LEN as u32,
             offset: 0,
-            len: VALUE_LEN as u8,
-            bytes: val(b),
+            len: VALUE_LEN as u16,
+            bytes,
         }
     }
 

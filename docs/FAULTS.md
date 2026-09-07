@@ -315,6 +315,7 @@ to, and a damaged stranger costs only itself.
 | I/O failure at every boundary of a long write | exhaustive | `long_values.rs` | same, after a fail-stop and restart |
 | A damaged continuation, at every position in a value | exhaustive | `long_values.rs` | strict open refuses by name; salvage quarantines exactly that value's rows; its head refuses to be served alone; every neighbour is still exact |
 | Reading a value is LINEAR in its length | run-measurement count, 1..=128 slots | `long_values.rs` | one run measurement per read, not one per slot — the quadratic shape cost a key/value store 720 us for 2 KiB against 0.5 us for 16 bytes |
+| A read is a handful of round trips, not one per slot | window count, 1..=128 slots | `long_values.rs` | a window carries sixteen slots, so a 2 KiB value is eight windows rather than 128 |
 | A damaged row after a SHORT value | pinned | `long_values.rs` | costs exactly one row — the complement that makes the CONTINUES bit worth its byte |
 | A head promising a continuation the file does not have | pinned | `long_values.rs` | refused as `TRUNCATED_VALUE`, never served short |
 | A substring straddling a slot seam | pinned, before and after restart | `long_values.rs`, `trigram.rs` | found like any other; scans do not go quietly incomplete |

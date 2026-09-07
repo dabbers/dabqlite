@@ -34,7 +34,9 @@ fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, Db
     match host.run_input(get_record(id)) {
         // This surface writes full-width values, so one window is the
         // whole value.
-        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| v.map(|w| w.bytes)),
+        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| {
+            v.map(|w| <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value"))
+        }),
         other => panic!("get_record({id}) did not complete: {other:?}"),
     }
 }

@@ -361,6 +361,7 @@ impl SimHost {
                     | Input::Update { .. }
                     | Input::Delete { .. }
                     | Input::Get { .. }
+                    | Input::GetFrom { .. }
                     | Input::Range { .. }
                     | Input::RangeRev { .. }
                     | Input::Find { .. }
@@ -396,7 +397,7 @@ impl SimHost {
             window.total as usize, VALUE_LEN,
             "get() is for full-width values; use get_bytes for id {id}"
         );
-        Some(window.bytes)
+        Some(<[u8; VALUE_LEN]>::try_from(window.payload()).expect("full-width value"))
     }
 
     /// The WHOLE value of `id`, however many slots it occupies, assembled

@@ -532,6 +532,41 @@ fn reading_a_value_measures_its_run_once_not_once_per_slot() {
         );
     }
 
+    // And a read is a handful of round trips, not one per slot: a window
+    // carries sixteen slots, so 2 KiB is eight calls rather than 128.
+    for (i, &len) in sizes.iter().enumerate() {
+        let mut windows = 0usize;
+        let first = match host.run_input(Input::Get { id: i as u64 }) {
+            Driven::Done(Output::GetDone {
+                result: Ok(Some(w)),
+                ..
+            }) => w,
+            other => panic!("{other:?}"),
+        };
+        windows += 1;
+        let mut next = first.next_offset();
+        while let Some(offset) = next {
+            let w = match host.run_input(Input::GetFrom {
+                id: i as u64,
+                offset,
+            }) {
+                Driven::Done(Output::GetDone {
+                    result: Ok(Some(w)),
+                    ..
+                }) => w,
+                other => panic!("{other:?}"),
+            };
+            windows += 1;
+            next = w.next_offset();
+        }
+        let slots = len.div_ceil(VALUE_LEN).max(1);
+        assert_eq!(
+            windows,
+            slots.div_ceil(dabqlite_core::WINDOW_LEN / VALUE_LEN),
+            "a {len}-byte value ({slots} slots) took {windows} windows"
+        );
+    }
+
     // The property that was actually broken: cost per SLOT must not grow
     // with the number of slots.
     let short = {

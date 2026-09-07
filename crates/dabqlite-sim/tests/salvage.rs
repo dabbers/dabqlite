@@ -55,7 +55,9 @@ fn open_salvage(disk: SimDisk) -> (SimHost, Result<u64, DbError>) {
 fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, DbError> {
     match host.run_input(Input::Get { id }) {
         // These suites write full-width values, so one window is whole.
-        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| v.map(|w| w.bytes)),
+        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| {
+            v.map(|w| <[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value"))
+        }),
         other => panic!("get: {other:?}"),
     }
 }

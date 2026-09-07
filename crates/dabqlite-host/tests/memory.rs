@@ -76,7 +76,7 @@ fn get_ok<S: Storage>(host: &mut Host<S>, id: u64) -> Option<[u8; VALUE_LEN]> {
             ..
         } => {
             assert_eq!(w.total as usize, VALUE_LEN, "unexpected value length");
-            Some(w.bytes)
+            Some(<[u8; VALUE_LEN]>::try_from(w.payload()).expect("full-width value"))
         }
         Output::GetDone {
             result: Ok(None), ..
