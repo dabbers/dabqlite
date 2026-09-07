@@ -360,6 +360,12 @@ pub enum Error {
     /// genuinely full of live rows, and the only way on is to reopen with
     /// a larger capacity.
     Full { capacity: u64, dead: u64 },
+    /// A [`Db::refresh`] cannot be applied: the files are not a
+    /// continuation of what this handle holds. A compaction swapped the
+    /// database out from under the reader, or commits went missing.
+    /// Reopen — merging two histories is not something the library will
+    /// guess at.
+    Diverged,
     /// The capacity asked for at open is smaller than the data already on
     /// disk. Reopen with at least `required`.
     ///
@@ -434,6 +440,12 @@ impl core::fmt::Display for Error {
         match self {
             Error::NotFound { id } => write!(f, "no row with id {id}"),
             Error::AlreadyExists { id } => write!(f, "row {id} already exists"),
+            Error::Diverged => write!(
+                f,
+                "this handle cannot be refreshed onto the database it is \
+                 reading: the files are not a continuation of what it holds. \
+                 Reopen it"
+            ),
             Error::Full { capacity, dead: 0 } => write!(
                 f,
                 "database is full at its declared capacity of {capacity} rows, and \
@@ -510,6 +522,7 @@ impl From<DbError> for Error {
         match e {
             DbError::NotFound { id } => Error::NotFound { id },
             DbError::DuplicateId { id } => Error::AlreadyExists { id },
+            DbError::Diverged => Error::Diverged,
             DbError::Full { capacity, dead, .. } => Error::Full { capacity, dead },
             DbError::Degraded { quarantined } => Error::Degraded { quarantined },
             DbError::Corrupt { what } => Error::Corrupt { what },
@@ -1696,6 +1709,50 @@ impl<S: Storage> Db<S> {
             slots,
             dead: self.h().engine.dead_slots(),
             capacity,
+        }
+    }
+
+    /// Catch this handle up on commits made since it opened, and return
+    /// how many row slots it gained.
+    ///
+    /// A reader sees the generation it opened on and nothing after it.
+    /// That is what makes a read lock-free and a scan self-consistent —
+    /// and it is also why every sample application that wanted a live
+    /// view ended up closing and reopening the database in a loop, paying
+    /// a full replay of every committed row to learn about three new
+    /// ones.
+    ///
+    /// This is that, incrementally. It re-reads the superblock and, if
+    /// the writer has moved on, reads and replays ONLY the rows appended
+    /// since. Rows already held are immutable — the file is append-only
+    /// within a generation lineage — so applying the tail applies
+    /// history, and it is the same replay recovery performs, from the
+    /// same code, for exactly that reason.
+    ///
+    /// `Ok(0)` means the writer has committed nothing new. Three answers
+    /// are refusals rather than failures, and each says to do something
+    /// different:
+    ///
+    /// - [`Error::Diverged`] — the files are not a continuation of what
+    ///   this handle holds (a compaction swapped the database out, or
+    ///   commits went missing). Reopen.
+    /// - [`Error::CapacityTooSmall`] — the writer grew past this
+    ///   handle's arenas. [`Db::grow`] first, then refresh.
+    /// - [`Error::Degraded`] — this handle was salvaged, and some of what
+    ///   it holds could not be verified, so there is no honest
+    ///   incremental answer over it.
+    ///
+    /// In all three the handle keeps the view it already had and keeps
+    /// answering: a refresh that cannot advance is not a failure of what
+    /// is already there.
+    ///
+    /// It writes nothing. A reader takes no lock and modifies no byte,
+    /// before or after.
+    pub fn refresh(&mut self) -> Result<u64, Error> {
+        match self.hm().refresh().map_err(io_err::<S>)? {
+            Output::RefreshDone { result: Ok(n) } => Ok(n),
+            Output::RefreshDone { result: Err(e) } => Err(e.into()),
+            other => unreachable!("refresh returned {other:?}"),
         }
     }
 

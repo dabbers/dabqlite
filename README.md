@@ -51,7 +51,8 @@ prefix scans off an index instead of a scan and a sort; substring search
 that can be anchored to either end or both; values of any length up to 2
 KiB; atomic
 multi-write batches, with compare-and-set inside them; lock-free readers
-alongside the single writer, and reads that take `&self`; a declared memory
+alongside the single writer, and reads that take `&self`, catching up on
+new commits incrementally rather than by reopening; a declared memory
 ceiling recorded in the database itself, raisable in place on an open handle
 when a database fills up; three interchangeable backends
 (POSIX files, in-memory, browser OPFS) proven to write byte-identical

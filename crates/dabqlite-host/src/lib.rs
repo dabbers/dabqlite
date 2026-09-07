@@ -145,6 +145,20 @@ impl<S: Storage> Host<S> {
         }))
     }
 
+    /// Catch an open handle up on commits made since it opened.
+    ///
+    /// Re-reads the superblock and, if the writer has moved on, reads and
+    /// replays only the rows appended since — not the whole file. `Err`
+    /// is only possible for the two size probes, exactly as for `open`.
+    pub fn refresh(&mut self) -> Result<Output, S::Error> {
+        let superblock_len = self.storage.len(FileId::Superblock)?;
+        let rows_len = self.storage.len(FileId::Rows)?;
+        Ok(self.drive(Input::Refresh {
+            superblock_len,
+            rows_len,
+        }))
+    }
+
     pub fn insert(&mut self, id: u64, value: [u8; dabqlite_core::VALUE_LEN]) -> Output {
         self.drive(Input::Insert { id, value })
     }

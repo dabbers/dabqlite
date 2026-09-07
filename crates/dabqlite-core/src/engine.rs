@@ -109,6 +109,13 @@ pub enum DbError {
     /// The configured capacity is smaller than the committed data already
     /// on disk. Reopen with at least `required` rows.
     CapacityBelowData { required: u64, configured: u64 },
+    /// A refresh cannot be applied to this handle, because the files it
+    /// is reading are not a continuation of what it already holds: a
+    /// generation or row count that went BACKWARDS. A compaction swapped
+    /// the database out from under the reader, or something outside the
+    /// design's budget took commits away. Merging two histories is not
+    /// something this engine will guess at; reopen instead.
+    Diverged,
     /// On-disk state violates an invariant the commit protocol guarantees.
     /// A strict `Open` refuses such a file outright; `OpenSalvage` opens it
     /// read-only with the damaged rows quarantined, so one bad row costs
@@ -496,6 +503,23 @@ pub enum Input<'a> {
     /// multiple of the row width — the boundaries `Get` and earlier
     /// windows hand back — so a window never straddles two slots.
     GetFrom { id: u64, offset: u32 },
+    /// Client: catch up on commits made since this handle opened.
+    ///
+    /// A reader sees the generation it opened on and nothing after it,
+    /// which is what makes a read lock-free and a scan self-consistent.
+    /// Getting a later view meant closing the database and opening it
+    /// again — a full replay of every committed row, to learn about three
+    /// new ones.
+    ///
+    /// This is that, incrementally: re-read the superblock, and if the
+    /// writer has moved on, read and replay ONLY the rows appended since.
+    /// Rows already held are immutable — the file is append-only within a
+    /// generation lineage — so applying the tail is applying history, the
+    /// same history recovery would replay from the beginning.
+    ///
+    /// The lengths are the host's, as at `Open`: this is a read of files
+    /// that may have grown since.
+    Refresh { superblock_len: u64, rows_len: u64 },
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
     /// call. Continue by re-issuing with `lo = page.next`.
     Range { lo: u64, hi: u64 },
@@ -597,6 +621,10 @@ pub enum Output {
     },
     /// Range page finished (pure in-memory, always immediate).
     RangeDone { result: Result<RangePage, DbError> },
+    /// Terminal for [`Input::Refresh`]: how many row slots the reader
+    /// gained, or why it could not advance. `Ok(0)` means the writer has
+    /// committed nothing new.
+    RefreshDone { result: Result<u64, DbError> },
     /// Find page finished (pure in-memory, always immediate).
     FindDone { result: Result<FindPage, DbError> },
     /// Offline migration finished (docs/DESIGN.md §4.8). `Ok(n)` = the
@@ -657,6 +685,11 @@ enum State {
     InitFsyncSb,
     /// Recovery: superblock zone read in flight.
     RecoverReadSb,
+    /// Refresh: superblock zone read in flight, on a database that is
+    /// already open and will still be open whatever the answer is.
+    RefreshReadSb,
+    /// Refresh: read of the rows appended since this handle last looked.
+    RefreshReadRows { generation: u64, row_count: u64 },
     /// Recovery: committed-rows read in flight.
     RecoverReadRows { generation: u64, row_count: u64 },
     /// Recovery: TRUNCATE of the rows file in flight, dropping everything
@@ -1350,6 +1383,10 @@ impl Engine {
             Input::Update { id, value } => self.on_update(id, value),
             Input::Delete { id } => self.on_delete(id),
             Input::Batch { ops } => self.on_batch(ops),
+            Input::Refresh {
+                superblock_len,
+                rows_len,
+            } => self.on_refresh(superblock_len, rows_len),
             Input::Get { .. }
             | Input::GetFrom { .. }
             | Input::Range { .. }
@@ -1461,6 +1498,17 @@ impl Engine {
     fn on_read_done(&mut self, file: FileId, data: &[u8]) -> Output {
         match (self.state, file) {
             (State::RecoverReadSb, FileId::Superblock) => self.recover_from_sb(data),
+            (State::RefreshReadSb, FileId::Superblock) => self.refresh_from_sb(data),
+            (
+                State::RefreshReadRows {
+                    generation,
+                    row_count,
+                },
+                FileId::Rows,
+            ) => {
+                let base = self.row_count;
+                self.replay_rows(true, base, generation, row_count, data)
+            }
             (
                 State::RecoverReadRows {
                     generation,
@@ -1471,6 +1519,104 @@ impl Engine {
             (state, file) => {
                 panic!("protocol violation: ReadDone({file:?}) in state {state:?}")
             }
+        }
+    }
+
+    /// Begin a refresh: read the superblock zone and see whether the
+    /// writer has moved on.
+    fn on_refresh(&mut self, superblock_len: u64, rows_len: u64) -> Output {
+        match self.state {
+            State::Ready => {}
+            // A degraded database has quarantined rows: some of what it
+            // holds could not be verified, so there is no honest
+            // incremental answer over it. Rebuild it, then read it.
+            State::Degraded => {
+                // Refused WITHOUT touching the state: a database that is
+                // degraded is still degraded afterwards, and a refusal
+                // that quietly promoted it to Ready would be worse than
+                // the thing it refused.
+                return Output::RefreshDone {
+                    result: Err(DbError::Degraded {
+                        quarantined: self.quarantined,
+                    }),
+                };
+            }
+            State::New => {
+                return Output::RefreshDone {
+                    result: Err(DbError::NotOpen),
+                }
+            }
+            State::Failed(e) => return Output::RefreshDone { result: Err(e) },
+            _ => {
+                return Output::RefreshDone {
+                    result: Err(DbError::Busy),
+                }
+            }
+        }
+        // The file cannot have shrunk below what this handle already
+        // holds. If it has, it is not the database this handle opened —
+        // a compaction swapped it, or something outside the design's
+        // budget took commits away — and the honest answer is "reopen",
+        // not a merge of two histories.
+        if rows_len < self.row_count * ROW_SIZE as u64 || superblock_len < SB_COPY_SIZE as u64 {
+            return Output::RefreshDone {
+                result: Err(DbError::Diverged),
+            };
+        }
+        self.state = State::RefreshReadSb;
+        Output::Read {
+            file: FileId::Superblock,
+            offset: 0,
+            len: (SB_COPIES * SB_COPY_SIZE) as u64,
+        }
+    }
+
+    /// The superblock came back. Decide whether there is anything to
+    /// replay, and if so ask for exactly the rows appended since.
+    fn refresh_from_sb(&mut self, data: &[u8]) -> Output {
+        let mut best: Option<crate::layout::SbCopy> = None;
+        for slot in 0..SB_COPIES {
+            let Some(chunk) = data.get(slot * SB_COPY_SIZE..(slot + 1) * SB_COPY_SIZE) else {
+                break;
+            };
+            if let Ok(copy) = decode_sb(chunk) {
+                if best.is_none_or(|b| copy.generation > b.generation) {
+                    best = Some(copy);
+                }
+            }
+        }
+        // Every copy unreadable is a damaged superblock, not a reason to
+        // serve a stale view as if it were current.
+        let Some(copy) = best else {
+            return self.fail_refresh(DbError::Corrupt {
+                what: crate::defect::SUPERBLOCK,
+            });
+        };
+        if copy.generation < self.generation || copy.row_count < self.row_count {
+            return self.fail_refresh(DbError::Diverged);
+        }
+        if copy.row_count == self.row_count {
+            // Nothing new. The generation may still have moved (a commit
+            // that only retired slots writes rows, so in practice it has
+            // not, but saying so costs nothing).
+            return self.finish_refresh(copy.generation.max(self.generation), self.row_count);
+        }
+        if copy.row_count > self.caps.rows {
+            // The writer grew past this reader's arenas. `grow` is the
+            // way through, and it is the caller's call to make.
+            return self.fail_refresh(DbError::CapacityBelowData {
+                required: copy.row_count,
+                configured: self.caps.rows,
+            });
+        }
+        self.state = State::RefreshReadRows {
+            generation: copy.generation,
+            row_count: copy.row_count,
+        };
+        Output::Read {
+            file: FileId::Rows,
+            offset: self.row_count * ROW_SIZE as u64,
+            len: (copy.row_count - self.row_count) * ROW_SIZE as u64,
         }
     }
 
@@ -1645,7 +1791,38 @@ impl Engine {
     }
 
     fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
-        let live = (row_count as usize) * ROW_SIZE;
+        self.replay_rows(false, 0, generation, row_count, data)
+    }
+
+    /// Replay committed rows `base..row_count` out of `data`, which
+    /// covers exactly that range starting at its first byte.
+    ///
+    /// An OPEN (`refreshing == false`) rebuilds every counter and index
+    /// from nothing and scans the tail past the manifest for rollback
+    /// evidence. A REFRESH — a reader catching up on commits made since
+    /// it last looked — leaves the state below `base` exactly as it is.
+    /// The two share this body rather than each having their own, because
+    /// a reader that applied a row differently from the way recovery
+    /// applies it would be a second definition of what the file means.
+    ///
+    /// Which of the two it is, is passed rather than derived from `base`.
+    /// A reader whose first refresh finds an empty database resumes at
+    /// row 0, and inferring the mode from that would have silently turned
+    /// its refresh into an open — which is exactly the bug this
+    /// parameter's existence prevents.
+    ///
+    /// A run never straddles `base`: a value is written whole inside one
+    /// commit and `base` is a commit boundary (it was some manifest's
+    /// `row_count`), so the range always begins at a head.
+    fn replay_rows(
+        &mut self,
+        refreshing: bool,
+        base: u64,
+        generation: u64,
+        row_count: u64,
+        data: &[u8],
+    ) -> Output {
+        let live = ((row_count - base) as usize) * ROW_SIZE;
         if data.len() < live {
             return self.fail_open(DbError::Corrupt {
                 what: "short read of committed rows",
@@ -1656,14 +1833,16 @@ impl Engine {
         // open quarantines just the damaged slot, so one bad row costs one
         // row. Either way a row is only ever SERVED after it verifies —
         // "never wrong" is not traded away for availability.
-        self.quarantined = 0;
-        self.live_count = 0;
-        self.retired = 0;
-        self.tombstones = 0;
-        self.chunks = 0;
-        self.dead_chunks = 0;
-        self.long_values = 0;
-        self.live_bits.fill(0);
+        if !refreshing {
+            self.quarantined = 0;
+            self.live_count = 0;
+            self.retired = 0;
+            self.tombstones = 0;
+            self.chunks = 0;
+            self.dead_chunks = 0;
+            self.long_values = 0;
+            self.live_bits.fill(0);
+        }
         // Rows already consumed as part of a value's run. A value is read
         // whole, at its head, so its continuations are not visited again.
         let mut skip_until = 0u64;
@@ -1672,11 +1851,11 @@ impl Engine {
         // replaying it in order replays history exactly. An id may be
         // inserted, deleted, and inserted again; the last word wins
         // because it is last.
-        for row in 0..row_count {
+        for row in base..row_count {
             if row < skip_until {
                 continue;
             }
-            let off = (row as usize) * ROW_SIZE;
+            let off = ((row - base) as usize) * ROW_SIZE;
             let chunk = &data[off..off + ROW_SIZE];
             // Pair assertion (docs/DESIGN.md §7.4): rows were verified when
             // encoded on the write path; verify again reading them back.
@@ -1700,12 +1879,12 @@ impl Engine {
                     // so a run that does not end where it promised is not
                     // one this engine wrote, and serving its head alone
                     // would be serving a value truncated.
-                    let extent = self.verify_run(data, row, row_count, &slot);
+                    let extent = self.verify_run(data, base, row, row_count, &slot);
                     let Some(rows) = extent else {
                         if self.salvage {
                             // The head and every continuation that was
                             // supposed to follow it are unreadable together.
-                            let broken = self.broken_run_len(data, row, row_count, &slot);
+                            let broken = self.broken_run_len(data, base, row, row_count, &slot);
                             for r in row..row + broken {
                                 self.quarantined += 1;
                                 self.trigram.skip_row(r);
@@ -1746,8 +1925,9 @@ impl Engine {
                         self.live_count += 1;
                     }
                     for r in row..row + rows {
-                        let o = (r as usize) * ROW_SIZE;
-                        self.arena[o..o + ROW_SIZE].copy_from_slice(&data[o..o + ROW_SIZE]);
+                        let dst = (r as usize) * ROW_SIZE;
+                        let src = ((r - base) as usize) * ROW_SIZE;
+                        self.arena[dst..dst + ROW_SIZE].copy_from_slice(&data[src..src + ROW_SIZE]);
                     }
                     self.bind_indices(id, row, row + rows);
                     self.set_live(row, true);
@@ -1789,8 +1969,9 @@ impl Engine {
                             what: crate::defect::ORPHAN_TOMBSTONE,
                         });
                     };
-                    let off = (row as usize) * ROW_SIZE;
-                    self.arena[off..off + ROW_SIZE].copy_from_slice(&data[off..off + ROW_SIZE]);
+                    let dst = (row as usize) * ROW_SIZE;
+                    let src = ((row - base) as usize) * ROW_SIZE;
+                    self.arena[dst..dst + ROW_SIZE].copy_from_slice(&data[src..src + ROW_SIZE]);
                     self.retire(record_row, row_count);
                     self.live_count -= 1;
                     self.tombstones += 1;
@@ -1799,6 +1980,13 @@ impl Engine {
                     self.trigram.skip_row(row);
                 }
             }
+        }
+        if refreshing {
+            // A reader writes nothing: no twin repair, no truncation, no
+            // fsync. It has also read exactly the manifest's rows, so
+            // there is no residue in `data` to judge — the rollback
+            // verdict belongs to whoever opened the database.
+            return self.finish_refresh(generation, row_count);
         }
         let scan = scan_orphans(&data[live..]);
         self.orphan_valid_rows = scan.valid;
@@ -1837,6 +2025,35 @@ impl Engine {
         Output::OpenDone {
             result: Ok(self.live_count),
         }
+    }
+
+    /// Publish a refresh: the reader now holds the writer's generation.
+    ///
+    /// Unlike `finish_open` this cannot change the degraded flag. A
+    /// refresh is refused outright on a degraded database (there is no
+    /// honest incremental answer over quarantined rows), so the mode it
+    /// started in is the mode it ends in.
+    fn finish_refresh(&mut self, generation: u64, row_count: u64) -> Output {
+        assert!(generation > 0, "committed generation must be positive");
+        debug_assert!(generation >= self.generation, "refresh went backwards");
+        let gained = row_count - self.row_count;
+        self.generation = generation;
+        self.row_count = row_count;
+        self.state = State::Ready;
+        Output::RefreshDone { result: Ok(gained) }
+    }
+
+    /// A refresh already in flight that cannot be completed.
+    ///
+    /// The reader goes back to the generation it already had, still
+    /// answering: this is a failure to ADVANCE, not a failure of what is
+    /// already held. `Ready` is the right state to return to because a
+    /// refresh is only ever started from `Ready` — every other case is
+    /// refused before the state moves. Only a damaged read fail-stops,
+    /// and that comes through `IoFailed` like any other.
+    fn fail_refresh(&mut self, err: DbError) -> Output {
+        self.state = State::Ready;
+        Output::RefreshDone { result: Err(err) }
     }
 
     fn fail_open(&mut self, err: DbError) -> Output {
@@ -2030,6 +2247,8 @@ impl Engine {
             | State::BatchWriteRow { .. }
             | State::BatchFsyncRows
             | State::BatchWriteSb { .. }
+            | State::RefreshReadSb
+            | State::RefreshReadRows { .. }
             | State::BatchFsyncSb => Some(DbError::Busy),
             // Salvage is strictly read-only: appending to a file we know is
             // damaged, and flipping the manifest over it, could only make a
@@ -2671,6 +2890,8 @@ impl Engine {
             State::DeleteWriteSb { .. } | State::DeleteFsyncSb => FileId::Superblock,
             State::BatchWriteRow { .. } | State::BatchFsyncRows => FileId::Rows,
             State::BatchWriteSb { .. } | State::BatchFsyncSb => FileId::Superblock,
+            State::RefreshReadSb => FileId::Superblock,
+            State::RefreshReadRows { .. } => FileId::Rows,
             state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
         };
         assert!(
@@ -2678,6 +2899,15 @@ impl Engine {
             "protocol violation: IoFailed({file:?}) but in-flight request targets {expected:?}"
         );
         match self.state {
+            // The exception to fail-stop, and it is not a weakening of
+            // it. Fail-stop exists because a half-done WRITE leaves the
+            // engine unable to say what is durable. A refresh writes
+            // nothing and changes nothing until it completes, so a failed
+            // read during one costs only the advance: the reader keeps
+            // the view it already held — which is in memory, was verified
+            // when it was built, and is not made doubtful by a later read
+            // failing — and says it could not move.
+            State::RefreshReadSb | State::RefreshReadRows { .. } => self.fail_refresh(err),
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
@@ -2785,6 +3015,8 @@ impl Engine {
             | State::BatchWriteRow { .. }
             | State::BatchFsyncRows
             | State::BatchWriteSb { .. }
+            | State::RefreshReadSb
+            | State::RefreshReadRows { .. }
             | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
@@ -2822,6 +3054,8 @@ impl Engine {
             | State::BatchWriteRow { .. }
             | State::BatchFsyncRows
             | State::BatchWriteSb { .. }
+            | State::RefreshReadSb
+            | State::RefreshReadRows { .. }
             | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
@@ -2866,6 +3100,8 @@ impl Engine {
             | State::BatchWriteRow { .. }
             | State::BatchFsyncRows
             | State::BatchWriteSb { .. }
+            | State::RefreshReadSb
+            | State::RefreshReadRows { .. }
             | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
@@ -2995,6 +3231,8 @@ impl Engine {
             | State::BatchWriteRow { .. }
             | State::BatchFsyncRows
             | State::BatchWriteSb { .. }
+            | State::RefreshReadSb
+            | State::RefreshReadRows { .. }
             | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
@@ -3167,6 +3405,7 @@ impl Engine {
     fn verify_run(
         &self,
         data: &[u8],
+        base: u64,
         head_row: u64,
         row_count: u64,
         head: &RowSlot,
@@ -3181,7 +3420,7 @@ impl Engine {
                 // than the value needs.
                 return None;
             }
-            let o = (r as usize) * ROW_SIZE;
+            let o = ((r - base) as usize) * ROW_SIZE;
             let slot = decode_row(&data[o..o + ROW_SIZE])?;
             if slot.kind != RowKind::Chunk || slot.id != head.id {
                 return None;
@@ -3202,7 +3441,14 @@ impl Engine {
     /// are unreadable together — the value they belong to cannot be
     /// served — so they are quarantined together rather than left behind
     /// as stranded chunks.
-    fn broken_run_len(&self, data: &[u8], head_row: u64, row_count: u64, head: &RowSlot) -> u64 {
+    fn broken_run_len(
+        &self,
+        data: &[u8],
+        base: u64,
+        head_row: u64,
+        row_count: u64,
+        head: &RowSlot,
+    ) -> u64 {
         let mut rows = 1u64;
         let mut more = head.more;
         while more && rows as usize <= MAX_COMMIT_ROWS {
@@ -3210,7 +3456,7 @@ impl Engine {
             if r >= row_count {
                 break;
             }
-            let o = (r as usize) * ROW_SIZE;
+            let o = ((r - base) as usize) * ROW_SIZE;
             match decode_row(&data[o..o + ROW_SIZE]) {
                 Some(slot) if slot.kind == RowKind::Chunk && slot.id == head.id => {
                     more = slot.more;

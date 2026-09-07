@@ -1010,3 +1010,23 @@ missing for a row it kept.
 | Paging | pinned | `value_order.rs` (both) | a page is bounded, the cursor advances, and paging returns exactly what scanning returns — in both directions |
 | A bound longer than any value can be | pinned | `value_order.rs` (facade) | refused by name, not answered with an empty page that looks like a result |
 | The prefix upper bound at the top of the byte range | pinned | `value_order.rs` (facade) | an all-`0xff` prefix has no upper bound, which the naive "append `0xff`" version gets silently wrong |
+
+## Catching a reader up
+
+`Db::refresh` is the one operation that makes a reader touch storage after
+opening, and it must not cost the reader what it already holds. The oracle
+throughout is the strongest one available: **a refreshed reader must be
+indistinguishable from a reader opened fresh at that moment** — not "has
+the right rows", indistinguishable, across every read the library offers,
+because the incremental replay and the full one are the same code.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| 60 rounds of writer traffic — puts, deletes, batches — with a refresh after each | randomized, seeded | `refresh.rs` | the refreshed reader's whole answer surface is byte-identical to a fresh reader's, every round; refreshing again with nothing new changes nothing |
+| Multi-slot values, at twelve different slot counts | pinned | `refresh.rs` | the tail a reader resumes at is always a value's HEAD, because a commit is atomic and a manifest's row count is therefore a commit boundary |
+| A fault at **every I/O boundary** of a refresh | exhaustive | `fault.rs` | the durable bytes never move; the reader ends on the old view or the new one, never a mixture; and it still answers either way |
+| A database swapped out from under the reader | pinned | `refresh.rs` | `Diverged`, not a merge of two histories — and the reader keeps what it held |
+| A manifest whose generation went backwards, row count unchanged | forged | `refresh.rs` | `Diverged` too: a restored older backup must not read as "already current" |
+| A writer that grew past the reader's arenas | pinned | `refresh.rs` | `CapacityTooSmall` naming both numbers, and `grow` catches the reader up on the way through |
+| A salvaged handle | pinned | `refresh.rs` | refused, and STILL DEGRADED afterwards — a refusal that quietly promoted it to healthy would be worse than what it refused |
+| Cost | byte count through a counting backend | `refresh.rs` | a refresh over a 2000-row database reads less than a twentieth of what its open read |

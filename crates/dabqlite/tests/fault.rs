@@ -21,7 +21,7 @@
 //! then reopens from a settled image rather than from the handle it was
 //! holding.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -110,7 +110,11 @@ struct FaultStorage {
     ops: Rc<RefCell<u64>>,
     /// Fail the operation with this index, and every one after it: a
     /// crashed process does not come back for the next call.
-    fail_from: Option<u64>,
+    ///
+    /// Shared and settable AFTER the backend has been handed to a `Db`,
+    /// because some sweeps arm a fault around one later operation — a
+    /// refresh, say — rather than around the open.
+    fail_from: Rc<Cell<Option<u64>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,15 +125,19 @@ impl FaultStorage {
         FaultStorage {
             images,
             ops: Rc::new(RefCell::new(0)),
-            fail_from: None,
+            fail_from: Rc::new(Cell::new(None)),
         }
     }
 
     fn failing_from(images: Rc<RefCell<Images>>, at: u64) -> Self {
-        FaultStorage {
-            fail_from: Some(at),
-            ..FaultStorage::new(images)
-        }
+        let s = FaultStorage::new(images);
+        s.fail_from.set(Some(at));
+        s
+    }
+
+    /// The switch, kept by a test that wants to arm the backend later.
+    fn control(&self) -> (Rc<Cell<Option<u64>>>, Rc<RefCell<u64>>) {
+        (Rc::clone(&self.fail_from), Rc::clone(&self.ops))
     }
 
     fn count(&self) -> u64 {
@@ -141,7 +149,7 @@ impl FaultStorage {
         let mut n = self.ops.borrow_mut();
         let at = *n;
         *n += 1;
-        self.fail_from.is_some_and(|from| at >= from)
+        self.fail_from.get().is_some_and(|from| at >= from)
     }
 }
 
@@ -666,5 +674,79 @@ fn a_fault_at_every_boundary_of_a_grow_costs_nothing() {
     assert!(
         failures > 0 && successes > 0,
         "the sweep must see both outcomes, saw {successes} ok and {failures} failed"
+    );
+}
+
+/// **A refresh performs no write either, so a fault during one cannot
+/// cost a byte — and cannot cost the reader what it already held.**
+///
+/// The reader is the half of this library that takes no lock and modifies
+/// nothing, and catching it up is the one operation that makes it touch
+/// storage after opening. This sweeps a failure over every I/O boundary
+/// of a refresh and holds three things at each: the durable bytes do not
+/// move; the call either advances the reader to the writer's view or
+/// leaves it on the one it had, never a mixture; and whichever happened,
+/// the reader still answers.
+#[test]
+fn a_fault_at_every_boundary_of_a_refresh_costs_nothing() {
+    let mut advanced = 0usize;
+    let mut refused = 0usize;
+    for boundary in 0..16u64 {
+        let images = fresh();
+        // One handle writes; a second reads the same images, the way two
+        // processes or two workers share a database.
+        let mut writer = open(&images);
+        for id in 0..6u64 {
+            writer.put(id, v(id, 8)).expect("put");
+        }
+        let reader =
+            Db::with_storage(FaultStorage::new(Rc::clone(&images)), ROWS).expect("reader opens");
+        let old_view = model(&reader);
+        assert_eq!(old_view.len(), 6);
+
+        // New commits the reader knows nothing about, including a value
+        // spanning several slots so the tail it reads is a real run.
+        for id in 6..10u64 {
+            writer.put(id, v(id, VALUE_LEN * 3 + 5)).expect("put");
+        }
+        let new_view = model(&writer);
+        let durable_before = images.borrow().durable.clone();
+
+        // Re-open the reader with storage armed to fail from `boundary`,
+        // positioned exactly where it was.
+        drop(reader);
+        let backend = FaultStorage::new(Rc::clone(&images));
+        let (switch, ops) = backend.control();
+        let mut reader = Db::with_storage(backend, ROWS).expect("reader opens");
+        // Arm the fault around the REFRESH, not around the open: the
+        // counter restarts here, so `boundary` indexes the refresh's own
+        // I/O.
+        *ops.borrow_mut() = 0;
+        switch.set(Some(boundary));
+        match reader.refresh() {
+            Ok(_) => {
+                advanced += 1;
+                assert_eq!(model(&reader), new_view, "an advanced reader is behind");
+            }
+            Err(_) => {
+                refused += 1;
+                // It kept SOMETHING coherent — either the old view or the
+                // new one, never a half-applied commit.
+                let got = model(&reader);
+                assert!(
+                    got == old_view || got == new_view,
+                    "boundary {boundary}: a refresh left a mixture"
+                );
+            }
+        }
+        assert_eq!(
+            images.borrow().durable,
+            durable_before,
+            "boundary {boundary}: a refresh made a durable change"
+        );
+    }
+    assert!(
+        advanced > 0 && refused > 0,
+        "the sweep must see both outcomes, saw {advanced} advanced and {refused} refused"
     );
 }

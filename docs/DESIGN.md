@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Seven of these have since been decided by building the thing. They are kept
+Eight of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -489,6 +489,33 @@ part worth reading.
   An assertion stages no row, so a batch of nothing but assertions
   performs no I/O at all.
 
+- **What a reader does about commits made after it opened** — DECIDED: it
+  catches up incrementally, and the incremental replay is the recovery
+  replay. A reader sees the generation it opened on and nothing after it,
+  which is what makes a read lock-free and a scan self-consistent; the
+  cost was that a live view meant closing and reopening in a loop, paying
+  a full replay of every committed row to learn about three new ones.
+  `Db::refresh` re-reads the superblock and, if the writer has moved on,
+  reads and replays ONLY the rows appended since. Rows already held are
+  immutable — the file is append-only within a generation lineage — so
+  applying the tail applies history. The load-bearing decision is that
+  this shares `replay_rows` with recovery rather than having a reader's
+  own version of it: a reader that applied a row differently from the way
+  recovery applies it would be a SECOND definition of what the file
+  means, and the whole design rests on there being one.
+  Three answers are refusals rather than failures, each pointing
+  somewhere different: `Diverged` (the files are not a continuation of
+  what this handle holds — a compaction swapped the database out, or
+  commits went missing; reopen), `CapacityTooSmall` (the writer grew past
+  this handle's arenas; grow, then refresh), and `Degraded` (this handle
+  was salvaged and holds rows it could not verify, so there is no honest
+  incremental answer). In all three the handle keeps the view it had and
+  keeps answering.
+  A failed READ during a refresh is the one exception to fail-stop, and
+  not a weakening of it: fail-stop exists because a half-done WRITE
+  leaves the engine unable to say what is durable, and a refresh writes
+  nothing. The reader keeps a view that was verified when it was built
+  and is not made doubtful by a later read failing.
 - **What happens when a database fills up** — DECIDED: it grows, on the
   handle that is open, and the static-allocation rule survives intact.
   Capacity is what every arena is sized from (§4.2), so it was fixed for

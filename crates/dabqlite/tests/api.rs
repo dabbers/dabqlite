@@ -545,6 +545,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             max: MAX_VALUE_LEN,
         },
         Error::Mismatch { id: 12 },
+        Error::Diverged,
     ];
     // Every variant must appear above. This match exists to break the
     // build when a new one is added: a variant with no case here is a
@@ -564,6 +565,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
         "Io",
         "BatchTooLong",
         "BatchRejected",
+        "Diverged",
     ];
     fn covered(e: &Error) -> &'static str {
         match e {
@@ -581,6 +583,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             Error::Io { .. } => "Io",
             Error::BatchTooLong { .. } => "BatchTooLong",
             Error::BatchRejected { .. } => "BatchRejected",
+            Error::Diverged => "Diverged",
         }
     }
     // Every variant must appear at least once. `covered` breaks the build

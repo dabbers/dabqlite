@@ -73,6 +73,11 @@ pub mod defect {
     /// silently cut short, so the whole value goes instead.
     pub const TRUNCATED_VALUE: &str =
         "value continuation missing or damaged (reopen in salvage mode to read the rest)";
+    /// Every copy of the superblock is unreadable. Distinct from a
+    /// damaged row: without the manifest there is no committed state to
+    /// speak of at all.
+    pub const SUPERBLOCK: &str =
+        "no readable superblock copy (reopen in salvage mode to read the rest)";
     /// Two committed rows claim the same primary key.
     pub const DUPLICATE_ID: &str =
         "duplicate id among committed rows (reopen in salvage mode to read the rest)";
