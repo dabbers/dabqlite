@@ -941,6 +941,70 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Looking at a database must not change it — including the one thing
+/// that only exists until someone looks.
+///
+/// A commit interrupted by a crash leaves checksum-valid rows past the
+/// manifest. The first read-WRITE open truncates them, which is what
+/// keeps the next open's claim rule sound; but it also means the evidence
+/// is consumed by whoever opens first. A monitoring probe, a `stat`
+/// command, an operator having a look — any of them would silently disarm
+/// the alarm for the process that actually needed it.
+///
+/// A read-only open leaves no next state to keep sound, so it truncates
+/// nothing. Two things follow: it can open a database that crashed
+/// mid-commit at all (it would otherwise be refused a truncate it must
+/// not perform, and fail-stop on the spot), and the evidence survives
+/// being read.
+#[cfg(unix)]
+#[test]
+fn a_read_only_open_does_not_consume_the_evidence_of_an_interrupted_commit() {
+    let dir = scratch("residue-readonly");
+    let superblock = {
+        let mut db = Db::open(&dir).expect("open");
+        for i in 0..3u64 {
+            db.insert(i, Value::from_text("committed").unwrap())
+                .unwrap();
+        }
+        // The manifest as it stands with three rows committed.
+        std::fs::read(dir.join("superblock.dabq")).expect("superblock")
+    };
+    {
+        let mut db = Db::open(&dir).expect("reopen");
+        db.insert(99, Value::from_text("interrupted").unwrap())
+            .unwrap();
+    }
+    // Rewind the manifest over the fourth row: exactly the state a crash
+    // between the row fsync and the superblock flip leaves behind.
+    std::fs::write(dir.join("superblock.dabq"), &superblock).expect("rewind");
+
+    // Read-only, twice: the same answer both times, and no writer lock.
+    for pass in 0..2 {
+        let db = Db::read_only(&dir).expect("read-only open");
+        assert_eq!(db.len(), 3, "pass {pass}");
+        assert_eq!(
+            db.recovery_report().orphan_valid_rows,
+            1,
+            "pass {pass}: reading the database consumed the evidence"
+        );
+        assert!(!db.recovery_report().rollback_evidence);
+    }
+
+    // The read-write open still sees it, and only then is it cleared.
+    {
+        let db = Db::open(&dir).expect("open");
+        assert_eq!(db.recovery_report().orphan_valid_rows, 1);
+        assert_eq!(db.len(), 3);
+    }
+    let db = Db::open(&dir).expect("open");
+    assert_eq!(
+        db.recovery_report().orphan_valid_rows,
+        0,
+        "the residue is gone once a writer has recovered past it"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A database remembers how big it was declared, so reopening it does not
 /// have to be told again.
 ///

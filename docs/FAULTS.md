@@ -41,6 +41,17 @@ degrades in a fixed, tested order — never to silence:
    `Engine::recovery_report()` raises `rollback_evidence` (deep-rollback
    test: 6 lost commits with surviving rows ⇒ flagged, mutation-verified).
    Hosts should treat that flag as an alarm.
+
+   The alarm is **read once**. Recovery truncates the residue before it
+   makes anything durable — that is what lets the next open read one
+   commit's worth of slots rather than two — so the process that opens
+   read-write first is the only one that sees it, and a host that wants a
+   durable alarm has to record it at that moment. Looking does not have
+   to cost the alarm: a read-only or salvage open (`Db::read_only`,
+   `Db::salvage`) changes nothing, truncates nothing, and reports the
+   same numbers, so a monitoring probe can read the evidence without
+   disarming it for the process that needed it
+   (`a_read_only_open_does_not_consume_the_evidence_of_an_interrupted_commit`).
 4. **Silent only when physics wins**: a rollback is undetectable only when
    *no* distinguishing bit survives on the platter — at which point the
    state is indistinguishable, by any observer, from the commits never

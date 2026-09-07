@@ -636,14 +636,28 @@ enum State {
 pub struct RecoveryReport {
     /// Committed rows recovered.
     pub row_count: u64,
-    /// Checksum-valid rows found beyond the manifest. Exactly one is the
-    /// normal artifact of an insert that was in flight (never acknowledged)
-    /// at a crash. Two or more cannot arise that way.
+    /// Checksum-valid rows found beyond the manifest — the slots of a
+    /// commit that was in flight, and never acknowledged, when a crash
+    /// hit. They all belong to one commit, so they all agree about where
+    /// it ended.
+    ///
+    /// READ ONCE, on this open. A read-write open truncates them (which
+    /// is what keeps the next open's claim rule sound), so the process
+    /// that opens first is the only one that sees them. A read-only or
+    /// salvage open changes nothing and therefore consumes nothing — that
+    /// is the way to look without disarming the alarm for whoever comes
+    /// next.
     pub orphan_valid_rows: u64,
-    /// True when the orphan count proves at least one *acknowledged* commit
-    /// was rolled back by an out-of-budget fault (lying fsync). The
-    /// recovered prefix is still exactly correct; what follows it is gone,
-    /// and this flag is the loud version of that fact.
+    /// True when those slots DISAGREE about where their commit ended, so
+    /// they cannot be one commit — proof that at least one *acknowledged*
+    /// commit was rolled back by an out-of-budget fault (a lying fsync).
+    /// The recovered prefix is still exactly correct; what followed it is
+    /// gone, and this flag is the loud version of that fact.
+    ///
+    /// Same one-shot caveat as `orphan_valid_rows`, and the same way to
+    /// avoid it. A host that wants a durable alarm has to record it when
+    /// it sees it: the engine reports what this open found, it does not
+    /// keep a history.
     pub rollback_evidence: bool,
     /// The row capacity this database was created with, as recorded in
     /// its superblock — which may differ from the capacity this engine
@@ -1363,7 +1377,16 @@ impl Engine {
     /// report OpenDone.
     fn stage_recovery_fsyncs(&mut self, generation: u64, row_count: u64) -> Output {
         let live = row_count * ROW_SIZE as u64;
-        if self.opened_rows_len > live {
+        // A salvage open changes nothing, so it removes nothing. The
+        // residue is truncated to keep the NEXT open's claim rule sound
+        // (`scan_orphans` reads one commit's worth of slots, not two), and
+        // a read-only open leaves no next state to keep sound. Two things
+        // follow, both wanted: a read-only handle can open a database that
+        // crashed mid-commit at all — it would otherwise be refused a
+        // truncate it must not perform and fail-stop on the spot — and the
+        // evidence of that interrupted commit survives being LOOKED at.
+        // An alarm a monitoring probe silently disarms is not an alarm.
+        if self.opened_rows_len > live && !self.salvage {
             self.state = State::RecoverTruncateRows {
                 generation,
                 row_count,
