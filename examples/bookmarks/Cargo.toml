@@ -15,3 +15,5 @@ path = "src/main.rs"
 [lib]
 name = "bookmarks"
 path = "src/lib.rs"
+
+[workspace]

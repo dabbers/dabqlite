@@ -42,6 +42,25 @@ jobs:
       - name: Tests (unit, model-based, crash-recovery sweep)
         run: cargo test --workspace
 
+      # The sample applications live OUTSIDE the workspace on purpose:
+      # they consume the published API the way a real user would, so if
+      # one needs something the API does not expose it fails to build
+      # instead of quietly reaching inside. That only works if something
+      # builds them. Nothing did, and all three rotted into a state where
+      # they no longer compiled against the library they exist to
+      # validate. Compiling and linting them here is the cheap half; the
+      # expensive half (crash torture, throughput measurement) stays a
+      # local and agent-driven exercise, because it is timing-sensitive
+      # and kills processes.
+      - name: Sample applications still compile against the published API
+        run: |
+          for s in examples/*/; do
+            echo "== $s"
+            (cd "$s" && cargo build --all-targets \
+                     && cargo clippy --all-targets -- -D warnings \
+                     && cargo fmt --check)
+          done
+
       # The generated codec is checked in (and load-bearing in the core);
       # regenerating must be a no-op.
       - name: Codegen drift check

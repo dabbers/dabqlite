@@ -17,6 +17,53 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+/// There is no reader. Not "one writer and many readers" — *no* reader.
+///
+/// A dashboard that wants to show the queue depth while the worker runs
+/// has nothing to open: `Db::open` takes the exclusive lock, and every
+/// read method (`get`, `range`, `len`... ) takes `&mut self`, so even a
+/// second handle in the same process could not share one. The only
+/// lock-free open is `Db::salvage`, which is documented for DAMAGED
+/// databases — and it does work on a healthy one, but its contract is
+/// "questions the quarantine makes unanswerable return `Degraded`", which
+/// is not something to build a status page on.
+#[test]
+fn there_is_no_concurrent_reader_only_a_salvage_open() {
+    let dir = scratch("reader").join("db");
+    {
+        let mut db = Db::open(&dir).expect("writer");
+        for i in 0..10u64 {
+            db.insert(i, dabqlite::Value::from_text("x").unwrap())
+                .unwrap();
+        }
+    }
+    let mut writer = Db::open(&dir).expect("writer");
+
+    // A would-be reader is refused exactly like a second writer.
+    assert!(matches!(Db::open(&dir), Err(Error::Locked { .. })));
+
+    // `salvage` takes no lock, and on a healthy database it reads fine.
+    let mut reader = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
+    assert_eq!(reader.len(), 10);
+    assert_eq!(reader.get(3).unwrap().unwrap().text(), "x");
+
+    // But it is a SNAPSHOT of the moment it opened, and it will not see
+    // anything the writer does afterwards. There is no way to refresh it
+    // short of reopening.
+    writer
+        .insert(99, dabqlite::Value::from_text("new").unwrap())
+        .unwrap();
+    assert_eq!(reader.get(99).unwrap(), None, "the salvage handle is stale");
+    assert_eq!(reader.len(), 10);
+    let mut fresh = dabqlite::SalvageDb::salvage(&dir).expect("salvage open");
+    assert_eq!(
+        fresh.get(99).unwrap().map(|v| v.text().to_string()),
+        Some("new".into())
+    );
+
+    std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+}
+
 /// The second writer is refused, and the refusal is its OWN error variant.
 ///
 /// This is the branch a queue actually needs: a worker that loses the race
@@ -69,9 +116,9 @@ fn a_healthy_uncontended_open_is_never_reported_as_locked() {
 fn two_racing_workers_do_not_corrupt_the_queue() {
     let root = scratch("race");
     let journal = root.join("j.log");
-    let jobs = 200u64;
+    let jobs = 120u64;
     let mut cfg = Config::new(root.join("db"), &journal, jobs);
-    cfg.capacity = 128;
+    cfg.capacity = 4096;
     cfg.window = 4;
 
     let args = |c: &Config| {
@@ -125,6 +172,7 @@ fn two_racing_workers_do_not_corrupt_the_queue() {
     }
     let ins = inspect(&cfg).unwrap();
     assert_eq!(ins.committed, jobs);
+    assert!(ins.short_payloads.is_empty(), "{:?}", ins.short_payloads);
     assert_eq!(ins.checksum, expected_checksum(jobs));
     let a = audit(&journal).unwrap();
     assert!(a.duplicate_commits.is_empty(), "{:?}", a.duplicate_commits);

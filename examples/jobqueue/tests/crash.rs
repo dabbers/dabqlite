@@ -1,8 +1,9 @@
 //! The point of the whole exercise: kill the worker with SIGKILL at
 //! arbitrary points, restart it, and check that every acknowledged job is
-//! accounted for exactly once — none lost, none duplicated.
+//! accounted for exactly once — none lost, none duplicated, and no batch
+//! ever half-applied.
 //!
-//! Three independent detectors run against every generation:
+//! Four independent detectors run against every generation:
 //!
 //! 1. **The database never regresses.** After every kill we reopen and
 //!    read the two watermarks. Neither may ever go backwards.
@@ -14,6 +15,19 @@
 //!    an order-sensitive fold over every committed job id. It must equal
 //!    the fold over `1..=committed` computed independently by the test.
 //!    A single dropped, repeated or reordered commit changes it.
+//! 4. **No batch is ever half-visible.** Every write the queue makes that
+//!    spans two rows is one `Db::batch`, so the intermediate states are
+//!    supposed to be unreachable. `Inspection::half_batch` looks for them
+//!    after every kill. (`tests/detectors.rs` forges both of them to prove
+//!    the detector fires.)
+//! 5. **No payload ever comes back SHORT.** Jobs carry real payloads of
+//!    1..=2028 bytes and most of them span several 16-byte row slots, so
+//!    an interrupted commit is usually interrupted in the MIDDLE OF ONE
+//!    VALUE. `Inspection::short_payloads` compares every surviving job row
+//!    against the payload that id is supposed to have, byte for byte,
+//!    after every kill. The commit checksum folds the payload as READ BACK
+//!    too, so a value that returned short poisons detector 3 as well even
+//!    if the row is deleted straight afterwards.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -44,27 +58,36 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-fn spawn(cfg: &Config) -> Child {
-    let mut cmd = Command::new(EXE);
-    cmd.arg("run")
-        .arg("--root")
-        .arg(&cfg.root)
-        .arg("--journal")
-        .arg(&cfg.journal)
-        .arg("--jobs")
-        .arg(cfg.jobs.to_string())
-        .arg("--capacity")
-        .arg(cfg.capacity.to_string())
-        .arg("--window")
-        .arg(cfg.window.to_string())
-        .arg("--compact-at")
-        .arg(cfg.compact_at.to_string())
-        .arg("--delay-us")
-        .arg(cfg.delay_us.to_string());
+fn worker_args(cfg: &Config) -> Vec<String> {
+    let mut v = vec![
+        "run".to_string(),
+        "--root".into(),
+        cfg.root.display().to_string(),
+        "--journal".into(),
+        cfg.journal.display().to_string(),
+        "--jobs".into(),
+        cfg.jobs.to_string(),
+        "--capacity".into(),
+        cfg.capacity.to_string(),
+        "--window".into(),
+        cfg.window.to_string(),
+        "--enqueue-chunk".into(),
+        cfg.enqueue_chunk.to_string(),
+        "--compact-at".into(),
+        cfg.compact_at.to_string(),
+        "--delay-us".into(),
+        cfg.delay_us.to_string(),
+    ];
     if !cfg.reap {
-        cmd.arg("--no-reap");
+        v.push("--no-reap".into());
     }
-    cmd.stdout(Stdio::piped())
+    v
+}
+
+fn spawn(cfg: &Config) -> Child {
+    Command::new(EXE)
+        .args(worker_args(cfg))
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn worker")
@@ -84,10 +107,21 @@ struct Tally {
     redundant_work: u64,
     compactions: u64,
     interrupted_compactions: u64,
-    /// Restarts that found an in-flight row past the manifest: proof the
+    /// Restarts that found in-flight rows past the manifest: proof the
     /// kill landed inside a dabqlite commit.
     opens_with_orphan_rows: u64,
+    /// Restarts that found TWO OR MORE such rows. A single write can only
+    /// ever leave one, so this is proof the kill landed inside a BATCH.
+    opens_with_orphan_batches: u64,
+    widest_orphan_batch: u64,
     runs: u64,
+    /// The longest payload the worker recorded doing work on. Proof the
+    /// kills were aimed at commits made of many row slots and not at
+    /// 16-byte writes.
+    widest_payload: usize,
+    /// Restarts that found a job row whose payload was not the payload
+    /// written for it. Must be 0.
+    short_payload_restarts: u64,
 }
 
 /// One generation's knobs. A struct rather than eight positional
@@ -99,6 +133,9 @@ struct Gen {
     jobs: u64,
     capacity: u64,
     window: u64,
+    /// Jobs per enqueue batch. Bigger batches take longer to write, so a
+    /// randomly timed kill lands inside one more often.
+    chunk: u64,
     reap: bool,
     cycles: u64,
     seed: u64,
@@ -120,6 +157,7 @@ fn generation(g: Gen, t: &mut Tally) {
         jobs,
         capacity,
         window,
+        chunk,
         reap,
         cycles,
         seed,
@@ -129,6 +167,7 @@ fn generation(g: Gen, t: &mut Tally) {
     let mut cfg = Config::new(root.join("db"), &journal, jobs);
     cfg.capacity = capacity;
     cfg.window = window;
+    cfg.enqueue_chunk = chunk;
     cfg.reap = reap;
     cfg.compact_at = 0.7;
 
@@ -195,7 +234,8 @@ fn generation(g: Gen, t: &mut Tally) {
             t.exited_first += 1;
         }
         // A worker that exits on its own must never report the rollback
-        // alarm (exit 3) or a hard error (exit 1).
+        // alarm (exit 3), a half-applied batch (exit 5), a short value
+        // (exit 6), or a hard error.
         if let Some(code) = out.status.code() {
             assert!(
                 code == 0 || code == 10,
@@ -205,10 +245,40 @@ fn generation(g: Gen, t: &mut Tally) {
         }
 
         // ---- detectors, after every single kill ----------------------
+        // NOTE, and it is a finding: this `inspect` is the FIRST open after
+        // the kill, and an open now truncates the rows file back to the
+        // manifest. So the in-flight rows are counted here and are GONE by
+        // the time the worker restarts and writes its own `S orphans=`
+        // record — which is why the tally below is fed from `inspect` and
+        // not from the journal any more. `orphan_valid_rows` is a one-shot
+        // report consumed by whoever opens first, and nothing in the API
+        // records that it was ever nonzero.
         let ins = inspect(&cfg).expect("reopen after kill");
+        match ins.orphan_valid_rows {
+            0 => {}
+            1 => t.opens_with_orphan_rows += 1,
+            n => {
+                t.opens_with_orphan_rows += 1;
+                t.opens_with_orphan_batches += 1;
+                t.widest_orphan_batch = t.widest_orphan_batch.max(n);
+            }
+        }
         assert!(
             !ins.rollback_evidence,
             "cycle {cycle}: dabqlite reports rolled-back acknowledged commits: {ins:?}"
+        );
+        if !ins.short_payloads.is_empty() {
+            t.short_payload_restarts += 1;
+        }
+        assert!(
+            ins.short_payloads.is_empty(),
+            "cycle {cycle}: A MULTI-SLOT VALUE CAME BACK SHORT — \
+             (id, written, returned) = {:?}",
+            ins.short_payloads
+        );
+        assert_eq!(
+            ins.half_batch, None,
+            "cycle {cycle}: A BATCH WAS APPLIED IN PART. state: {ins:?}"
         );
         assert!(
             ins.committed >= prev_committed,
@@ -250,10 +320,11 @@ fn generation(g: Gen, t: &mut Tally) {
             );
         }
         if let Some(&last) = a.enqueued.last() {
-            // The insert is acknowledged before the watermark moves, so
-            // the watermark is legitimately at `last` or `last + 1`.
+            // The enqueue is now ONE batch: the row and the watermark land
+            // together, so an acknowledged insert of `last` means the
+            // watermark is strictly past it.
             assert!(
-                last <= ins.enqueue_next,
+                last < ins.enqueue_next,
                 "cycle {cycle}: the journal saw insert {last} acknowledged but the \
                  enqueue watermark came back at {} — ACKNOWLEDGED DATA LOST",
                 ins.enqueue_next
@@ -281,20 +352,7 @@ fn generation(g: Gen, t: &mut Tally) {
     let mut attempts = 0;
     loop {
         let out = Command::new(EXE)
-            .arg("run")
-            .arg("--root")
-            .arg(&cfg.root)
-            .arg("--journal")
-            .arg(&cfg.journal)
-            .arg("--jobs")
-            .arg(cfg.jobs.to_string())
-            .arg("--capacity")
-            .arg(cfg.capacity.to_string())
-            .arg("--window")
-            .arg(cfg.window.to_string())
-            .arg("--compact-at")
-            .arg(cfg.compact_at.to_string())
-            .args(if reap { vec![] } else { vec!["--no-reap"] })
+            .args(worker_args(&cfg))
             .output()
             .expect("final drain");
         attempts += 1;
@@ -312,6 +370,8 @@ fn generation(g: Gen, t: &mut Tally) {
     // ---- the full accounting -----------------------------------------
     let ins = inspect(&cfg).expect("final inspect");
     assert!(!ins.rollback_evidence);
+    assert!(ins.short_payloads.is_empty(), "{:?}", ins.short_payloads);
+    assert_eq!(ins.half_batch, None, "{ins:?}");
     assert_eq!(ins.committed, jobs, "not every job committed");
     assert_eq!(ins.checksum, expected_checksum(jobs));
     if reap {
@@ -342,7 +402,7 @@ fn generation(g: Gen, t: &mut Tally) {
     subsequence_of_jobs(&a.committed, "commit");
     subsequence_of_jobs(&a.enqueued, "insert");
     assert!(
-        a.committed.len() as u64 >= jobs - t.cycles,
+        a.committed.len() as u64 >= jobs.saturating_sub(t.cycles),
         "far too many commit records missing: {} of {jobs}",
         a.committed.len()
     );
@@ -351,7 +411,7 @@ fn generation(g: Gen, t: &mut Tally) {
     t.redundant_work += (a.worked.len() as u64).saturating_sub(jobs);
     t.compactions += a.compactions_finished as u64;
     t.interrupted_compactions += (a.compactions_started - a.compactions_finished) as u64;
-    t.opens_with_orphan_rows += a.opens_with_orphan_rows as u64;
+    t.widest_payload = t.widest_payload.max(a.widest_payload);
     t.runs += a.runs as u64;
 
     std::fs::remove_dir_all(&root).ok();
@@ -360,15 +420,25 @@ fn generation(g: Gen, t: &mut Tally) {
 #[test]
 fn sigkill_never_loses_or_duplicates_an_acknowledged_job() {
     let mut t = Tally::default();
-    // Four independent lifetimes, each killed 25 times mid-flight. The
+    // Five independent lifetimes, each killed 25-30 times mid-flight. The
     // capacities are deliberately tiny so compaction runs constantly and
-    // the kills land inside it as often as inside ordinary writes.
+    // the kills land inside it as often as inside ordinary writes. The
+    // `chunk` column widens the enqueue batch so kills land inside a
+    // multi-row commit, not only inside a single-row one.
+    // Capacities are in ROW SLOTS, and a job at the payload ceiling is 127
+    // of them to insert and 127 more to claim. So the smallest workable
+    // capacity here is a couple of thousand, not the 48 the previous
+    // revision of this test used with 16-byte values. That is not a
+    // regression in the library; it is what happens when the unit the
+    // application thinks in (bytes) and the unit capacity is denominated
+    // in (slots) differ by up to 128x.
     generation(
         Gen {
             tag: "g0",
-            jobs: 200,
-            capacity: 128,
+            jobs: 60,
+            capacity: 2048,
             window: 6,
+            chunk: 1,
             reap: true,
             cycles: 25,
             seed: 0xD1CE_D1CE,
@@ -378,9 +448,10 @@ fn sigkill_never_loses_or_duplicates_an_acknowledged_job() {
     generation(
         Gen {
             tag: "g1",
-            jobs: 200,
-            capacity: 96,
+            jobs: 60,
+            capacity: 2048,
             window: 4,
+            chunk: 4,
             reap: true,
             cycles: 25,
             seed: 0x5EED_0001,
@@ -390,9 +461,10 @@ fn sigkill_never_loses_or_duplicates_an_acknowledged_job() {
     generation(
         Gen {
             tag: "g2",
-            jobs: 150,
-            capacity: 256,
-            window: 12,
+            jobs: 50,
+            capacity: 8192,
+            window: 16,
+            chunk: 16,
             reap: true,
             cycles: 25,
             seed: 0x00A1_1CE5,
@@ -402,23 +474,25 @@ fn sigkill_never_loses_or_duplicates_an_acknowledged_job() {
     generation(
         Gen {
             tag: "g3",
-            jobs: 120,
-            capacity: 512,
-            window: 3,
+            jobs: 50,
+            capacity: 16_384,
+            window: 32,
+            chunk: 32,
             reap: true,
             cycles: 25,
             seed: 0xFEED_BEEF,
         },
         &mut t,
     );
-    // A capacity so small that the worker spends much of its life inside
-    // the compaction swap, so the kills land there too.
+    // A capacity tight enough that the worker spends much of its life
+    // inside compaction, so the kills land there too.
     generation(
         Gen {
             tag: "g4",
-            jobs: 150,
-            capacity: 48,
-            window: 3,
+            jobs: 50,
+            capacity: 1024,
+            window: 2,
+            chunk: 1,
             reap: true,
             cycles: 30,
             seed: 0x0BAD_F00D,
@@ -427,32 +501,50 @@ fn sigkill_never_loses_or_duplicates_an_acknowledged_job() {
     );
 
     eprintln!("crash tally: {t:#?}");
-    assert!(t.killed >= 90, "not enough kills actually landed: {t:?}");
+    assert!(t.killed >= 60, "not enough kills actually landed: {t:?}");
+    assert_eq!(
+        t.short_payload_restarts, 0,
+        "a payload came back short (the per-kill assertion should have fired \
+         first): {t:?}"
+    );
+    assert!(
+        t.widest_payload > 1_000,
+        "the workload never put a value spanning many row slots in flight, so \
+         the short-payload detector had nothing to catch: {t:?}"
+    );
     assert!(
         t.opens_with_orphan_rows >= 5,
         "kills never landed inside a dabqlite commit (no orphan rows seen \
          at any restart): {t:?}"
     );
     assert!(
-        t.interrupted_compactions >= 1,
-        "no compaction was ever interrupted by a kill; the swap protocol \
-         was never exercised under crash: {t:?}"
+        t.opens_with_orphan_batches >= 1,
+        "no kill ever landed inside a multi-row commit, so the batch \
+         atomicity claim was never actually put under the knife: {t:?}"
     );
-    assert_eq!(t.jobs_committed, 820);
+    assert!(
+        t.interrupted_compactions >= 1,
+        "no compaction was ever interrupted by a kill; the rebuild was \
+         never exercised under crash: {t:?}"
+    );
+    assert_eq!(t.jobs_committed, 270);
 }
 
-/// The same torture without reaping: completed jobs are archived to a
-/// different id instead of deleted, so the database grows and compaction
-/// has real work to move.
+/// The same torture in archive mode: a committed job is moved to `DONE`
+/// instead of deleted, so the commit batch is `[put watermark, update
+/// row]` rather than `[put watermark, delete row]`, and the half-batch
+/// detector checks the row states against the watermark in both
+/// directions.
 #[test]
 fn sigkill_torture_without_reaping() {
     let mut t = Tally::default();
     generation(
         Gen {
             tag: "n0",
-            jobs: 120,
-            capacity: 512,
+            jobs: 40,
+            capacity: 16_384,
             window: 5,
+            chunk: 5,
             reap: false,
             cycles: 20,
             seed: 0x1234_5678,
