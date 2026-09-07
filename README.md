@@ -3,14 +3,29 @@
 An embeddable, schema-compiled record store with a declared memory ceiling, a
 deterministic core, and a web-native execution model.
 
-**Status: vertical slice + hardened durability + blob allocator**
-([design §9 steps 1 and 4](docs/DESIGN.md#9-build-order)) — one table, insert
-and get-by-id, arena at open, superblock copy-set durability, the blob-zone
-allocator, and a deterministic simulation harness with crash and media-fault
-injection. The
-[§7.3 crash-recovery property](docs/DESIGN.md#73-the-test-that-means-the-harness-works)
-passes: crash at every I/O boundary, recover, state is exactly N or N+1
-committed inserts, never in between — reproducible from a single integer seed.
+```rust
+use dabqlite::{Db, Value};
+
+let mut db = Db::open("./mydb")?;          // or Db::in_memory()
+db.put(1, Value::from_text("hello")?)?;    // insert or replace, atomically
+db.update(1, Value::from_text("hi")?)?;
+db.remove(1)?;
+let hits = db.find_text("ell")?;           // exact substring search
+let blob = db.snapshot()?.to_bytes();      // move it anywhere
+```
+
+**Status: steps 1–8 of the [build order](docs/DESIGN.md#9-build-order), plus
+the OPFS backend (step 2).** One table with insert, update, delete, get,
+ordered range scans and substring search; a declared memory ceiling; three
+interchangeable backends (POSIX files, in-memory, browser OPFS) proven to
+write byte-identical databases; an offline migration path; corruption
+containment with repair-by-rebuild; and an inspector CLI.
+
+The [§7.3 crash-recovery property](docs/DESIGN.md#73-the-test-that-means-the-harness-works)
+passes: crash at every I/O boundary, recover, and the state is exactly
+all-or-nothing for the in-flight write — reproducible from a single integer
+seed. Every write kind is the same shape (one appended row, one manifest
+flip), so that argument covers updates and deletes too.
 
 What the harness currently proves — the full fault matrix with suites and
 guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
@@ -66,6 +81,8 @@ schema/
   records.sql     The schema: Postgres DDL + annotations. Single source of
                   truth for layout and SCHEMA_HASH.
 crates/
+  dabqlite        The public API: `Db`, `Value`, `Snapshot`. This is what an
+                  application depends on; everything below is machinery.
   dabqlite-core   The pure state machine: tick(input) -> output. No I/O, no
                   clock, no randomness, no allocation after init. Zero
                   dependencies; must always build for wasm32-unknown-unknown.
