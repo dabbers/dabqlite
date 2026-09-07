@@ -63,6 +63,10 @@ pub use dabqlite_core::{DbError as EngineError, FindCursor, Match, RecoveryRepor
 // this within minutes and each had to invent its own type erasure to work
 // around it.
 pub use dabqlite_host::{MemoryStorage, Storage};
+// `Storage` is unimplementable without the file the methods take, so it
+// travels with it. Re-exported for the same reason [`Db::with_storage`]
+// exists: a backend the library cannot name should still be usable.
+pub use dabqlite_core::FileId;
 #[cfg(unix)]
 pub use dabqlite_host::{PosixStorage, ReadOnlyDir};
 
@@ -1118,6 +1122,42 @@ fn fs_err(e: std::io::Error) -> Error {
 const _: () = assert!(VALUE_LEN == CORE_VALUE_LEN);
 
 impl<S: Storage> Db<S> {
+    /// Open a database on a storage backend you supply.
+    ///
+    /// The other constructors name a backend — memory, a directory, a
+    /// snapshot — and each is this with one filled in. This is the door
+    /// for the ones the library cannot name: OPFS in a browser, a
+    /// key-value service, a fault injector, anything that implements
+    /// [`Storage`].
+    ///
+    /// Without it the facade could only be used over the backends it
+    /// happened to ship, which left the OPFS backend — the whole reason
+    /// the storage seam is shaped the way it is — reachable only by
+    /// driving the engine's protocol by hand.
+    ///
+    /// `rows` is the capacity to open with. A database that already
+    /// records its own uses that instead, and refuses if `rows` is below
+    /// what it already holds.
+    pub fn with_storage(storage: S, rows: u64) -> Result<Self, Error> {
+        Self::start(Host::new(caps(rows), storage))
+    }
+
+    /// [`Db::with_storage`] in salvage mode: damaged rows are quarantined
+    /// rather than failing the whole database, and the result is
+    /// read-only. The rescue path for a backend the library cannot name.
+    pub fn salvage_storage(storage: S, rows: u64) -> Result<Self, Error> {
+        Self::start_salvaged(Host::new(caps(rows), storage))
+    }
+
+    /// The backend underneath, for whatever only it can answer — a
+    /// browser asking OPFS how much space it has, a test looking at the
+    /// bytes. Reading it cannot disturb the database; writing to it
+    /// behind the engine's back is the caller's problem, which is why
+    /// this is a shared borrow.
+    pub fn storage(&self) -> &S {
+        &self.h().storage
+    }
+
     fn start(mut host: Host<S>) -> Result<Self, Error> {
         match host.open().map_err(io_err::<S>)? {
             Output::OpenDone { result: Ok(_) } => Ok(Db {

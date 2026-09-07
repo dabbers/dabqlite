@@ -35,6 +35,10 @@ Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;
 // and the compiler proves a read requests no I/O and changes nothing.
 fn stats(db: &Db<PosixStorage>) -> usize { db.all().unwrap().len() }
 
+// Bring your own backend: OPFS in a browser, or anything implementing
+// Storage. The named constructors are all this with one filled in.
+let mut custom = Db::with_storage(my_storage, 65_536)?;
+
 // Any number of reader PROCESSES, alongside the writer, taking no lock.
 let mut reader = Db::read_only("./mydb")?;
 ```

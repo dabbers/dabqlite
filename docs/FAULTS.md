@@ -98,6 +98,8 @@ Each unsynced write independently receives a fate:
 | Reopen capacity boundaries | targeted | `capacity.rs` | capacity == data opens already-full; data-1 refuses with `CapacityBelowData {{ required, configured }}`; data+1 gives exactly one slot |
 | 100%-full database serves reads | targeted | `capacity.rs` | every get, full ordered paged scan, empty/singleton ranges — all exact at the wall |
 | Whole lifetimes lived at the wall, under crash/EIO schedules | seeded (floor-asserted) + swarm vopr (rows=4 configs) | `lifetime.rs`, `vopr` | Full interleaved with faults never corrupts; oracle-exact every cycle |
+| Every write the PUBLIC API offers, crashed at every I/O boundary × 3 settles | exhaustive per op | `dabqlite/tests/fault.rs` | the database reads as it did before the call or as it would after it, never anything else — and the sweep is floor-asserted to straddle the commit point, so a schedule that stopped interrupting anything fails |
+| 60-round interleaved workload through the PUBLIC API, crashed at a random point in a third of rounds, each round starting on what the last crash left | seeded × 12 | `dabqlite/tests/fault.rs` | oracle-exact after every round across get, both scan directions, `last(n)`, every search mode, and a rebuild — the facade's own sequences (windowed reads, batches, rebuilds) are where it has state the engine does not |
 | Blob zone exhaustion | targeted + fuzz (arena sized to fill) | core `blob.rs`, `blob.rs` fuzz | `Full {{ block_bytes, capacity }}`; freed blocks reusable; zero leak |
 | B+tree node pool | adversarial fill | core + `btree_oracle.rs` | derived bound never approached — index capacity can't be hit before row capacity |
 
