@@ -273,6 +273,20 @@ impl SimHost {
                     }
                     out = self.tick_machine(Input::WriteDone { file });
                 }
+                Output::Truncate { file, len } => {
+                    if self.at_crash_boundary() {
+                        return Driven::Crashed;
+                    }
+                    if self.this_op_fails() {
+                        out = self.tick_machine(Input::IoFailed { file });
+                        continue;
+                    }
+                    // Not counted as a write: it moves no data, and the
+                    // disk-full regimes are about bytes arriving, not
+                    // leaving.
+                    self.disk.truncate(file, len);
+                    out = self.tick_machine(Input::TruncateDone { file });
+                }
                 Output::Fsync { file } => {
                     if self.at_crash_boundary() {
                         return Driven::Crashed;

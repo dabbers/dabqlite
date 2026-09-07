@@ -26,7 +26,9 @@
 
 use std::collections::BTreeMap;
 
-use dabqlite_core::{BatchOp, Capacities, DbError, FileId, Output, MAX_COMMIT_ROWS, VALUE_LEN};
+use dabqlite_core::{
+    BatchOp, Capacities, DbError, FileId, Output, MAX_COMMIT_ROWS, ROW_SIZE, VALUE_LEN,
+};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{Driven, SimDisk, SimHost};
@@ -965,4 +967,149 @@ fn batches_and_single_writes_track_a_btreemap_exactly_across_restarts() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Residue must not accumulate
+// ---------------------------------------------------------------------
+
+/// A crash loop must not be able to fake evidence of lost data.
+///
+/// Rows past the manifest are the residue of commits that were never
+/// acknowledged. Left in place, residue from SEVERAL incarnations piles
+/// up — and a wide interrupted commit followed by a narrow one leaves
+/// rows claiming two different commit sizes, which is EXACTLY what one
+/// acknowledged commit rolled back by a lying fsync looks like. Recovery
+/// would then report data loss on a database that lost nothing, on every
+/// open, forever, and a host that treats the flag as fatal (as the
+/// documentation asks) would refuse to start a healthy database.
+///
+/// So recovery drops the residue: what lies past the manifest always
+/// belongs to at most one commit — this incarnation's.
+#[test]
+fn a_wide_torn_commit_then_a_narrow_one_is_not_mistaken_for_lost_data() {
+    for settle in 0..3u64 {
+        let ctx = format!("settle={settle}");
+        let mut base = fresh();
+        for i in 0..4u64 {
+            base.run(ClientOp::Insert {
+                id: i,
+                value: arr(val(i)),
+            });
+        }
+        let disk = std::mem::take(&mut base.disk);
+
+        // Life one: a wide batch, interrupted after its rows are written
+        // but before the superblock flips.
+        let wide: Vec<BatchOp> = (100..140u64)
+            .map(|i| BatchOp::Insert {
+                id: i,
+                value: val(i),
+            })
+            .collect();
+        let mut host = SimHost::new(CAPS, disk, None);
+        host.open();
+        host.crash_after = Some(host.io_count + wide.len() as u64);
+        let _ = host.batch(&wide);
+        let mut disk = std::mem::take(&mut host.disk);
+        disk.crash(&mut crash_rng(0xD1DE_5EED, settle));
+
+        // Life two: reopen (which is where the residue is dealt with),
+        // then a NARROW batch, also interrupted.
+        let (mut host, _) = open(disk);
+        let narrow = [
+            BatchOp::Insert {
+                id: 200,
+                value: val(200),
+            },
+            BatchOp::Insert {
+                id: 201,
+                value: val(201),
+            },
+        ];
+        host.crash_after = Some(host.io_count + 2);
+        let _ = host.batch(&narrow);
+        let mut disk = std::mem::take(&mut host.disk);
+        disk.crash(&mut crash_rng(0xA1AA_5EED, settle));
+
+        // Life three: the verdict.
+        let (mut host, live) = open(disk);
+        let report = host.engine.recovery_report();
+        assert!(
+            !report.rollback_evidence,
+            "[{ctx}] two INTERRUPTED commits of different widths were reported \
+             as lost acknowledged data ({} orphan rows) — a crash loop can \
+             brick a healthy database",
+            report.orphan_valid_rows
+        );
+        assert_eq!(live, 4, "[{ctx}] the committed rows are all that survives");
+        for i in 0..4u64 {
+            assert_eq!(got(&mut host, i), Some(val(i).to_vec()), "[{ctx}] row {i}");
+        }
+        // And the database is still writable, and still quiet on reopen.
+        assert!(matches!(
+            host.batch(&[BatchOp::Insert {
+                id: 300,
+                value: val(300)
+            }]),
+            Driven::Done(Output::BatchDone { result: Ok(()), .. })
+        ));
+        let disk = std::mem::take(&mut host.disk);
+        let (host, _) = open(disk);
+        assert!(
+            !host.engine.recovery_report().rollback_evidence,
+            "[{ctx}] the alarm came back on a later open"
+        );
+    }
+}
+
+/// The mechanism, stated directly: an open leaves nothing past the
+/// manifest, so `orphan_valid_rows` always describes THIS incarnation.
+#[test]
+fn an_open_leaves_no_residue_past_the_manifest() {
+    let mut base = fresh();
+    base.run(ClientOp::Insert {
+        id: 1,
+        value: arr(val(1)),
+    });
+    let disk = std::mem::take(&mut base.disk);
+
+    let ops: Vec<BatchOp> = (10..30u64)
+        .map(|i| BatchOp::Insert {
+            id: i,
+            value: val(i),
+        })
+        .collect();
+    let mut host = SimHost::new(CAPS, disk, None);
+    host.open();
+    host.crash_after = Some(host.io_count + ops.len() as u64);
+    let _ = host.batch(&ops);
+    let mut disk = std::mem::take(&mut host.disk);
+    disk.crash(&mut crash_rng(0x5C4A_9EED, 1));
+    let before = disk.contents(FileId::Rows).len();
+    assert!(
+        before > ROW_SIZE,
+        "the setup should leave residue to clear: {before} bytes"
+    );
+
+    let (mut host, live) = open(disk);
+    // The first open reports what it found, then clears it.
+    let first = host.engine.recovery_report();
+    assert_eq!(live, 1);
+    // Force the truncate to become durable the way a real open does, then
+    // look at the file.
+    let disk = std::mem::take(&mut host.disk);
+    assert_eq!(
+        disk.contents(FileId::Rows).len(),
+        ROW_SIZE,
+        "the rows file still holds residue past the manifest ({} orphans found)",
+        first.orphan_valid_rows
+    );
+
+    let (host, _) = open(disk);
+    assert_eq!(
+        host.engine.recovery_report().orphan_valid_rows,
+        0,
+        "a second open still sees residue the first one should have cleared"
+    );
 }

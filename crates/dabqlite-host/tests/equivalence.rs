@@ -46,6 +46,10 @@ impl Storage for SimStorage {
         self.0.fsync(file);
         Ok(())
     }
+    fn truncate(&mut self, file: FileId, len: u64) -> Result<(), Infallible> {
+        self.0.truncate(file, len);
+        Ok(())
+    }
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {

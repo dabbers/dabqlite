@@ -73,6 +73,9 @@ pub trait SyncHandle {
     fn read_at(&self, buf: &mut [u8], at: u64) -> Result<usize, Self::Error>;
     fn write_at(&self, buf: &[u8], at: u64) -> Result<usize, Self::Error>;
     fn flush(&self) -> Result<(), Self::Error>;
+    /// `FileSystemSyncAccessHandle.truncate(newSize)`. Only ever asked to
+    /// shrink a file, and only for bytes no manifest references.
+    fn truncate(&self, size: u64) -> Result<(), Self::Error>;
 }
 
 /// What can go wrong in the backend: the handle's own failures, plus the
@@ -181,6 +184,17 @@ impl<H: SyncHandle> Storage for OpfsStorage<H> {
             done += n;
         }
         Ok(buf)
+    }
+
+    fn truncate(&mut self, file: FileId, len: u64) -> Result<(), Self::Error> {
+        // Shrink only: `truncate` to a LARGER size would zero-extend, and
+        // growing a file behind the engine's back is not something any
+        // caller means.
+        let handle = self.handle(file);
+        if handle.size()? > len {
+            handle.truncate(len)?;
+        }
+        Ok(())
     }
 
     fn write(&mut self, file: FileId, offset: u64, data: &[u8]) -> Result<(), Self::Error> {

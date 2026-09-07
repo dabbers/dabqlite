@@ -12,10 +12,11 @@ dabqlite-core = { path = "../dabqlite-core" }
 [dev-dependencies]
 dabqlite-sim = { path = "../dabqlite-sim" }
 
-[target.'cfg(unix)'.dev-dependencies]
-# Constants only (the ENOSPC errno in the disk-full test). The
-# single-writer lock uses std's `File::try_lock` (flock on Linux), so
-# production code needs no libc and contains no unsafe.
+[target.'cfg(unix)'.dependencies]
+# `fcntl(F_SETLK)` for the single-writer lock, and the ENOSPC errno the
+# disk-full test asserts on. Record locks rather than `flock` because
+# `flock` is inherited by forked children and record locks are not — see
+# `WriterLock` in src/posix.rs. This is the only FFI in the workspace.
 libc = "0.2"
 
 [lints]

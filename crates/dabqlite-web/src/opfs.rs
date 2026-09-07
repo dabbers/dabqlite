@@ -89,6 +89,10 @@ impl SyncHandle for OpfsHandle {
     fn flush(&self) -> Result<(), JsValue> {
         self.0.flush()
     }
+
+    fn truncate(&self, size: u64) -> Result<(), JsValue> {
+        self.0.truncate_with_f64(size as f64)
+    }
 }
 
 /// Acquire the declared file set inside `dir` under the origin-private

@@ -162,6 +162,16 @@ impl SyncHandle for FakeHandle {
         *self.0.flushed.borrow_mut() = self.0.bytes.borrow().clone();
         Ok(())
     }
+
+    fn truncate(&self, size: u64) -> Result<(), FakeError> {
+        self.0.step()?;
+        let mut bytes = self.0.bytes.borrow_mut();
+        let size = size as usize;
+        // The browser's `truncate` grows as well as shrinks, zero-filling;
+        // the fake matches it so the model is the real contract.
+        bytes.resize(size, 0);
+        Ok(())
+    }
 }
 
 /// The declared file set as fakes: a ready-to-drive [`OpfsStorage`] plus

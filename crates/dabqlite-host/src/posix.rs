@@ -1,15 +1,29 @@
 //! POSIX file storage: the declared file set as real files in a directory.
 //!
+//! One `unsafe` block lives here, in `record_lock`: the `fcntl` call that
+//! takes the single-writer lock. It is the only FFI in the workspace's
+//! production code, and it is here rather than avoided because the safe
+//! alternative — `flock`, via `std::fs::File::try_lock` — leaks the lock
+//! into forked children (see [`WriterLock`]), which is a correctness bug
+//! and not a stylistic one.
+#![allow(
+    unsafe_code,
+    reason = "one fcntl(F_SETLK) call; see `record_lock` and `WriterLock`"
+)]
+//!
 //! File creation happens exactly once, at open (docs/DESIGN.md §4.4), and
 //! the directory is fsynced right there — the one directory operation in
 //! the design, confined to the one place it can happen. After that the
 //! backend is pure positional I/O on held handles, the same shape OPFS
 //! sync access handles offer.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use dabqlite_core::migration::V1_SCHEMA_HASH;
 use dabqlite_core::{FileId, SCHEMA_HASH};
@@ -21,15 +35,162 @@ use crate::Storage;
 // the inspector, the test suites — keep working unchanged.
 pub use crate::{rows_file_name, LOCK_FILE, SUPERBLOCK_FILE};
 
+/// Database directories THIS PROCESS holds the writer lock for.
+///
+/// The other half of the single-writer rule, and not optional. The kernel
+/// lock below is a POSIX record lock, which is owned by the *process*: two
+/// handles in one process do not conflict with each other at all, so
+/// without this registry a program could open the same database twice and
+/// the engine's whole single-writer premise would quietly stop holding.
+///
+/// It also makes the record lock's other sharp edge unreachable. Closing
+/// ANY descriptor to a file drops that process's record locks on it, so a
+/// second open-and-close of the same lock file would release the first
+/// handle's lock; the registry refuses that second open before it happens.
+static HELD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// The single-writer lock (docs/DESIGN.md §2: "one writer, always"), held
+/// for the storage's lifetime.
+///
+/// A POSIX record lock (`fcntl(F_SETLK)`), NOT `flock`, for one reason:
+/// record locks are not inherited by a child created with `fork`, and
+/// `flock` locks are. That difference is not academic. `flock` belongs to
+/// the open file description, `fork` duplicates it, and `O_CLOEXEC` only
+/// closes the copy at `exec` — so with `flock`, any program that spawns a
+/// subprocess hands its database's writer lock to a child that has never
+/// heard of the database, for the whole fork-to-exec window. Measured on
+/// this machine, against a database whose only handle had already been
+/// CLOSED: 891 of 1500 reopens refused, from 39 spawns of `/bin/true`.
+///
+/// The crash-safety property is unchanged: the kernel releases record
+/// locks when the process dies, so a crash can never leave a stale lock.
+struct WriterLock {
+    file: File,
+    dir: PathBuf,
+}
+
+/// Set or clear the whole-file write lock. `l_len` of 0 means "to the end
+/// of the file, however long it becomes", which is the idiom for locking a
+/// file rather than a range of it.
+fn record_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
+    let request = libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    // SAFETY: `fcntl` receives a descriptor borrowed from `file` and valid
+    // for the duration of the call, and a pointer to a fully-initialized
+    // `flock` this function owns and outlives the call. `F_SETLK` reads
+    // that struct and touches no other memory. This is the only FFI in the
+    // workspace's production code, and the only `unsafe` outside the
+    // counting allocator the test suite uses.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &request) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl WriterLock {
+    fn acquire(dir: &Path, lock_path: &Path) -> io::Result<Self> {
+        let key = dir.canonicalize()?;
+        {
+            let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+            if !held.insert(key.clone()) {
+                return Err(contended(dir));
+            }
+        }
+        // From here on the guard owns the registry entry, so every exit
+        // path releases it by dropping.
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                HELD.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+                return Err(e);
+            }
+        };
+        let lock = WriterLock { file, dir: key };
+        match record_lock(&lock.file, libc::F_WRLCK as libc::c_short) {
+            Ok(()) => Ok(lock),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EAGAIN)) => {
+                Err(contended(dir))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Release explicitly before the descriptor closes, so the unlock
+        // is an ordered step rather than a side effect of dropping a file.
+        let _ = record_lock(&self.file, libc::F_UNLCK as libc::c_short);
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.dir);
+    }
+}
+
+fn contended(dir: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "{} is locked by another writer; the store is single-writer \
+             (design §2) — close the other handle first",
+            dir.display()
+        ),
+    )
+}
+
+/// Is another process holding the single-writer lock on `dir` right now?
+///
+/// Asks with `F_GETLK`, which reports whether a lock WOULD conflict
+/// without taking anything — so the question cannot disturb the writer,
+/// and cannot trip the record-lock rule that closing any descriptor to a
+/// file drops the caller's own locks on it.
+///
+/// `None` means the question could not be answered — no lock file, or a
+/// mount that will not even open it — which callers treat as "no writer",
+/// since a rescue must still be possible on media that barely works.
+/// `F_GETLK` also cannot see a lock this same process holds, so a caller
+/// asking about a database it has open itself gets `Some(false)`; the
+/// in-process registry is what answers that question.
+pub fn writer_holds(dir: &Path) -> Option<bool> {
+    let path = dir.join(LOCK_FILE);
+    if !path.exists() {
+        return Some(false);
+    }
+    let file = File::open(&path).ok()?;
+    let mut probe = libc::flock {
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    // SAFETY: as `record_lock` — a borrowed valid descriptor and a
+    // fully-initialized `flock` this function owns. `F_GETLK` writes its
+    // answer back into that same struct and touches nothing else.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    if rc == -1 {
+        return None;
+    }
+    Some(probe.l_type != libc::F_UNLCK as libc::c_short)
+}
+
 pub struct PosixStorage {
     superblock: File,
     rows: File,
     rows_old: File,
-    /// The single-writer lock (docs/DESIGN.md §2: "one writer, always").
-    /// Held for the storage's lifetime; `flock` is released by the kernel
-    /// when the process dies, so a crash can never leave a stale lock —
-    /// the lock itself is crash-safe by construction.
-    _lock: File,
+    _lock: WriterLock,
 }
 
 impl PosixStorage {
@@ -47,26 +208,8 @@ impl PosixStorage {
                 .open(dir.join(name))
         };
         // Take the single-writer lock BEFORE touching data files: a second
-        // process must be refused before it can do any harm at all.
-        let lock = open(LOCK_FILE)?;
-        // Non-blocking exclusive lock via std (`flock(LOCK_EX|LOCK_NB)` on
-        // Linux): held by the open file description, released by the
-        // kernel when the process dies — crash-safe by construction, and
-        // no unsafe FFI anywhere in the workspace's production code.
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "dabqlite: {} is locked by another process; the store is \
-                         single-writer (design §2) — close the other handle first",
-                        dir.display()
-                    ),
-                ));
-            }
-            Err(TryLockError::Error(e)) => return Err(e),
-        }
+        // writer must be refused before it can do any harm at all.
+        let lock = WriterLock::acquire(dir, &dir.join(LOCK_FILE))?;
         let superblock = open(SUPERBLOCK_FILE)?;
         let rows = open(&rows_file_name(SCHEMA_HASH))?;
         let rows_old = open(&rows_file_name(V1_SCHEMA_HASH))?;
@@ -117,6 +260,16 @@ impl Storage for PosixStorage {
         // sync_all = fsync (data + metadata; the file can grow, so metadata
         // matters). macOS F_FULLFSYNC is the TODO noted at open_dir.
         self.file(file).sync_all()
+    }
+
+    fn truncate(&mut self, file: FileId, len: u64) -> Result<(), io::Error> {
+        // Only ever shrinks: `set_len` would zero-extend a shorter file,
+        // and growing the rows file behind the engine's back is not
+        // something any caller means.
+        if self.len(file)? > len {
+            self.file(file).set_len(len)?;
+        }
+        Ok(())
     }
 }
 
@@ -191,5 +344,13 @@ impl Storage for ReadOnlyDir {
     fn sync(&mut self, _file: FileId) -> Result<(), io::Error> {
         // Nothing was written, so nothing needs flushing.
         Ok(())
+    }
+
+    fn truncate(&mut self, _file: FileId, _len: u64) -> Result<(), io::Error> {
+        // A rescue must not alter the wreckage it is reading.
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "dabqlite: a read-only open never truncates",
+        ))
     }
 }

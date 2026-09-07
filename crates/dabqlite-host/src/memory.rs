@@ -130,4 +130,12 @@ impl Storage for MemoryStorage {
         // durability story ends, and it ends honestly.
         Ok(())
     }
+
+    fn truncate(&mut self, file: FileId, len: u64) -> Result<(), Never> {
+        let image = self.file_mut(file);
+        if (len as usize) < image.len() {
+            image.truncate(len as usize);
+        }
+        Ok(())
+    }
 }

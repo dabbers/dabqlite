@@ -68,6 +68,15 @@ pub trait Storage {
     fn read(&mut self, file: FileId, offset: u64, len: u64) -> Result<Vec<u8>, Self::Error>;
     fn write(&mut self, file: FileId, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
     fn sync(&mut self, file: FileId) -> Result<(), Self::Error>;
+    /// Shorten the file to `len` bytes. Never used to grow one, and never
+    /// used on bytes the manifest references — recovery calls it to drop
+    /// the residue of commits that were never acknowledged, so that what
+    /// lies past the manifest always belongs to THIS incarnation.
+    ///
+    /// Present in the trait because OPFS sync access handles offer it
+    /// natively (`truncate`), so it costs no portability; the alternative,
+    /// zeroing the region with ordinary writes, is unbounded work at open.
+    fn truncate(&mut self, file: FileId, len: u64) -> Result<(), Self::Error>;
 }
 
 /// Drives an [`Engine`] against any [`Storage`]. One request in flight at a
@@ -226,6 +235,15 @@ impl<S: Storage> Host<S> {
                 Output::Write { file, offset, data } => {
                     out = match self.storage.write(file, offset, data.as_slice()) {
                         Ok(()) => self.tick_machine(Input::WriteDone { file }),
+                        Err(e) => {
+                            self.last_error = Some(e);
+                            self.tick_machine(Input::IoFailed { file })
+                        }
+                    };
+                }
+                Output::Truncate { file, len } => {
+                    out = match self.storage.truncate(file, len) {
+                        Ok(()) => self.tick_machine(Input::TruncateDone { file }),
                         Err(e) => {
                             self.last_error = Some(e);
                             self.tick_machine(Input::IoFailed { file })

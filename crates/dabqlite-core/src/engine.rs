@@ -340,6 +340,8 @@ pub enum Input<'a> {
     WriteDone { file: FileId },
     /// An fsync the core requested has completed.
     FsyncDone { file: FileId },
+    /// A truncate the core requested has completed.
+    TruncateDone { file: FileId },
     /// The read, write, or fsync the core requested FAILED (EIO and
     /// friends). The write may or may not have reached the disk or page
     /// cache — the engine assumes nothing. It fail-stops; restart to
@@ -415,6 +417,9 @@ pub enum Output {
     },
     /// Host: fsync the file and feed back `FsyncDone`.
     Fsync { file: FileId },
+    /// Host: shorten the file to `len` bytes and feed back `TruncateDone`.
+    /// Only ever asked for bytes the manifest does not reference.
+    Truncate { file: FileId, len: u64 },
     /// Open finished. `Ok(n)` = recovered `n` committed rows.
     OpenDone { result: Result<u64, DbError> },
     /// Insert finished (durably committed if `Ok`).
@@ -507,6 +512,22 @@ enum State {
     RecoverReadSb,
     /// Recovery: committed-rows read in flight.
     RecoverReadRows { generation: u64, row_count: u64 },
+    /// Recovery: TRUNCATE of the rows file in flight, dropping everything
+    /// past the manifest before anything else is made durable.
+    ///
+    /// What lies past the manifest is the residue of commits that were
+    /// never acknowledged, and this open has just finished reading it: the
+    /// rollback verdict is already decided. Leaving it there would let
+    /// residue from SEVERAL incarnations pile up, and the pile is what
+    /// makes a false alarm — two never-acknowledged commits of different
+    /// widths look exactly like one acknowledged commit that was rolled
+    /// back. Clearing it means the region always belongs to at most one
+    /// commit: this incarnation's.
+    ///
+    /// Only ever shrinks, and only ever bytes the manifest does not
+    /// reference, so a crash mid-truncate leaves committed data untouched
+    /// and the next open repeats it.
+    RecoverTruncateRows { generation: u64, row_count: u64 },
     /// Recovery: rows-file fsync in flight. Recovery fsyncs both files
     /// before OpenDone: after a fail-stop restart (process died, machine
     /// did not), the page cache can show state that was never made durable.
@@ -1061,6 +1082,7 @@ impl Engine {
             Input::ReadDone { file, data } => self.on_read_done(file, data),
             Input::WriteDone { file } => self.on_write_done(file),
             Input::FsyncDone { file } => self.on_fsync_done(file),
+            Input::TruncateDone { file } => self.on_truncate_done(file),
             Input::IoFailed { file } => self.on_io_failed(file),
             Input::Insert { id, value } => self.on_insert(id, value),
             Input::Update { id, value } => self.on_update(id, value),
@@ -1262,11 +1284,45 @@ impl Engine {
     /// (see `State::RecoverFsyncRows`). Fsync rows, then superblock, then
     /// report OpenDone.
     fn stage_recovery_fsyncs(&mut self, generation: u64, row_count: u64) -> Output {
+        let live = row_count * ROW_SIZE as u64;
+        if self.opened_rows_len > live {
+            self.state = State::RecoverTruncateRows {
+                generation,
+                row_count,
+            };
+            return Output::Truncate {
+                file: FileId::Rows,
+                len: live,
+            };
+        }
         self.state = State::RecoverFsyncRows {
             generation,
             row_count,
         };
         Output::Fsync { file: FileId::Rows }
+    }
+
+    fn on_truncate_done(&mut self, file: FileId) -> Output {
+        match (self.state, file) {
+            (
+                State::RecoverTruncateRows {
+                    generation,
+                    row_count,
+                },
+                FileId::Rows,
+            ) => {
+                // The residue is gone; make that, and the rows, durable.
+                self.opened_rows_len = row_count * ROW_SIZE as u64;
+                self.state = State::RecoverFsyncRows {
+                    generation,
+                    row_count,
+                };
+                Output::Fsync { file: FileId::Rows }
+            }
+            (state, file) => {
+                panic!("protocol violation: TruncateDone({file:?}) in state {state:?}")
+            }
+        }
     }
 
     fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
@@ -1634,6 +1690,7 @@ impl Engine {
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
@@ -2254,7 +2311,9 @@ impl Engine {
             State::InitWriteSb { .. } | State::InitFsyncSb | State::RecoverReadSb => {
                 FileId::Superblock
             }
-            State::RecoverReadRows { .. } | State::RecoverFsyncRows { .. } => FileId::Rows,
+            State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
+            | State::RecoverFsyncRows { .. } => FileId::Rows,
             State::RecoverRepairSb { .. } | State::RecoverFsyncSb { .. } => FileId::Superblock,
             State::InsertWriteRow | State::InsertFsyncRows => FileId::Rows,
             State::InsertWriteSb { .. } | State::InsertFsyncSb => FileId::Superblock,
@@ -2359,6 +2418,7 @@ impl Engine {
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
@@ -2395,6 +2455,7 @@ impl Engine {
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
@@ -2433,6 +2494,7 @@ impl Engine {
             | State::InitFsyncSb
             | State::RecoverReadSb
             | State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),

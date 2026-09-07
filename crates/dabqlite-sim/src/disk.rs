@@ -58,8 +58,14 @@ pub struct SimFile {
     durable: Vec<u8>,
     current: Vec<u8>,
     unsynced: Vec<(u64, Vec<u8>)>,
+    /// A shortening that has happened for readers but is not durable yet.
+    /// Modelled like an unsynced write: a crash before the next fsync
+    /// drops it, and the residue it was meant to remove comes back.
+    pending_truncate: Option<u64>,
 }
 
+/// A pending shortening, recorded alongside the unsynced writes so that a
+/// crash can drop it exactly like one.
 fn apply(buf: &mut Vec<u8>, offset: u64, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -83,6 +89,29 @@ impl SimFile {
         self.unsynced.push((offset, data.to_vec()));
     }
 
+    fn truncate(&mut self, len: u64) {
+        if (len as usize) >= self.current.len() {
+            return;
+        }
+        self.current.truncate(len as usize);
+        self.pending_truncate = Some(self.pending_truncate.map_or(len, |prev| prev.min(len)));
+        // Writes still in the unsynced window that land past the new end
+        // are gone with the bytes they were going to occupy — a write and
+        // a truncate that overlap resolve in issue order, and the truncate
+        // came second. A write straddling the new end keeps only the part
+        // that is still inside the file.
+        self.unsynced.retain_mut(|(offset, data)| {
+            if *offset >= len {
+                return false;
+            }
+            let keep = (len - *offset) as usize;
+            if data.len() > keep {
+                data.truncate(keep);
+            }
+            !data.is_empty()
+        });
+    }
+
     fn fsync(&mut self) {
         // Apply-pending rather than clone-the-file. Identical semantics —
         // `current` only ever differs from `durable` by the unsynced writes,
@@ -92,6 +121,9 @@ impl SimFile {
         // the guard on this claim.
         for (offset, data) in self.unsynced.drain(..) {
             apply(&mut self.durable, offset, &data);
+        }
+        if let Some(len) = self.pending_truncate.take() {
+            self.durable.truncate(len as usize);
         }
         debug_assert_eq!(self.durable.len(), self.current.len());
     }
@@ -148,6 +180,8 @@ impl SimFile {
     }
 
     fn crash(&mut self, rng: &mut ChaCha8Rng) {
+        // An un-fsynced truncate simply did not happen.
+        self.pending_truncate = None;
         let pending = std::mem::take(&mut self.unsynced);
         for (offset, data) in pending {
             let fate = Self::random_fate(data.len(), rng);
@@ -212,6 +246,19 @@ impl SimDisk {
         self.file_mut(id).fsync();
     }
 
+    /// Shorten a file, the way the engine's recovery does.
+    ///
+    /// Modelled as unsynced, like a write: the shortening is visible to
+    /// reads immediately but is not durable until the next fsync, so a
+    /// crash between the two leaves the residue in place. That is the
+    /// weaker of the two plausible kernel behaviours, and the one the
+    /// protocol has to survive — recovery fsyncs the rows file before it
+    /// accepts any write, so a truncate that did not stick is simply
+    /// redone at the next open.
+    pub fn truncate(&mut self, id: FileId, len: u64) {
+        self.file_mut(id).truncate(len);
+    }
+
     /// Simulate a machine crash: every unsynced write independently gets a
     /// random [`WriteFate`]. Reads afterwards see only what survived.
     pub fn crash(&mut self, rng: &mut ChaCha8Rng) {
@@ -248,6 +295,10 @@ impl SimDisk {
         assert_eq!(fates.len(), total, "one fate per unsynced write");
         let mut it = fates.iter();
         for file in [&mut self.superblock, &mut self.rows, &mut self.rows_old] {
+            // An un-fsynced truncate simply did not happen, exactly as in
+            // `crash`. It has no fate of its own: the file either kept its
+            // length or did not, and "did not" is the harder case.
+            file.pending_truncate = None;
             let pending = std::mem::take(&mut file.unsynced);
             for (offset, data) in pending {
                 SimFile::settle_one(

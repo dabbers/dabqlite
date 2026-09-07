@@ -41,7 +41,7 @@ use dabqlite_core::inspect::{inspect, InspectReport, SlotState, Verdict};
 use dabqlite_core::migration::V1_SCHEMA_HASH;
 use dabqlite_core::SCHEMA_HASH;
 use dabqlite_core::{Capacities, Output};
-use dabqlite_host::posix::{rows_file_name, LOCK_FILE, SUPERBLOCK_FILE};
+use dabqlite_host::posix::{rows_file_name, SUPERBLOCK_FILE};
 use dabqlite_host::{Host, PosixStorage, ReadOnlyDir};
 
 fn read_optional(path: &Path) -> Vec<u8> {
@@ -195,25 +195,10 @@ fn print_report(dir: &Path, report: &InspectReport) {
 /// original made worse.
 /// Is a writer holding the single-writer lock right now?
 ///
-/// Checked WITHOUT creating or writing anything: the lock file is opened
-/// read-only (flock works on any descriptor) and released immediately.
-/// `None` means the question could not be answered — no lock file, or a
-/// mount that will not even open it — which is treated as "no writer",
-/// since a rescue must still be possible on media that barely works.
+/// Checked WITHOUT creating, writing, or locking anything — see
+/// `posix::writer_holds`.
 fn live_writer(dir: &Path) -> Option<bool> {
-    let path = dir.join(LOCK_FILE);
-    if !path.exists() {
-        return Some(false);
-    }
-    let file = std::fs::File::open(&path).ok()?;
-    match file.try_lock() {
-        Ok(()) => {
-            drop(file); // release immediately; we only asked a question
-            Some(false)
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Some(true),
-        Err(_) => None,
-    }
+    dabqlite_host::posix::writer_holds(dir)
 }
 
 fn repair_to(src: &Path, dest: &Path, force_live: bool) -> Result<(u64, u64), String> {
