@@ -37,6 +37,11 @@ pub fn migrate_row(old: records_v1::RecordsRow) -> records::RecordsRow {
         // Every migrated row is a record: the legacy format had no
         // deletions to carry across.
         kind: records::RECORDS_KIND_RECORD,
+        // Each migrated row is its own commit as far as the format is
+        // concerned: the migration writes the whole file and then flips
+        // the superblock once, so no row is part of a multi-row commit
+        // group that recovery would need to reassemble.
+        span: 0,
         id: old.id,
         value,
     }
@@ -541,7 +546,7 @@ impl MigrationEngine {
         let old = records_v1::decode_records_row(slot).expect("validated during on_old_rows");
         let new = migrate_row(old);
         let mut out = [0u8; ROW_SIZE];
-        encode_row(RowKind::Record, new.id, &new.value, &mut out);
+        encode_row(RowKind::Record, new.span, new.id, &new.value, &mut out);
         self.state = MState::WriteNewRows {
             generation,
             row_count,

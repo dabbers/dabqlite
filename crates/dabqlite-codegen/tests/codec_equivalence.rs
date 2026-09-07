@@ -14,7 +14,8 @@ use dabqlite_core::layout::RowKind;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
 use generated::{
     decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_RECORD,
-    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_ROW_SIZE,
+    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_ROW_SIZE, RECORDS_SPAN_MAX,
+    RECORDS_SPAN_OFFSET,
 };
 
 /// Deterministic pseudo-random stream without pulling rand into this crate:
@@ -52,12 +53,17 @@ fn generated_encode_is_byte_identical_to_hand_written() {
             _ => (RowKind::Record, RECORDS_KIND_RECORD),
         };
 
+        // Every legal span, cycled, so the commit-group byte is covered by
+        // the equivalence exactly like the kind byte is.
+        let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
+
         let mut hand_bytes = [0u8; ROW_SIZE];
-        hand::encode_row(kind, id, &value, &mut hand_bytes);
+        hand::encode_row(kind, span, id, &value, &mut hand_bytes);
         let mut gen_bytes = [0u8; RECORDS_ROW_SIZE];
         encode_records_row(
             &RecordsRow {
                 kind: kind_byte,
+                span,
                 id,
                 value,
             },
@@ -87,7 +93,8 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                 2 => RowKind::Update,
                 _ => RowKind::Record,
             };
-            hand::encode_row(kind, id, &value, &mut slot);
+            let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
+            hand::encode_row(kind, span, id, &value, &mut slot);
             if round % 4 == 0 {
                 // Corrupt a random byte with a random mask (sometimes 0 =
                 // no corruption; both decoders must still agree).
@@ -117,6 +124,11 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                     hand_kind, row.kind,
                     "round {round}: row KIND diverged - a record and a deletion must never be confused"
                 );
+                assert_eq!(
+                    hand_slot.span, row.span,
+                    "round {round}: commit SPAN diverged - the two codecs would draw \
+                     commit boundaries in different places after a crash"
+                );
             }
             (h, g) => panic!(
                 "round {round}: verdicts diverged (hand={:?}, generated={:?})",
@@ -141,6 +153,9 @@ fn generated_codec_has_no_dead_bytes_either() {
     ] {
         let row = RecordsRow {
             kind,
+            // A mid-range span: flipping any of its bits must be caught,
+            // in either direction.
+            span: 0b0010_1010,
             id: 0xDAB0_0001,
             value: *b"0123456789abcdef",
         };
@@ -159,4 +174,67 @@ fn generated_codec_has_no_dead_bytes_either() {
     }
     // And short input is rejected, not sliced.
     assert_eq!(decode_records_row(&slot[..RECORDS_ROW_SIZE - 1]), None);
+}
+
+/// A span byte beyond what the format defines is damage, and BOTH codecs
+/// must refuse it — even though the checksum over the damaged row is
+/// perfectly valid. This is the same rule the kind byte lives under: the
+/// value space is closed, so an out-of-range value is evidence, not data.
+///
+/// The check matters because a too-large span would tell recovery to
+/// expect a commit group longer than the engine can ever write, which is
+/// exactly how a misdirected write or a foreign file would mislead it.
+#[test]
+fn both_codecs_refuse_a_span_the_format_does_not_define() {
+    for span in (RECORDS_SPAN_MAX as u16 + 1)..=255 {
+        let mut slot = [0u8; RECORDS_ROW_SIZE];
+        // Encode a legal row, then rewrite the span byte and re-checksum
+        // by hand so the slot is impeccable except for that one field.
+        hand::encode_row(RowKind::Record, 0, 7, b"................", &mut slot);
+        slot[RECORDS_SPAN_OFFSET] = span as u8;
+        let crc = crc32_ieee(&slot[0..RECORDS_SPAN_OFFSET + 1]);
+        slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5]
+            .copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(
+            decode_records_row(&slot),
+            None,
+            "the generated codec accepted span {span}, which no commit can produce"
+        );
+        assert!(
+            hand::decode_row(&slot).is_none(),
+            "the reference codec accepted span {span}, which no commit can produce"
+        );
+    }
+}
+
+/// And every span the format DOES define round-trips through both codecs,
+/// so the refusal above is a boundary and not a blanket.
+#[test]
+fn both_codecs_round_trip_every_legal_span() {
+    for span in 0..=RECORDS_SPAN_MAX {
+        let mut slot = [0u8; RECORDS_ROW_SIZE];
+        hand::encode_row(RowKind::Update, span, 99, b"abcdefghijklmnop", &mut slot);
+        let decoded = decode_records_row(&slot).expect("legal span must decode");
+        assert_eq!(decoded.span, span);
+        assert_eq!(hand::decode_row(&slot).expect("legal span").span, span);
+    }
+}
+
+/// CRC-32/IEEE, spelled out here rather than imported: this test rewrites a
+/// row's checksum by hand, and doing so with the crate's own helper would
+/// let a bug in that helper hide the very thing under test.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }

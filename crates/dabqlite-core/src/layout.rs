@@ -11,8 +11,9 @@
 //!      0     8  id        (u64 LE)
 //!      8    16  value     (fixed-width payload)
 //!     24     1  kind      (0 = record, 1 = tombstone, 2 = update)
-//!     25     4  crc32     (over bytes 0..25 — the kind byte INCLUDED)
-//!     29     3  padding   (zero)
+//!     25     1  span      (further rows in the same commit; 0 = last/only)
+//!     26     4  crc32     (over bytes 0..26 — kind and span INCLUDED)
+//!     30     2  padding   (zero)
 //!
 //! The kind byte is inside the checksummed region on purpose. A deletion
 //! is recorded by appending a tombstone rather than overwriting anything,
@@ -21,6 +22,16 @@
 //! flip could turn a tombstone back into a record with a still-valid
 //! checksum, a deleted row would silently reappear. Covering it by the
 //! CRC makes that impossible to miss.
+//!
+//! The span byte is there for the same reason, one level up. A batch is
+//! several rows made durable under ONE superblock flip; after a crash,
+//! recovery must tell an interrupted batch apart from several separate
+//! commits that storage rolled back after acknowledging them. The rows of
+//! an `n`-row commit carry spans `n-1, n-2, ..., 0`, so the run past the
+//! manifest is self-describing. Leaving that byte out of the checksum
+//! would let one bit flip redraw a commit boundary — turning evidence of
+//! lost acknowledged data into an ordinary interrupted write, or the
+//! reverse.
 //! ```
 //!
 //! ## Superblock copy (64 bytes, SB_COPIES redundant slots in the zone)
@@ -51,9 +62,15 @@ const _: () = assert!(ROW_SIZE == 32);
 const _: () = assert!(records::RECORDS_COL_ID_OFFSET == 0);
 const _: () = assert!(records::RECORDS_COL_VALUE_OFFSET == 8);
 const _: () = assert!(records::RECORDS_KIND_OFFSET == 8 + VALUE_LEN);
-const _: () = assert!(records::RECORDS_CRC_OFFSET == records::RECORDS_KIND_OFFSET + 1);
+const _: () = assert!(records::RECORDS_SPAN_OFFSET == records::RECORDS_KIND_OFFSET + 1);
+const _: () = assert!(records::RECORDS_CRC_OFFSET == records::RECORDS_SPAN_OFFSET + 1);
 const _: () =
     assert!(VALUE_LEN == records::RECORDS_KIND_OFFSET - records::RECORDS_COL_VALUE_OFFSET);
+
+/// The largest number of rows one commit may contain, fixed by the width
+/// of the span byte's validated range. A commit of `n` rows writes spans
+/// `n-1 .. 0`, so `n` can be at most `SPAN_MAX + 1`.
+pub const MAX_COMMIT_ROWS: usize = records::RECORDS_SPAN_MAX as usize + 1;
 
 /// What a row slot says about itself. The discriminant lives inside the
 /// checksum (see the module docs).
@@ -97,6 +114,9 @@ impl RowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowSlot {
     pub kind: RowKind,
+    /// Rows still to come in the same commit: 0 for the last (or only)
+    /// row of a commit, `n-1` for the first row of an `n`-row batch.
+    pub span: u8,
     pub id: u64,
     pub value: [u8; VALUE_LEN],
 }
@@ -133,10 +153,21 @@ pub const SCHEMA_HASH: u64 = records::RECORDS_SCHEMA_HASH;
 /// Encode a row into its slot. Delegates to the schema-compiled codec; the
 /// hand-written [`reference`] implementation exists as a permanent second
 /// opinion and is asserted equivalent in debug builds and test suites.
-pub fn encode_row(kind: RowKind, id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
+pub fn encode_row(
+    kind: RowKind,
+    span: u8,
+    id: u64,
+    value: &[u8; VALUE_LEN],
+    out: &mut [u8; ROW_SIZE],
+) {
+    debug_assert!(
+        (span as usize) < MAX_COMMIT_ROWS,
+        "span {span} exceeds the largest commit this format can describe"
+    );
     records::encode_records_row(
         &records::RecordsRow {
             kind: kind.byte(),
+            span,
             id,
             value: *value,
         },
@@ -147,7 +178,7 @@ pub fn encode_row(kind: RowKind, id: u64, value: &[u8; VALUE_LEN], out: &mut [u8
     #[cfg(debug_assertions)]
     {
         let mut check = [0u8; ROW_SIZE];
-        reference::encode_row(kind, id, value, &mut check);
+        reference::encode_row(kind, span, id, value, &mut check);
         debug_assert_eq!(*out, check, "generated and reference codecs diverged");
     }
 }
@@ -160,6 +191,7 @@ pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
     let decoded = records::decode_records_row(bytes).and_then(|row| {
         Some(RowSlot {
             kind: RowKind::from_byte(row.kind)?,
+            span: row.span,
             id: row.id,
             value: row.value,
         })
@@ -177,9 +209,15 @@ pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
 /// in debug builds on every call above, and exhaustively in the codegen
 /// equivalence suite). Never wired into the engine directly.
 pub mod reference {
-    use super::{crc32, RowKind, RowSlot, ROW_SIZE, VALUE_LEN};
+    use super::{crc32, RowKind, RowSlot, MAX_COMMIT_ROWS, ROW_SIZE, VALUE_LEN};
 
-    pub fn encode_row(kind: RowKind, id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
+    pub fn encode_row(
+        kind: RowKind,
+        span: u8,
+        id: u64,
+        value: &[u8; VALUE_LEN],
+        out: &mut [u8; ROW_SIZE],
+    ) {
         out[0..8].copy_from_slice(&id.to_le_bytes());
         out[8..8 + VALUE_LEN].copy_from_slice(value);
         out[24] = match kind {
@@ -187,20 +225,21 @@ pub mod reference {
             RowKind::Tombstone => 1,
             RowKind::Update => 2,
         };
-        let crc = crc32(&out[0..25]);
-        out[25..29].copy_from_slice(&crc.to_le_bytes());
-        out[29..32].fill(0);
+        out[25] = span;
+        let crc = crc32(&out[0..26]);
+        out[26..30].copy_from_slice(&crc.to_le_bytes());
+        out[30..32].fill(0);
     }
 
     pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
         if bytes.len() < ROW_SIZE {
             return None;
         }
-        let stored = u32::from_le_bytes(bytes[25..29].try_into().ok()?);
-        if crc32(&bytes[0..25]) != stored {
+        let stored = u32::from_le_bytes(bytes[26..30].try_into().ok()?);
+        if crc32(&bytes[0..26]) != stored {
             return None;
         }
-        if bytes[29..32] != [0u8; 3] {
+        if bytes[30..32] != [0u8; 2] {
             return None;
         }
         let kind = match bytes[24] {
@@ -209,9 +248,18 @@ pub mod reference {
             2 => RowKind::Update,
             _ => return None,
         };
+        let span = bytes[25];
+        if span as usize >= MAX_COMMIT_ROWS {
+            return None;
+        }
         let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
         let value: [u8; VALUE_LEN] = bytes[8..8 + VALUE_LEN].try_into().ok()?;
-        Some(RowSlot { kind, id, value })
+        Some(RowSlot {
+            kind,
+            span,
+            id,
+            value,
+        })
     }
 }
 
@@ -301,11 +349,12 @@ mod tests {
     fn row_roundtrip() {
         let mut slot = [0u8; ROW_SIZE];
         let value = *b"0123456789abcdef";
-        encode_row(RowKind::Record, 42, &value, &mut slot);
+        encode_row(RowKind::Record, 0, 42, &value, &mut slot);
         assert_eq!(
             decode_row(&slot),
             Some(RowSlot {
                 kind: RowKind::Record,
+                span: 0,
                 id: 42,
                 value
             })
@@ -316,7 +365,7 @@ mod tests {
         );
 
         // A tombstone round-trips too, and is NOT a record.
-        encode_row(RowKind::Tombstone, 42, &value, &mut slot);
+        encode_row(RowKind::Tombstone, 0, 42, &value, &mut slot);
         let decoded = decode_row(&slot).expect("tombstone must decode");
         assert_eq!(decoded.kind, RowKind::Tombstone);
         assert_eq!(decoded.id, 42);
@@ -332,7 +381,7 @@ mod tests {
     fn length_gates_are_exact_in_both_codecs() {
         let value = *b"0123456789abcdef";
         let mut slot = [0u8; ROW_SIZE];
-        encode_row(RowKind::Record, 42, &value, &mut slot);
+        encode_row(RowKind::Record, 0, 42, &value, &mut slot);
         let mut long_row = [0u8; ROW_SIZE + 1];
         long_row[..ROW_SIZE].copy_from_slice(&slot);
         for short in 0..ROW_SIZE {
@@ -345,6 +394,7 @@ mod tests {
         }
         let want = RowSlot {
             kind: RowKind::Record,
+            span: 0,
             id: 42,
             value,
         };
@@ -371,7 +421,7 @@ mod tests {
     #[test]
     fn row_rejects_corruption() {
         let mut slot = [0u8; ROW_SIZE];
-        encode_row(RowKind::Record, 42, &[7u8; VALUE_LEN], &mut slot);
+        encode_row(RowKind::Record, 0, 42, &[7u8; VALUE_LEN], &mut slot);
         slot[3] ^= 0x01;
         assert_eq!(decode_row(&slot), None);
         // Negative space: an all-zero slot must not decode.
@@ -385,18 +435,22 @@ mod tests {
         // Both kinds. The KIND byte is the one this matters most for: if
         // a flip there went undetected, a deletion would silently become a
         // record again and deleted data would reappear.
+        // Spans too: a mid-range span exercises bits in both halves of
+        // the byte, so a flip in either direction has to be caught.
         for kind in [RowKind::Record, RowKind::Tombstone, RowKind::Update] {
-            let mut row = [0u8; ROW_SIZE];
-            encode_row(kind, 42, &[7u8; VALUE_LEN], &mut row);
-            for byte in 0..ROW_SIZE {
-                for bit in 0..8 {
-                    let mut damaged = row;
-                    damaged[byte] ^= 1 << bit;
-                    assert_eq!(
-                        decode_row(&damaged),
-                        None,
-                        "row flip at byte {byte} bit {bit} undetected ({kind:?})"
-                    );
+            for span in [0u8, 1, 0b0010_1010, 63] {
+                let mut row = [0u8; ROW_SIZE];
+                encode_row(kind, span, 42, &[7u8; VALUE_LEN], &mut row);
+                for byte in 0..ROW_SIZE {
+                    for bit in 0..8 {
+                        let mut damaged = row;
+                        damaged[byte] ^= 1 << bit;
+                        assert_eq!(
+                            decode_row(&damaged),
+                            None,
+                            "row flip at byte {byte} bit {bit} undetected ({kind:?}, span {span})"
+                        );
+                    }
                 }
             }
         }

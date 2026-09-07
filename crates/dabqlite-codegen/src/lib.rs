@@ -60,6 +60,19 @@ pub struct Schema {
     /// row with a valid checksum, which is precisely the silent wrongness
     /// this project does not permit.
     ///
+    /// v3 adds a second checksummed byte, SPAN: how many further rows were
+    /// written as part of the same commit. It exists so that a batch —
+    /// several rows made durable under ONE superblock flip — can be told
+    /// apart, after a crash, from several separate commits. Recovery counts
+    /// rows past the manifest to decide whether an acknowledged commit was
+    /// rolled back by a lying fsync; without SPAN, a five-row batch
+    /// interrupted mid-flight would be indistinguishable from five
+    /// acknowledged single-row commits that a storage fault erased, and the
+    /// engine would have to either cry wolf or go quiet. Neither is
+    /// acceptable, so the row says how many companions it was written with.
+    /// Like KIND, SPAN sits inside the CRC: a bit flip must not be able to
+    /// re-draw a commit boundary.
+    ///
     /// The version is part of the schema hash, so a binary that does not
     /// understand a format refuses the file at open (`SchemaMismatch`)
     /// instead of misreading it. Declare an older format with
@@ -68,7 +81,7 @@ pub struct Schema {
 }
 
 /// The current row format emitted for a schema that does not say otherwise.
-pub const CURRENT_ROW_FORMAT: u8 = 2;
+pub const CURRENT_ROW_FORMAT: u8 = 3;
 
 /// Row kinds, v2 and later. The discriminant lives inside the checksum.
 pub const ROW_KIND_RECORD: u8 = 0;
@@ -82,6 +95,18 @@ pub const ROW_KIND_UPDATE: u8 = 2;
 /// Largest kind this format defines; anything above is damaged or foreign.
 pub const ROW_KIND_MAX: u8 = ROW_KIND_UPDATE;
 
+/// Largest SPAN a v3 row may carry: the number of further rows written in
+/// the same commit. A commit of `n` rows writes spans `n-1, n-2, ..., 0`,
+/// so this also fixes the largest batch the engine will accept
+/// (`ROW_SPAN_MAX + 1` rows).
+///
+/// It is a decode-time check, not just a policy: a slot claiming a span
+/// beyond this is damaged or foreign, and saying so at the codec is one
+/// more byte that cannot be quietly wrong. The bound keeps a batch's
+/// staging area small enough to reason about, and keeps the worst-case
+/// work a single commit can queue behind an fsync bounded.
+pub const ROW_SPAN_MAX: u8 = 63;
+
 /// Computed record layout: sequential field offsets, then the CRC, then
 /// zero padding to an 8-byte multiple. Every byte of the row is covered:
 /// fields and CRC by the checksum, padding by the zero check.
@@ -91,6 +116,9 @@ pub struct Layout {
     /// Offset of the one-byte row-kind discriminant (v2+), inside the
     /// checksummed region. `None` in v1, which has no kind byte.
     pub kind_offset: Option<usize>,
+    /// Offset of the one-byte commit SPAN (v3+), inside the checksummed
+    /// region, immediately after the kind. `None` before v3.
+    pub span_offset: Option<usize>,
     pub crc_offset: usize,
     pub row_size: usize,
 }
@@ -410,11 +438,18 @@ impl Schema {
         if kind_offset.is_some() {
             at += 1;
         }
+        // v3+ reserves one more byte for the commit span, also before the
+        // CRC (see `Schema::format`).
+        let span_offset = (self.format >= 3).then_some(at);
+        if span_offset.is_some() {
+            at += 1;
+        }
         let crc_offset = at;
         let row_size = (crc_offset + 4).next_multiple_of(8);
         Layout {
             field_offsets: offsets,
             kind_offset,
+            span_offset,
             crc_offset,
             row_size,
         }
@@ -536,6 +571,16 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
         };
         w(format!("| {off} | {size} | `{}`{pk} | {enc} |", col.name));
     }
+    if let Some(kind) = layout.kind_offset {
+        w(format!(
+            "| {kind} | 1 | kind | {ROW_KIND_RECORD} = record, {ROW_KIND_TOMBSTONE} = tombstone, {ROW_KIND_UPDATE} = update |"
+        ));
+    }
+    if let Some(span) = layout.span_offset {
+        w(format!(
+            "| {span} | 1 | span | rows still to come in the same commit (0..={ROW_SPAN_MAX}) |"
+        ));
+    }
     let crc = layout.crc_offset;
     w(format!("| {crc} | 4 | crc32 | IEEE, over bytes 0..{crc} |"));
     w(format!(
@@ -547,6 +592,15 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
     w("A slot decodes only if the checksum matches AND the padding is zero —".into());
     w("every byte of a committed row is covered by verification.".into());
     w(String::new());
+    if layout.span_offset.is_some() {
+        w("`kind` and `span` sit INSIDE the checksummed region, not in the".into());
+        w("padding. `kind` decides whether a slot holds data or deletes it, and".into());
+        w("`span` decides where one commit ends and the next begins; a bit flip".into());
+        w("that could silently change either would be able to resurrect a".into());
+        w("deleted row, or to disguise a rolled-back commit as an interrupted".into());
+        w("one. Covering them by the CRC makes both impossible to miss.".into());
+        w(String::new());
+    }
     w("## Superblock copy (64 bytes × 4 slots)".into());
     w(String::new());
     w("| offset | size | field | encoding |".into());
@@ -573,6 +627,20 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
     w("generation g+1 → fsync superblock (the commit point). Rows are always".into());
     w("durable before the superblock that references them.".into());
     w(String::new());
+    if layout.span_offset.is_some() {
+        w("Batch of `n` rows: write all `n` slots (spans `n-1` down to `0`) →".into());
+        w("fsync rows → write both superblock copies of generation g+1 → fsync".into());
+        w("superblock. One commit point for the whole batch, so it lands".into());
+        w("all-or-nothing; the fsync count does not grow with `n`.".into());
+        w(String::new());
+        w("After a crash, recovery reads slots past the manifest and groups them".into());
+        w("by span. One incomplete group, or one complete group with nothing".into());
+        w("after it, is the ordinary trace of a commit that was in flight and".into());
+        w("never acknowledged. A complete group with a further valid row after it".into());
+        w("cannot be: it means an acknowledged commit was rolled back by storage".into());
+        w("that lied about an fsync, and the open reports that loudly.".into());
+        w(String::new());
+    }
     w(format!(
         "## Migration (schema `0x{legacy_hash:016X}` → `0x{hash:016X}`)"
     ));
@@ -619,6 +687,11 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
             ROW_KIND_RECORD, ROW_KIND_TOMBSTONE, ROW_KIND_UPDATE, ROW_KIND_MAX
         ));
     }
+    if let Some(span) = layout.span_offset {
+        o.push_str(&format!(
+            "/// Offset of the commit SPAN: how many further rows were written\n             /// as part of the same commit. Also INSIDE the checksummed region —\n             /// a bit flip here must not be able to re-draw a commit boundary.\n             pub const {upper}_SPAN_OFFSET: usize = {span};\n             /// Largest span a slot may claim; beyond it the slot is damaged\n             /// or foreign, and the decoder refuses it.\n             pub const {upper}_SPAN_MAX: u8 = {ROW_SPAN_MAX};\n"
+        ));
+    }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
         o.push_str(&format!(
             "pub const {upper}_COL_{}_OFFSET: usize = {off};\n",
@@ -633,6 +706,11 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     if layout.kind_offset.is_some() {
         o.push_str(
             "    /// `KIND_RECORD` for a row that holds data, `KIND_TOMBSTONE`\n             \x20   /// for one that records a deletion.\n             \x20   pub kind: u8,\n",
+        );
+    }
+    if layout.span_offset.is_some() {
+        o.push_str(
+            "    /// Rows still to come in the same commit: 0 for the last (or\n             \x20   /// only) row of a commit, `n-1` for the first of `n`.\n             \x20   pub span: u8,\n",
         );
     }
     for col in &schema.columns {
@@ -694,6 +772,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     if layout.kind_offset.is_some() {
         o.push_str(&format!("    out[{upper}_KIND_OFFSET] = row.kind;\n"));
     }
+    if layout.span_offset.is_some() {
+        o.push_str(&format!("    out[{upper}_SPAN_OFFSET] = row.span;\n"));
+    }
     o.push_str(&format!(
         "    let crc = gen_crc32(&out[0..{upper}_CRC_OFFSET]);\n\
          \x20   out[{upper}_CRC_OFFSET..{upper}_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());\n\
@@ -726,6 +807,14 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
              \x20   }}\n"
         ));
     }
+    if layout.span_offset.is_some() {
+        o.push_str(&format!(
+            "    let span = bytes[{upper}_SPAN_OFFSET];\n\
+             \x20   if span > {upper}_SPAN_MAX {{\n\
+             \x20       return None;\n\
+             \x20   }}\n"
+        ));
+    }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
         match col.ty {
             ColType::BigInt => o.push_str(&format!(
@@ -743,6 +832,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     let mut fields: Vec<&str> = Vec::new();
     if layout.kind_offset.is_some() {
         fields.push("kind");
+    }
+    if layout.span_offset.is_some() {
+        fields.push("span");
     }
     fields.extend(schema.columns.iter().map(|c| c.name.as_str()));
     o.push_str(&format!(

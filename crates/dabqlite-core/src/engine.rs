@@ -1161,7 +1161,9 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Update, id, &value, slot);
+        // Span 0: a single-row commit, the only kind these three paths
+        // make. `Input::Batch` is where a span above 0 comes from.
+        encode_row(RowKind::Update, 0, id, &value, slot);
         self.pending_update = Some((id, value, old_row));
         self.state = State::UpdateWriteRow;
         Output::Write {
@@ -1227,7 +1229,7 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Tombstone, id, &[0u8; VALUE_LEN], slot);
+        encode_row(RowKind::Tombstone, 0, id, &[0u8; VALUE_LEN], slot);
         self.pending_delete = Some((id, record_row));
         self.state = State::DeleteWriteRow;
         Output::Write {
@@ -1297,7 +1299,7 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Record, id, &value, slot);
+        encode_row(RowKind::Record, 0, id, &value, slot);
         self.pending = Some((id, value));
         self.state = State::InsertWriteRow;
         Output::Write {

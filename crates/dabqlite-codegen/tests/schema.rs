@@ -27,10 +27,18 @@ fn records_schema_matches_the_engine_exactly() {
     assert_eq!(layout.field_offsets, vec![0, 8]);
     // v2 rows carry the kind discriminant between the fields and the CRC,
     // so the CRC covers it — a flip there must never be able to turn a
-    // deletion back into a record.
+    // deletion back into a record. v3 adds the commit span next to it,
+    // under the same checksum, so a flip cannot redraw a commit boundary
+    // either.
     assert_eq!(schema.format, dabqlite_codegen::CURRENT_ROW_FORMAT);
     assert_eq!(layout.kind_offset, Some(24));
-    assert_eq!(layout.crc_offset, 25);
+    assert_eq!(layout.span_offset, Some(25));
+    assert_eq!(layout.crc_offset, 26);
+    // Both bytes are strictly below the CRC offset, which is what "inside
+    // the checksummed region" means. Stated as an assertion rather than a
+    // comment so that moving either byte into the padding fails here.
+    assert!(layout.kind_offset.unwrap() < layout.crc_offset);
+    assert!(layout.span_offset.unwrap() < layout.crc_offset);
     assert_eq!(layout.row_size, dabqlite_core::ROW_SIZE);
     assert_eq!(
         schema.columns[1].ty.width(),

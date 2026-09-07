@@ -13,7 +13,7 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-9407a7e1d5cbe17a.dabq` | row slots for `records` under the current schema |
+| `rows-a621c5242711bdf9.dabq` | row slots for `records` under the current schema |
 | `rows-c4345b300a440058.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
@@ -21,17 +21,26 @@ Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0x9407A7E1D5CBE17A`)
+## Row slot (32 bytes, table `records`, schema hash `0xA621C5242711BDF9`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
 | 0 | 8 | `id` (primary key) | u64, little-endian |
 | 8 | 16 | `value` | 16 raw bytes, fixed width |
-| 25 | 4 | crc32 | IEEE, over bytes 0..25 |
-| 29 | 3 | padding | must be zero (validated on decode: no dead bytes) |
+| 24 | 1 | kind | 0 = record, 1 = tombstone, 2 = update |
+| 25 | 1 | span | rows still to come in the same commit (0..=63) |
+| 26 | 4 | crc32 | IEEE, over bytes 0..26 |
+| 30 | 2 | padding | must be zero (validated on decode: no dead bytes) |
 
 A slot decodes only if the checksum matches AND the padding is zero —
 every byte of a committed row is covered by verification.
+
+`kind` and `span` sit INSIDE the checksummed region, not in the
+padding. `kind` decides whether a slot holds data or deletes it, and
+`span` decides where one commit ends and the next begins; a bit flip
+that could silently change either would be able to resurrect a
+deleted row, or to disguise a rolled-back commit as an interrupted
+one. Covering them by the CRC makes both impossible to miss.
 
 ## Superblock copy (64 bytes × 4 slots)
 
@@ -40,7 +49,7 @@ every byte of a committed row is covered by verification.
 | 0 | 8 | magic | `"DABQSB01"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0x9407A7E1D5CBE17A` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0xA621C5242711BDF9` for this schema) |
 | 32 | 4 | crc32 | IEEE, over bytes 0..32 |
 | 36 | 28 | padding | must be zero (validated) |
 
@@ -57,7 +66,19 @@ Insert: write row slot → fsync rows → write both superblock copies of
 generation g+1 → fsync superblock (the commit point). Rows are always
 durable before the superblock that references them.
 
-## Migration (schema `0xC4345B300A440058` → `0x9407A7E1D5CBE17A`)
+Batch of `n` rows: write all `n` slots (spans `n-1` down to `0`) →
+fsync rows → write both superblock copies of generation g+1 → fsync
+superblock. One commit point for the whole batch, so it lands
+all-or-nothing; the fsync count does not grow with `n`.
+
+After a crash, recovery reads slots past the manifest and groups them
+by span. One incomplete group, or one complete group with nothing
+after it, is the ordinary trace of a commit that was in flight and
+never acknowledged. A complete group with a further valid row after it
+cannot be: it means an acknowledged commit was rolled back by storage
+that lied about an fsync, and the open reports that loudly.
+
+## Migration (schema `0xC4345B300A440058` → `0xA621C5242711BDF9`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to
