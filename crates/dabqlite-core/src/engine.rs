@@ -727,6 +727,12 @@ pub struct Engine {
     /// for one slot. Not records and not deletions, but every slot has to
     /// be accounted for somewhere or the counting invariant is a lie.
     chunks: u64,
+    /// Of those, the ones belonging to a value that has since been
+    /// superseded or deleted. `retired` counts retired HEADS, so without
+    /// this a retired eight-slot value would report one slot of dead
+    /// weight instead of eight — and dead weight is the number a host
+    /// watches to decide when to rebuild.
+    dead_chunks: u64,
     /// Rows a substring search has verified since this engine opened.
     ///
     /// Diagnostic only, and exposed on purpose: "paging a search is
@@ -870,6 +876,7 @@ impl Engine {
             retired: 0,
             tombstones: 0,
             chunks: 0,
+            dead_chunks: 0,
             long_values: 0,
             find_verifications: core::cell::Cell::new(0),
             salvage: false,
@@ -983,11 +990,17 @@ impl Engine {
     }
 
     /// Slots that hold neither a live record nor useful history: retired
-    /// records plus the deletions that retired them. This is the dead
-    /// weight a rebuild (`dabqlite-inspect --repair-to`) compacts away,
-    /// and the number a host should watch to decide when to do it.
+    /// records, the continuations those records held, and the deletions
+    /// that retired them. This is the dead weight a rebuild
+    /// (`dabqlite-inspect --repair-to`) compacts away, and the number a
+    /// host should watch to decide when to do it.
+    ///
+    /// Counted in SLOTS, the same unit as capacity — a retired value that
+    /// spanned eight slots frees eight. Anything else would be a number
+    /// that cannot be compared against the one it exists to be compared
+    /// against.
     pub fn dead_slots(&self) -> u64 {
-        self.retired + self.tombstones
+        self.retired + self.tombstones + self.dead_chunks
     }
 
     fn assert_invariants(&self) {
@@ -1035,6 +1048,10 @@ impl Engine {
                 self.live_count + self.retired + self.tombstones + self.chunks,
                 self.row_count
             );
+            // Dead continuations are continuations, and dead weight never
+            // exceeds the file.
+            debug_assert!(self.dead_chunks <= self.chunks);
+            debug_assert!(self.dead_slots() <= self.row_count);
         }
         // In salvage mode the manifest still counts the damaged slots, so
         // the indices are short by exactly the quarantine.
@@ -1403,6 +1420,7 @@ impl Engine {
         self.retired = 0;
         self.tombstones = 0;
         self.chunks = 0;
+        self.dead_chunks = 0;
         self.long_values = 0;
         self.live_bits.fill(0);
         // Rows already consumed as part of a value's run. A value is read
@@ -1482,8 +1500,7 @@ impl Engine {
                         });
                     }
                     if let Some(old_row) = self.live_row_of(id) {
-                        self.set_live(old_row, false);
-                        self.retired += 1;
+                        self.retire(old_row, row_count);
                     } else {
                         self.live_count += 1;
                     }
@@ -1533,9 +1550,8 @@ impl Engine {
                     };
                     let off = (row as usize) * ROW_SIZE;
                     self.arena[off..off + ROW_SIZE].copy_from_slice(&data[off..off + ROW_SIZE]);
-                    self.set_live(record_row, false);
+                    self.retire(record_row, row_count);
                     self.live_count -= 1;
-                    self.retired += 1;
                     self.tombstones += 1;
                     // Accounted for, never indexed: a deletion is not
                     // searchable content.
@@ -2083,8 +2099,9 @@ impl Engine {
                 } => {
                     debug_assert_eq!(at, row, "commit disagrees with validation");
                     if let Some(old_row) = supersedes {
-                        self.set_live(old_row, false);
-                        self.retired += 1;
+                        // The staged rows are already in the arena, so a
+                        // value this same batch superseded is reachable too.
+                        self.retire(old_row, self.row_count + self.batch_rows as u64);
                     } else {
                         self.live_count += 1;
                     }
@@ -2103,12 +2120,11 @@ impl Engine {
                 }
                 BatchEffect::Delete { at, record_row, .. } => {
                     debug_assert_eq!(at, row, "commit disagrees with validation");
-                    self.set_live(record_row, false);
+                    self.retire(record_row, self.row_count + self.batch_rows as u64);
                     // Accounted for, never indexed: a deletion is not
                     // searchable content.
                     self.trigram.skip_row(row);
                     self.live_count -= 1;
-                    self.retired += 1;
                     self.tombstones += 1;
                     row += 1;
                 }
@@ -2273,12 +2289,11 @@ impl Engine {
                     .expect("pending update at commit");
                 self.generation += 1;
                 // The superseded slot stops being live; the new one starts.
-                self.set_live(old_row, false);
+                self.retire(old_row, self.row_count);
                 self.bind_indices(id, self.row_count);
                 self.trigram.insert(self.row_count, &value);
                 self.set_live(self.row_count, true);
                 self.row_count += 1;
-                self.retired += 1;
                 self.state = State::Ready;
                 // Pair assertion: the new value must now be the one read.
                 debug_assert_eq!(self.lookup_value(id), Some(value));
@@ -2299,12 +2314,11 @@ impl Engine {
                 // The record's slot stops being live. Nothing is removed
                 // from any index: they keep pointing at the retired slot,
                 // and every read path asks `is_live` before trusting it.
-                self.set_live(record_row, false);
+                self.retire(record_row, self.row_count);
                 // The tombstone slot is accounted for but never indexed.
                 self.trigram.skip_row(self.row_count);
                 self.row_count += 1;
                 self.live_count -= 1;
-                self.retired += 1;
                 self.tombstones += 1;
                 self.state = State::Ready;
                 // Pair assertion: the deleted row must now be unreadable.
@@ -2864,6 +2878,41 @@ impl Engine {
             }
         }
         (rows, total)
+    }
+
+    /// Slots the value at `head_row` occupies, looking no further than
+    /// `limit`.
+    ///
+    /// The same run rule as `value_extent`, but with the bound passed in:
+    /// this is called while retiring a value, including from recovery and
+    /// from the middle of a batch, where `self.row_count` is not yet the
+    /// number of rows the arena holds.
+    fn run_len(&self, head_row: u64, limit: u64) -> u64 {
+        let off = (head_row as usize) * ROW_SIZE;
+        let Some(head) = decode_row(&self.arena[off..off + ROW_SIZE]) else {
+            return 1;
+        };
+        let mut rows = 1u64;
+        let mut r = head_row + 1;
+        while head.more && r < limit {
+            let o = (r as usize) * ROW_SIZE;
+            match decode_row(&self.arena[o..o + ROW_SIZE]) {
+                Some(slot) if slot.kind == RowKind::Chunk && slot.id == head.id => {
+                    rows += 1;
+                    r += 1;
+                }
+                _ => break,
+            }
+        }
+        rows
+    }
+
+    /// Record that the value at `head_row` has stopped being live: its
+    /// head becomes dead weight, and so does every slot it held.
+    fn retire(&mut self, head_row: u64, limit: u64) {
+        self.set_live(head_row, false);
+        self.retired += 1;
+        self.dead_chunks += self.run_len(head_row, limit) - 1;
     }
 
     /// One bounded window of `id`'s value, starting at `offset`.

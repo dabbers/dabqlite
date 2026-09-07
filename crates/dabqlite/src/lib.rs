@@ -455,9 +455,12 @@ impl From<DbError> for Error {
 pub struct Stats {
     /// Rows you can read.
     pub live: u64,
-    /// Row slots consumed — every insert, update and delete takes one.
+    /// Row slots consumed. A delete takes one; an insert or update takes
+    /// one per 16 bytes of value, and at least one.
     pub slots: u64,
-    /// Slots holding superseded or deleted rows. Rebuild to reclaim.
+    /// Slots holding superseded or deleted rows, INCLUDING the slots a
+    /// long value held. Rebuild to reclaim them. Same unit as `slots` and
+    /// `capacity`, so the three can be compared.
     pub dead: u64,
     /// The declared ceiling.
     pub capacity: u64,

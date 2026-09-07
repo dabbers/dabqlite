@@ -147,11 +147,10 @@ fn print_report(dir: &Path, report: &InspectReport) {
             report.rows.orphan_tombstones, report.rows.orphan_updates, report.rows.orphan_chunks
         );
     }
-    // Dead weight is the retired records plus the deletions that retired
-    // them: an update retires one record, a delete retires one record AND
-    // occupies a slot itself.
-    let retired = report.rows.superseded + report.rows.tombstones;
-    let dead = retired + report.rows.tombstones;
+    // Dead weight, in SLOTS: the retired records, the continuations they
+    // held, and the deletions that retired them (a delete retires a
+    // record AND occupies a slot itself).
+    let dead = report.rows.dead_slots();
     if dead > 0 {
         println!("  reclaimable slots  {dead}  (rebuild with --repair-to to compact)");
     }

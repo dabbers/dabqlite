@@ -145,6 +145,79 @@ fn a_file_backed_database_persists_and_shares_bytes_with_memory() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Dead weight is counted in SLOTS, the same unit as capacity — which
+/// only matters once a value is longer than one slot, and matters a great
+/// deal then: a store watching `dead` to decide when to rebuild would
+/// under-read an eight-slot value's retirement by a factor of eight.
+#[test]
+fn dead_weight_counts_the_slots_a_long_value_held_not_the_value() {
+    let mut db = Db::in_memory_with(64).expect("open");
+    // Eight slots: 128 bytes at 16 bytes a slot.
+    let long = Value::from_bytes(&[b'x'; 128]).unwrap();
+    let short = Value::from_text("small").unwrap();
+    db.insert(1, long.clone()).unwrap();
+    assert_eq!(db.stats().slots, 8);
+    assert_eq!(db.stats().dead, 0);
+
+    // Superseding it retires all eight, not one.
+    db.put(1, short.clone()).unwrap();
+    let s = db.stats();
+    assert_eq!(s.slots, 9);
+    assert_eq!(s.live, 1);
+    assert_eq!(s.dead, 8, "the retired value held eight slots");
+
+    // And a rebuild returns exactly that many.
+    let mut compacted = db.compact_to_memory().expect("compact");
+    assert_eq!(compacted.stats().slots, 1);
+    assert_eq!(compacted.stats().dead, 0);
+    assert_eq!(compacted.get(1).unwrap(), Some(short));
+
+    // Deleting a long value is the same story plus the tombstone.
+    let mut db = Db::in_memory_with(64).expect("open");
+    db.insert(1, long).unwrap();
+    db.remove(1).unwrap();
+    let s = db.stats();
+    assert_eq!(s.live, 0);
+    assert_eq!(s.slots, 9);
+    assert_eq!(s.dead, 9, "eight retired slots plus the tombstone");
+    // Dead weight never exceeds what is there to reclaim.
+    assert!(s.dead <= s.slots);
+}
+
+/// The same in a batch, and across a reopen: recovery rebuilds the
+/// accounting from the rows file alone, so it has to reach the same
+/// number the write path did.
+#[test]
+fn dead_weight_survives_a_reopen_and_a_batch() {
+    let long = Value::from_bytes(&[b'q'; 100]).unwrap(); // 7 slots
+    let mut db = Db::in_memory_with(64).expect("open");
+    db.batch(&[
+        Op::insert(1, long.clone()),
+        Op::insert(2, long.clone()),
+        Op::insert(3, Value::from_text("short").unwrap()),
+    ])
+    .unwrap();
+    assert_eq!(db.stats().slots, 15);
+    db.batch(&[
+        Op::put(1, Value::from_text("now short").unwrap()),
+        Op::delete(2),
+    ])
+    .unwrap();
+    let before = db.stats();
+    assert_eq!(before.live, 2);
+    assert_eq!(before.slots, 17);
+    // 7 retired for id 1, 7 + 1 tombstone for id 2.
+    assert_eq!(before.dead, 15);
+
+    let snapshot = db.snapshot().expect("snapshot");
+    let reopened = Db::load(&snapshot).expect("load");
+    assert_eq!(
+        reopened.stats(),
+        before,
+        "recovery reached a different accounting than the write path"
+    );
+}
+
 #[test]
 fn stats_expose_the_dead_weight_that_deletes_and_updates_create() {
     let mut db = Db::in_memory_with(64).expect("open");

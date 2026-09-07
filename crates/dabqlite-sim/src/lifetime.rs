@@ -784,6 +784,22 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 oracle.len() as u64,
                 "[{ctx}] inspector diverged from the oracle"
             );
+            // Reclaimable space, worked out twice: the engine tracks it
+            // as rows retire, the inspector replays the file and adds it
+            // up. It is the number a host watches to decide when to
+            // rebuild, and it is in SLOTS — a retired eight-slot value
+            // frees eight, not one.
+            assert_eq!(
+                report.rows.dead_slots(),
+                host.engine.dead_slots(),
+                "[{ctx}] inspector and engine disagree about reclaimable slots"
+            );
+            assert_eq!(
+                report.rows.live_records + report.rows.dead_slots() + report.rows.chunks
+                    - report.rows.dead_chunks,
+                used,
+                "[{ctx}] the inspector's slots do not add up to the file"
+            );
             let rr = host.engine.recovery_report();
             assert_eq!(
                 report.rollback_evidence, rr.rollback_evidence,

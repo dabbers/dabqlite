@@ -14,7 +14,7 @@
 //! allocation beyond the bounded report itself (sample lists are capped;
 //! counts are exact). The CLI in `dabqlite-host` is a thin shell over it.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::layout::{
@@ -90,6 +90,10 @@ pub struct RowScan {
     /// promised end — the slots a multi-row value occupies beyond its
     /// head.
     pub chunks: u64,
+    /// Of those, the ones held by a value that was later superseded or
+    /// deleted. Without this, a retired eight-slot value would report one
+    /// slot of reclaimable space instead of eight.
+    pub dead_chunks: u64,
     /// Values whose continuations do not run to the end the head
     /// promised: the run is missing, short, damaged, or belongs to
     /// another id. The whole value is unreadable, not just its tail.
@@ -104,6 +108,19 @@ pub struct RowScan {
     pub orphan_valid: u64,
     /// Slots beyond the manifest that hold garbage (torn/zero) — inert.
     pub orphan_invalid: u64,
+}
+
+impl RowScan {
+    /// Slots a rebuild would reclaim, in SLOTS — the unit capacity is in.
+    ///
+    /// Every superseding row retires one value and every deletion retires
+    /// one and occupies a slot itself, so the dead weight is those heads,
+    /// the tombstones, and the continuations the retired values held.
+    /// This is the inspector's own answer to `Engine::dead_slots`, worked
+    /// out from the bytes.
+    pub fn dead_slots(&self) -> u64 {
+        self.superseded + 2 * self.tombstones + self.dead_chunks
+    }
 }
 
 /// What a binary compiled against THIS schema would conclude at open,
@@ -248,7 +265,10 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     // the raw truth).
     let committed = live.map_or(0, |l| l.row_count);
     let mut scan = RowScan::default();
-    let mut seen = BTreeSet::new();
+    // id -> how many slots its currently-live value occupies, so that
+    // retiring it can account for every slot it held rather than only its
+    // head.
+    let mut seen: BTreeMap<u64, u64> = BTreeMap::new();
     // Recovery stops at the FIRST defective committed row, in row order;
     // the verdict must name the same defect the engine would, even when
     // several kinds are present. The scan itself still counts everything —
@@ -289,7 +309,7 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                     continue;
                 }
                 if slot.kind == RowKind::Record {
-                    if seen.insert(id) {
+                    if seen.insert(id, span).is_none() {
                         scan.committed_valid += 1;
                     } else {
                         scan.duplicate_ids += 1;
@@ -298,12 +318,14 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                         }
                         first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
                     }
-                } else if seen.contains(&id) {
+                } else if let Some(previous) = seen.insert(id, span) {
                     // A superseding row is legitimate only for an id
                     // that is live at this point in the commit order.
                     scan.committed_valid += 1;
                     scan.superseded += 1;
+                    scan.dead_chunks += previous - 1;
                 } else {
+                    seen.remove(&id);
                     scan.orphan_updates += 1;
                     first_defect.get_or_insert(crate::defect::ORPHAN_UPDATE);
                 }
@@ -314,9 +336,11 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                 // A deletion that claims to continue is as impossible as
                 // one for an id that is not live: a tombstone carries no
                 // value to spill into a second slot.
-                if !slot.more && seen.remove(&id) {
+                let retires = if slot.more { None } else { seen.remove(&id) };
+                if let Some(previous) = retires {
                     scan.committed_valid += 1;
                     scan.tombstones += 1;
+                    scan.dead_chunks += previous - 1;
                 } else {
                     scan.orphan_tombstones += 1;
                     first_defect.get_or_insert(crate::defect::ORPHAN_TOMBSTONE);
