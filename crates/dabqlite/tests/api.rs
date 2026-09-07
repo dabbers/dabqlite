@@ -139,7 +139,7 @@ fn a_file_backed_database_persists_and_shares_bytes_with_memory() {
     // The same database moves into memory as a snapshot and back —
     // without the caller knowing anything about the file layout.
     let snapshot = db.snapshot().expect("snapshot a file-backed database");
-    let mut in_ram = Db::load(&snapshot).expect("load into memory");
+    let in_ram = Db::load(&snapshot).expect("load into memory");
     assert_eq!(in_ram.all().unwrap(), db.all().unwrap());
 
     std::fs::remove_dir_all(&dir).ok();
@@ -297,7 +297,7 @@ fn dead_weight_counts_the_slots_a_long_value_held_not_the_value() {
     assert_eq!(s.dead, 8, "the retired value held eight slots");
 
     // And a rebuild returns exactly that many.
-    let mut compacted = db.compact_to_memory().expect("compact");
+    let compacted = db.compact_to_memory().expect("compact");
     assert_eq!(compacted.stats().slots, 1);
     assert_eq!(compacted.stats().dead, 0);
     assert_eq!(compacted.get(1).unwrap(), Some(short));
@@ -374,7 +374,7 @@ fn stats_expose_the_dead_weight_that_deletes_and_updates_create() {
 
     // Compaction gives the space back, and loses nothing.
     let before = db.all().unwrap();
-    let mut compacted = db.compact_to_memory().expect("compact");
+    let compacted = db.compact_to_memory().expect("compact");
     assert_eq!(compacted.all().unwrap(), before);
     assert_eq!(compacted.stats().dead, 0);
     assert_eq!(compacted.stats().slots, 15);
@@ -732,7 +732,7 @@ fn a_value_survives_storage_byte_for_byte_at_every_length() {
     // And again after a reload from the raw bytes, so the file — not the
     // live engine — is what is being trusted.
     let snapshot = db.snapshot().unwrap();
-    let mut reloaded = Db::load(&snapshot).expect("reload");
+    let reloaded = Db::load(&snapshot).expect("reload");
     for (i, case) in cases.iter().enumerate() {
         assert_eq!(
             reloaded.get(i as u64).unwrap().unwrap().as_bytes(),
@@ -929,7 +929,7 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
         ])
         .expect("batch");
     }
-    let mut db = Db::open(&dir).expect("reopen");
+    let db = Db::open(&dir).expect("reopen");
     assert_eq!(db.len(), 3);
     assert_eq!(db.get(10).unwrap().unwrap().text(), "ten");
     assert_eq!(db.get(20).unwrap().unwrap().text(), "twenty");
@@ -939,6 +939,59 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
         "a clean reopen after a batch must not report lost data"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads take `&self`, so one open database can serve many readers at
+/// once — and, more to the point, so the compiler proves reads are pure.
+///
+/// Every read here is answered from state recovery built in memory: no
+/// I/O is requested, no state machine advances, nothing is written. A
+/// read path that broke any of that would not compile against `&self`,
+/// which turns "reads never touch the disk" from a claim in a comment
+/// into a property of the types.
+#[test]
+fn reads_take_a_shared_borrow_so_many_can_run_at_once() {
+    let mut db = Db::in_memory_with(256).expect("open");
+    for i in 0..40u64 {
+        db.insert(i, Value::from_text(&format!("value {i}")).unwrap())
+            .unwrap();
+    }
+    db.insert(99, Value::from_bytes(&[b'L'; 100]).unwrap())
+        .unwrap();
+
+    // Several reads alive at the same time, from one handle, with no
+    // mutable borrow anywhere.
+    let a = db.get(7).unwrap().unwrap();
+    let b = db.range(0, 5).unwrap();
+    let c = db.find_text("value 3").unwrap();
+    let d = db.last(3).unwrap();
+    let e = db.get(99).unwrap().unwrap();
+    assert_eq!(a.text(), "value 7");
+    assert_eq!(b.len(), 6);
+    assert!(!c.is_empty());
+    assert_eq!(d[0].0, 99);
+    assert_eq!(
+        e.len(),
+        100,
+        "a multi-slot value reads back through &self too"
+    );
+
+    // A shared reference is enough for the whole read surface, so a
+    // reader can be handed out behind one.
+    fn count_everything(db: &Db<dabqlite::MemoryStorage>) -> usize {
+        db.all().unwrap().len()
+            + db.range_rev(0, u64::MAX).unwrap().len()
+            + db.find_prefix(b"value").unwrap().len()
+            + db.find_page(b"value", None).unwrap().0.len()
+            + db.range_page_rev(0, u64::MAX).unwrap().0.len()
+            + usize::from(db.get(1).unwrap().is_some())
+    }
+    let n = count_everything(&db);
+    assert!(n > 0);
+    // The same handle is still writable afterwards: a shared read borrow
+    // ends where it ends.
+    db.insert(1000, Value::empty()).unwrap();
+    assert_eq!(db.len(), 42);
 }
 
 /// Anchored search: a host is not a query parameter, and a tag is not a
@@ -1050,7 +1103,7 @@ fn the_newest_rows_are_a_page_of_work_not_a_scan() {
     assert_eq!(db.last(1).unwrap()[0].1.text(), "edited");
 
     // An empty database has no newest row rather than an error.
-    let mut empty = Db::in_memory().expect("open");
+    let empty = Db::in_memory().expect("open");
     assert!(empty.last(10).unwrap().is_empty());
     assert!(empty.range_rev(0, u64::MAX).unwrap().is_empty());
 }
@@ -1273,7 +1326,7 @@ fn a_database_remembers_the_capacity_it_was_created_with() {
     }
     // Reopened without saying anything: the same ceiling, not the default.
     {
-        let mut db = Db::open(&dir).expect("reopen");
+        let db = Db::open(&dir).expect("reopen");
         assert_eq!(
             db.stats().capacity,
             100,
@@ -1309,7 +1362,7 @@ fn a_database_remembers_the_capacity_it_was_created_with() {
         db.insert(2, Value::from_text("two").unwrap()).unwrap();
     }
     {
-        let mut db = Db::open(&dir).expect("reopen after a resize that wrote");
+        let db = Db::open(&dir).expect("reopen after a resize that wrote");
         assert_eq!(
             db.stats().capacity,
             250,
@@ -1329,7 +1382,7 @@ fn a_snapshot_carries_the_capacity_it_was_written_with() {
     let bytes = db.snapshot().unwrap().to_bytes();
 
     let snapshot = Snapshot::from_bytes(&bytes).expect("parse");
-    let mut reloaded = Db::load(&snapshot).expect("load");
+    let reloaded = Db::load(&snapshot).expect("load");
     assert_eq!(
         reloaded.stats().capacity,
         64,
@@ -1359,7 +1412,7 @@ fn a_snapshot_can_be_restored_onto_a_directory() {
 
     // Onto a directory that does not exist yet.
     {
-        let mut db = Db::restore(&dir, &source).expect("restore");
+        let db = Db::restore(&dir, &source).expect("restore");
         assert_eq!(db.len(), 29);
         assert_eq!(db.get(3).unwrap(), None);
         assert_eq!(db.get(7).unwrap().unwrap().len(), 47);
@@ -1377,7 +1430,7 @@ fn a_snapshot_can_be_restored_onto_a_directory() {
         assert!(existing.contains(999).unwrap());
     }
     {
-        let mut db = Db::restore(&dir, &source).expect("restore over");
+        let db = Db::restore(&dir, &source).expect("restore over");
         assert_eq!(
             db.get(999).unwrap(),
             None,
@@ -1446,7 +1499,7 @@ fn readers_run_alongside_the_writer_and_never_see_a_half_commit() {
             .unwrap();
         // A reader opened NOW sees a whole number of commits: every id it
         // can see carries a whole value, never a prefix.
-        let mut fresh = Db::read_only(&dir).expect("reader");
+        let fresh = Db::read_only(&dir).expect("reader");
         for (id, value) in fresh.all().unwrap() {
             let expect = if id >= 200 {
                 5

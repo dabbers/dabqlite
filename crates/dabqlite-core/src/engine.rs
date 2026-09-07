@@ -1231,6 +1231,33 @@ impl Engine {
             Input::Update { id, value } => self.on_update(id, value),
             Input::Delete { id } => self.on_delete(id),
             Input::Batch { ops } => self.on_batch(ops),
+            Input::Get { .. }
+            | Input::GetFrom { .. }
+            | Input::Range { .. }
+            | Input::RangeRev { .. }
+            | Input::Find { .. } => self.read(input),
+        }
+    }
+
+    /// Answer a READ without a mutable engine.
+    ///
+    /// Every read this database offers — point lookup, value window,
+    /// ordered scan in either direction, substring search — is answered
+    /// from in-memory state that recovery built. No I/O is requested, no
+    /// state advances, and nothing is written; the terminal output comes
+    /// straight back.
+    ///
+    /// Taking `&self` is not a convenience, it is the proof. A read path
+    /// that requested I/O, advanced the state machine, or touched a
+    /// counter would not compile, so "reads are pure" is enforced by the
+    /// type system rather than asserted in a comment — and callers can
+    /// share one open database between readers instead of taking a
+    /// mutable borrow to ask a question.
+    ///
+    /// Panics on anything that is not a read: those belong to
+    /// [`Engine::tick`], which is where state changes live.
+    pub fn read(&self, input: Input<'_>) -> Output {
+        match input {
             Input::Get { id } => self.on_get(id),
             Input::GetFrom { id, offset } => self.read_window(id, offset),
             Input::Range { lo, hi } => self.on_range(lo, hi, false),
@@ -1240,6 +1267,7 @@ impl Engine {
                 mode,
                 after,
             } => self.on_find(needle, mode, after),
+            other => panic!("Engine::read takes reads, not {other:?}"),
         }
     }
 
@@ -2561,14 +2589,14 @@ impl Engine {
 
     // ---- get ---------------------------------------------------------
 
-    fn on_get(&mut self, id: u64) -> Output {
+    fn on_get(&self, id: u64) -> Output {
         self.read_window(id, 0)
     }
 
     /// A value's first window, or a later one. One code path, because the
     /// only difference between "read this row" and "read the rest of it"
     /// is where you start.
-    fn read_window(&mut self, id: u64, offset: u32) -> Output {
+    fn read_window(&self, id: u64, offset: u32) -> Output {
         let result = match self.state {
             State::Ready => Ok(self.window_of(id, offset)),
             // A HIT is checksum-verified and therefore exactly right, in
@@ -2611,7 +2639,7 @@ impl Engine {
         Output::GetDone { id, result }
     }
 
-    fn on_range(&mut self, lo: u64, hi: u64, descending: bool) -> Output {
+    fn on_range(&self, lo: u64, hi: u64, descending: bool) -> Output {
         let result = match self.state {
             // Served, but every page carries `incomplete: true` — the rows
             // returned are exact; rows that would have matched may be
@@ -2648,7 +2676,7 @@ impl Engine {
         Output::RangeDone { result }
     }
 
-    fn on_find(&mut self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> Output {
+    fn on_find(&self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> Output {
         if needle.len() > MAX_VALUE_LEN {
             // Longer than any value can be, so it cannot match anything.
             // Saying so is more useful than an empty page that looks like

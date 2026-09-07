@@ -208,6 +208,19 @@ impl<S: Storage> Host<S> {
         self.drive(input)
     }
 
+    /// Answer a READ without a mutable host.
+    ///
+    /// A read requests no I/O (see [`Engine::read`]), so there is no
+    /// drive loop to run and no storage to touch — which is why this can
+    /// take `&self` while `run` cannot.
+    pub fn read(&self, input: Input<'_>) -> Output {
+        debug_assert!(
+            self.migrating.is_none(),
+            "a migration is in flight; there is nothing to read yet"
+        );
+        self.engine.read(input)
+    }
+
     fn tick_machine(&mut self, input: Input<'_>) -> Output {
         match &mut self.migrating {
             Some(m) => m.tick(input),

@@ -674,7 +674,7 @@ impl Db<MemoryStorage> {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_dir_all(&retired);
         {
-            let mut source = Db::load_with(snapshot, rows)?;
+            let source = Db::load_with(snapshot, rows)?;
             let live = source.all()?;
             let mut fresh = Db::<PosixStorage>::open_with(&staging, rows)?;
             fresh.refill(live)?;
@@ -1117,9 +1117,9 @@ impl<S: Storage> Db<S> {
     /// A value longer than one row slot is reassembled here from the
     /// bounded windows the engine hands back — the core never allocates,
     /// and the caller never sees a partial value.
-    pub fn get(&mut self, id: u64) -> Result<Option<Value>, Error> {
+    pub fn get(&self, id: u64) -> Result<Option<Value>, Error> {
         use dabqlite_core::Input;
-        let first = match self.hm().get(id) {
+        let first = match self.h().read(Input::Get { id }) {
             Output::GetDone { result: Ok(v), .. } => v,
             Output::GetDone { result: Err(e), .. } => return Err(e.into()),
             other => unreachable!("get returned {other:?}"),
@@ -1134,7 +1134,7 @@ impl<S: Storage> Db<S> {
         bytes.extend_from_slice(first.payload());
         let mut next = first.next_offset();
         while let Some(offset) = next {
-            let window = match self.hm().run(Input::GetFrom { id, offset }) {
+            let window = match self.h().read(Input::GetFrom { id, offset }) {
                 Output::GetDone {
                     result: Ok(Some(w)),
                     ..
@@ -1175,7 +1175,7 @@ impl<S: Storage> Db<S> {
     ///
     /// Collects the whole range; for a very large one, page with
     /// [`Db::range_page`] instead.
-    pub fn range(&mut self, lo: u64, hi: u64) -> Result<Vec<Row>, Error> {
+    pub fn range(&self, lo: u64, hi: u64) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         let mut cursor = lo;
         loop {
@@ -1189,9 +1189,9 @@ impl<S: Storage> Db<S> {
     }
 
     /// One bounded page of a range, plus where to continue from.
-    pub fn range_page(&mut self, lo: u64, hi: u64) -> Result<Page, Error> {
+    pub fn range_page(&self, lo: u64, hi: u64) -> Result<Page, Error> {
         use dabqlite_core::Input;
-        match self.hm().run(Input::Range { lo, hi }) {
+        match self.h().read(Input::Range { lo, hi }) {
             Output::RangeDone { result: Ok(page) } => {
                 let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
                 let next = page.next;
@@ -1203,7 +1203,7 @@ impl<S: Storage> Db<S> {
     }
 
     /// The same range, DESCENDING — greatest id first.
-    pub fn range_rev(&mut self, lo: u64, hi: u64) -> Result<Vec<Row>, Error> {
+    pub fn range_rev(&self, lo: u64, hi: u64) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         let mut cursor = hi;
         loop {
@@ -1223,9 +1223,9 @@ impl<S: Storage> Db<S> {
     /// Reaching the highest ids by scanning upward means walking every row
     /// below them first, which is the difference between a page of work
     /// and the whole database — see [`Db::last`].
-    pub fn range_page_rev(&mut self, lo: u64, hi: u64) -> Result<Page, Error> {
+    pub fn range_page_rev(&self, lo: u64, hi: u64) -> Result<Page, Error> {
         use dabqlite_core::Input;
-        match self.hm().run(Input::RangeRev { lo, hi }) {
+        match self.h().read(Input::RangeRev { lo, hi }) {
             Output::RangeDone { result: Ok(page) } => {
                 let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
                 let next = page.next;
@@ -1244,7 +1244,7 @@ impl<S: Storage> Db<S> {
     /// built against this library wrote that query, and before there was
     /// a descending scan every one of them materialised the whole database
     /// to answer it.
-    pub fn last(&mut self, n: usize) -> Result<Vec<Row>, Error> {
+    pub fn last(&self, n: usize) -> Result<Vec<Row>, Error> {
         let mut out = Vec::with_capacity(n.min(dabqlite_core::RANGE_PAGE));
         if n == 0 {
             return Ok(out);
@@ -1269,7 +1269,7 @@ impl<S: Storage> Db<S> {
     /// too long to travel in the page itself. A page carries the whole
     /// value when it fits and its LENGTH when it does not, so a long
     /// value costs an extra read rather than arriving silently truncated.
-    fn rows_from(&mut self, items: &[dabqlite_core::RowRef]) -> Result<Vec<Row>, Error> {
+    fn rows_from(&self, items: &[dabqlite_core::RowRef]) -> Result<Vec<Row>, Error> {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             match item.value() {
@@ -1284,7 +1284,7 @@ impl<S: Storage> Db<S> {
     }
 
     /// Every row, ascending by id.
-    pub fn all(&mut self) -> Result<Vec<Row>, Error> {
+    pub fn all(&self) -> Result<Vec<Row>, Error> {
         self.range(0, u64::MAX)
     }
 
@@ -1297,7 +1297,7 @@ impl<S: Storage> Db<S> {
     /// Newest-first because that is the order the index can page cheaply
     /// and the order a search box wants; see [`Db::find_page`] to stop
     /// early rather than collecting every match.
-    pub fn find(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+    pub fn find(&self, needle: &[u8]) -> Result<Vec<Row>, Error> {
         self.find_matching(needle, Match::Contains)
     }
 
@@ -1306,12 +1306,12 @@ impl<S: Storage> Db<S> {
     /// Anchoring costs nothing — the index narrows the same candidates
     /// either way — and it is the difference between finding a host and
     /// finding a query parameter that happens to contain one.
-    pub fn find_prefix(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+    pub fn find_prefix(&self, needle: &[u8]) -> Result<Vec<Row>, Error> {
         self.find_matching(needle, Match::Prefix)
     }
 
     /// Every row whose value ENDS with `needle`, newest first.
-    pub fn find_suffix(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+    pub fn find_suffix(&self, needle: &[u8]) -> Result<Vec<Row>, Error> {
         self.find_matching(needle, Match::Suffix)
     }
 
@@ -1321,12 +1321,12 @@ impl<S: Storage> Db<S> {
     /// expressible by storing delimiters around every tag so that a
     /// substring search could not reach `rustaceans` — a trick each
     /// application had to invent, with its own ceiling.
-    pub fn find_exact(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+    pub fn find_exact(&self, needle: &[u8]) -> Result<Vec<Row>, Error> {
         self.find_matching(needle, Match::Exact)
     }
 
     /// Every match in any [`Match`] mode, newest first.
-    pub fn find_matching(&mut self, needle: &[u8], mode: Match) -> Result<Vec<Row>, Error> {
+    pub fn find_matching(&self, needle: &[u8], mode: Match) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         let mut cursor = None;
         loop {
@@ -1346,7 +1346,7 @@ impl<S: Storage> Db<S> {
     /// a search box can show its first results without paying for the
     /// long tail — which is the point of stopping early.
     pub fn find_page(
-        &mut self,
+        &self,
         needle: &[u8],
         after: Option<FindCursor>,
     ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
@@ -1355,7 +1355,7 @@ impl<S: Storage> Db<S> {
 
     /// One bounded page in any [`Match`] mode.
     pub fn find_page_matching(
-        &mut self,
+        &self,
         needle: &[u8],
         mode: Match,
         after: Option<FindCursor>,
@@ -1371,7 +1371,7 @@ impl<S: Storage> Db<S> {
                 max: MAX_VALUE_LEN,
             });
         }
-        let page = match self.hm().run(Input::Find {
+        let page = match self.h().read(Input::Find {
             needle,
             mode,
             after,
@@ -1386,7 +1386,7 @@ impl<S: Storage> Db<S> {
     }
 
     /// Text convenience over [`Db::find`].
-    pub fn find_text(&mut self, needle: &str) -> Result<Vec<Row>, Error> {
+    pub fn find_text(&self, needle: &str) -> Result<Vec<Row>, Error> {
         self.find(needle.as_bytes())
     }
 

@@ -24,7 +24,11 @@ let newest = db.last(20)?;                    // 20 highest ids, 20 rows of work
 let blob = db.snapshot()?.to_bytes();         // move it anywhere
 Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;
 
-// Any number of readers, alongside the writer, taking no lock.
+// Reads take &self, so one open database serves many readers at once —
+// and the compiler proves a read requests no I/O and changes nothing.
+fn stats(db: &Db<PosixStorage>) -> usize { db.all().unwrap().len() }
+
+// Any number of reader PROCESSES, alongside the writer, taking no lock.
 let mut reader = Db::read_only("./mydb")?;
 ```
 
