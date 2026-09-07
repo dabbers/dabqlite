@@ -3,9 +3,9 @@
 //   cargo run -p dabqlite-codegen -- schema/records.sql <this file>
 
 pub const RECORDS_TABLE: &str = "records";
-pub const RECORDS_SCHEMA_HASH: u64 = 0xA621C5242711BDF9;
+pub const RECORDS_SCHEMA_HASH: u64 = 0x5B3F0B9084F97598;
 pub const RECORDS_ROW_SIZE: usize = 32;
-pub const RECORDS_CRC_OFFSET: usize = 26;
+pub const RECORDS_CRC_OFFSET: usize = 27;
 /// Offset of the row-kind discriminant. INSIDE the checksummed
              /// region: a bit flip here must not be able to turn a deletion
              /// back into a record.
@@ -13,7 +13,8 @@ pub const RECORDS_CRC_OFFSET: usize = 26;
              pub const RECORDS_KIND_RECORD: u8 = 0;
              pub const RECORDS_KIND_TOMBSTONE: u8 = 1;
              pub const RECORDS_KIND_UPDATE: u8 = 2;
-             pub const RECORDS_KIND_MAX: u8 = 2;
+             pub const RECORDS_KIND_CHUNK: u8 = 3;
+             pub const RECORDS_KIND_MAX: u8 = 3;
 /// Offset of the commit SPAN: how many further rows were written
              /// as part of the same commit. Also INSIDE the checksummed region —
              /// a bit flip here must not be able to re-draw a commit boundary.
@@ -21,6 +22,12 @@ pub const RECORDS_CRC_OFFSET: usize = 26;
              /// Largest span a slot may claim; beyond it the slot is damaged
              /// or foreign, and the decoder refuses it.
              pub const RECORDS_SPAN_MAX: u8 = 63;
+/// Offset of the payload LEN: how many bytes of the final
+             /// fixed-width column this row carries. Also INSIDE the checksummed
+             /// region — a flip here would silently lengthen or shorten a value.
+             pub const RECORDS_LEN_OFFSET: usize = 26;
+             /// Largest payload a single row can carry.
+             pub const RECORDS_LEN_MAX: u8 = 16;
 pub const RECORDS_COL_ID_OFFSET: usize = 0;
 pub const RECORDS_COL_VALUE_OFFSET: usize = 8;
 
@@ -32,6 +39,8 @@ pub struct RecordsRow {
     /// Rows still to come in the same commit: 0 for the last (or
                  /// only) row of a commit, `n-1` for the first of `n`.
                  pub span: u8,
+    /// Bytes of the final column this row actually carries.
+                 pub len: u8,
     pub id: u64,
     pub value: [u8; 16],
 }
@@ -66,6 +75,7 @@ pub fn encode_records_row(row: &RecordsRow, out: &mut [u8; RECORDS_ROW_SIZE]) {
     out[8..24].copy_from_slice(&row.value);
     out[RECORDS_KIND_OFFSET] = row.kind;
     out[RECORDS_SPAN_OFFSET] = row.span;
+    out[RECORDS_LEN_OFFSET] = row.len;
     let crc = gen_crc32(&out[0..RECORDS_CRC_OFFSET]);
     out[RECORDS_CRC_OFFSET..RECORDS_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out[RECORDS_CRC_OFFSET + 4..].fill(0);
@@ -91,7 +101,11 @@ pub fn decode_records_row(bytes: &[u8]) -> Option<RecordsRow> {
     if span > RECORDS_SPAN_MAX {
         return None;
     }
+    let len = bytes[RECORDS_LEN_OFFSET];
+    if len > RECORDS_LEN_MAX {
+        return None;
+    }
     let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
     let value: [u8; 16] = bytes[8..24].try_into().ok()?;
-    Some(RecordsRow { kind, span, id, value })
+    Some(RecordsRow { kind, span, len, id, value })
 }

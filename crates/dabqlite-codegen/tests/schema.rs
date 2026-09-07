@@ -29,16 +29,22 @@ fn records_schema_matches_the_engine_exactly() {
     // so the CRC covers it — a flip there must never be able to turn a
     // deletion back into a record. v3 adds the commit span next to it,
     // under the same checksum, so a flip cannot redraw a commit boundary
-    // either.
+    // either. v4 adds the payload length beside those, so a flip cannot
+    // lengthen a value into its own padding.
     assert_eq!(schema.format, dabqlite_codegen::CURRENT_ROW_FORMAT);
     assert_eq!(layout.kind_offset, Some(24));
     assert_eq!(layout.span_offset, Some(25));
-    assert_eq!(layout.crc_offset, 26);
-    // Both bytes are strictly below the CRC offset, which is what "inside
-    // the checksummed region" means. Stated as an assertion rather than a
-    // comment so that moving either byte into the padding fails here.
+    assert_eq!(layout.len_offset, Some(26));
+    assert_eq!(layout.crc_offset, 27);
+    // The length's ceiling is the value column's width, derived rather
+    // than written down twice.
+    assert_eq!(layout.len_max, Some(dabqlite_core::VALUE_LEN as u8));
+    // All three bytes are strictly below the CRC offset, which is what
+    // "inside the checksummed region" means. Stated as assertions rather
+    // than comments so that moving any of them into the padding fails here.
     assert!(layout.kind_offset.unwrap() < layout.crc_offset);
     assert!(layout.span_offset.unwrap() < layout.crc_offset);
+    assert!(layout.len_offset.unwrap() < layout.crc_offset);
     assert_eq!(layout.row_size, dabqlite_core::ROW_SIZE);
     assert_eq!(
         schema.columns[1].ty.width(),

@@ -42,6 +42,10 @@ pub fn migrate_row(old: records_v1::RecordsRow) -> records::RecordsRow {
         // the superblock once, so no row is part of a multi-row commit
         // group that recovery would need to reassemble.
         span: 0,
+        // The legacy format had no length byte: every v1 row carried a
+        // full-width value, and the migration widens it by zero-filling
+        // the tail, so the migrated row carries the full new width too.
+        len: records::RECORDS_LEN_MAX,
         id: old.id,
         value,
     }
@@ -546,7 +550,14 @@ impl MigrationEngine {
         let old = records_v1::decode_records_row(slot).expect("validated during on_old_rows");
         let new = migrate_row(old);
         let mut out = [0u8; ROW_SIZE];
-        encode_row(RowKind::Record, new.span, new.id, &new.value, &mut out);
+        encode_row(
+            RowKind::Record,
+            new.span,
+            new.len,
+            new.id,
+            &new.value,
+            &mut out,
+        );
         self.state = MState::WriteNewRows {
             generation,
             row_count,

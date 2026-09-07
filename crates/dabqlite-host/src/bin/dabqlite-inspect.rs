@@ -124,11 +124,14 @@ fn print_report(dir: &Path, report: &InspectReport) {
         report.rows.tombstones
     );
     println!("  superseded by update {}", report.rows.superseded);
-    if report.rows.orphan_tombstones > 0 || report.rows.orphan_updates > 0 {
+    if report.rows.orphan_tombstones > 0
+        || report.rows.orphan_updates > 0
+        || report.rows.orphan_chunks > 0
+    {
         println!(
-            "  ORPHANED           {} deletion(s), {} update(s) referring to rows that \
-             were not live — the engine cannot write these",
-            report.rows.orphan_tombstones, report.rows.orphan_updates
+            "  ORPHANED           {} deletion(s), {} update(s), {} continuation(s) \
+             referring to rows that were not live — the engine cannot write these",
+            report.rows.orphan_tombstones, report.rows.orphan_updates, report.rows.orphan_chunks
         );
     }
     // Dead weight is the retired records plus the deletions that retired

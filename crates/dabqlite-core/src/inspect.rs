@@ -82,6 +82,10 @@ pub struct RowScan {
     /// commit order — impossible for the engine to write, so evidence of
     /// damage or of a file we did not produce.
     pub orphan_tombstones: u64,
+    /// Value continuations with nothing in front of them to continue —
+    /// impossible for the engine to write, since a chunk is only ever
+    /// appended directly after the row it belongs to.
+    pub orphan_chunks: u64,
     /// Distinct ids seen more than once among committed rows — recovery
     /// refuses the file if nonzero.
     pub duplicate_ids: u64,
@@ -241,6 +245,14 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
                             scan.orphan_tombstones += 1;
                             first_defect.get_or_insert(crate::defect::ORPHAN_TOMBSTONE);
                         }
+                    }
+                    RowKind::Chunk => {
+                        // Nothing in this replay can own a continuation
+                        // yet, so every chunk is a stranded one. When
+                        // multi-row values arrive, this arm attaches the
+                        // chunk to the row before it instead.
+                        scan.orphan_chunks += 1;
+                        first_defect.get_or_insert(crate::defect::ORPHAN_CHUNK);
                     }
                 }
             }

@@ -446,3 +446,65 @@ fn an_io_failure_during_salvage_fail_stops_at_every_boundary() {
         assert_eq!(get_result(&mut host, id), Ok(Some(value)), "row {row}");
     }
 }
+
+/// The format defines a CHUNK row — the continuation of a value too long
+/// for one slot — and the engine does not yet write one. That gap has to
+/// be loud rather than quiet: a chunk in a committed file is either a
+/// misdirected write, a truncation, or a file this binary did not produce,
+/// and in every one of those cases serving the row would be serving
+/// something nobody wrote.
+///
+/// So: plant a perfectly checksum-valid chunk over a committed record.
+/// Strict open must refuse it by name, and salvage must quarantine exactly
+/// that one row and keep the rest.
+#[test]
+fn a_value_continuation_with_nothing_to_continue_is_refused_by_name() {
+    use dabqlite_core::layout::{encode_row, RowKind};
+
+    let (base, ops) = build(77, 6);
+    let victim_row = 3usize;
+    let (victim_id, _) = ops[victim_row];
+
+    let mut planted = [0u8; ROW_SIZE];
+    // A flawless row in every respect except that nothing precedes it that
+    // a continuation could belong to.
+    encode_row(
+        RowKind::Chunk,
+        0,
+        VALUE_LEN as u8,
+        victim_id,
+        &[0xAB; VALUE_LEN],
+        &mut planted,
+    );
+    let mut disk = base.clone();
+    disk.write(FileId::Rows, (victim_row * ROW_SIZE) as u64, &planted);
+
+    let (_, strict) = open_strict(disk.clone());
+    assert_eq!(
+        strict,
+        Err(DbError::Corrupt {
+            what: dabqlite_core::defect::ORPHAN_CHUNK
+        }),
+        "a stranded continuation must be refused, and named"
+    );
+
+    let (mut host, salvaged) = open_salvage(disk);
+    assert_eq!(salvaged, Ok(5), "the five undamaged rows must survive");
+    assert_eq!(
+        host.engine.quarantined(),
+        1,
+        "exactly the planted row should be quarantined"
+    );
+    for (row, &(id, value)) in ops.iter().enumerate() {
+        if row == victim_row {
+            continue;
+        }
+        assert_eq!(get_result(&mut host, id), Ok(Some(value)), "row {row}");
+    }
+    // And the row it replaced is not served from the wreckage.
+    assert_eq!(
+        get_result(&mut host, victim_id),
+        Err(DbError::Degraded { quarantined: 1 }),
+        "a miss in a degraded database must be refused, not answered None"
+    );
+}

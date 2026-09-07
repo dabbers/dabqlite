@@ -13,9 +13,9 @@ use dabqlite_core::layout::reference as hand;
 use dabqlite_core::layout::RowKind;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
 use generated::{
-    decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_RECORD,
-    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_ROW_SIZE, RECORDS_SPAN_MAX,
-    RECORDS_SPAN_OFFSET,
+    decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_CHUNK, RECORDS_KIND_RECORD,
+    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_LEN_MAX, RECORDS_LEN_OFFSET,
+    RECORDS_ROW_SIZE, RECORDS_SPAN_MAX, RECORDS_SPAN_OFFSET,
 };
 
 /// Deterministic pseudo-random stream without pulling rand into this crate:
@@ -47,23 +47,29 @@ fn generated_encode_is_byte_identical_to_hand_written() {
         rng.fill(&mut value);
         // Both row kinds, so the discriminant byte is covered by the
         // equivalence too — not just the record path.
-        let (kind, kind_byte) = match round % 3 {
+        let (kind, kind_byte) = match round % 4 {
             0 => (RowKind::Tombstone, RECORDS_KIND_TOMBSTONE),
             1 => (RowKind::Update, RECORDS_KIND_UPDATE),
+            2 => (RowKind::Chunk, RECORDS_KIND_CHUNK),
             _ => (RowKind::Record, RECORDS_KIND_RECORD),
         };
+        // Every legal payload length, cycled, with the bytes past it
+        // zeroed the way a real encoder must leave them.
+        let len = (round % (RECORDS_LEN_MAX as usize + 1)) as u8;
+        value[len as usize..].fill(0);
 
         // Every legal span, cycled, so the commit-group byte is covered by
         // the equivalence exactly like the kind byte is.
         let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
 
         let mut hand_bytes = [0u8; ROW_SIZE];
-        hand::encode_row(kind, span, id, &value, &mut hand_bytes);
+        hand::encode_row(kind, span, len, id, &value, &mut hand_bytes);
         let mut gen_bytes = [0u8; RECORDS_ROW_SIZE];
         encode_records_row(
             &RecordsRow {
                 kind: kind_byte,
                 span,
+                len,
                 id,
                 value,
             },
@@ -88,13 +94,16 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
             let id = rng.next();
             let mut value = [0u8; VALUE_LEN];
             rng.fill(&mut value);
-            let kind = match round % 6 {
+            let kind = match round % 8 {
                 0 => RowKind::Tombstone,
                 2 => RowKind::Update,
+                4 => RowKind::Chunk,
                 _ => RowKind::Record,
             };
             let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
-            hand::encode_row(kind, span, id, &value, &mut slot);
+            let len = (round % (RECORDS_LEN_MAX as usize + 1)) as u8;
+            value[len as usize..].fill(0);
+            hand::encode_row(kind, span, len, id, &value, &mut slot);
             if round % 4 == 0 {
                 // Corrupt a random byte with a random mask (sometimes 0 =
                 // no corruption; both decoders must still agree).
@@ -119,10 +128,16 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                     RowKind::Record => RECORDS_KIND_RECORD,
                     RowKind::Tombstone => RECORDS_KIND_TOMBSTONE,
                     RowKind::Update => RECORDS_KIND_UPDATE,
+                    RowKind::Chunk => RECORDS_KIND_CHUNK,
                 };
                 assert_eq!(
                     hand_kind, row.kind,
                     "round {round}: row KIND diverged - a record and a deletion must never be confused"
+                );
+                assert_eq!(
+                    hand_slot.len, row.len,
+                    "round {round}: payload LEN diverged - the two codecs would \
+                     disagree about how long a value is"
                 );
                 assert_eq!(
                     hand_slot.span, row.span,
@@ -150,14 +165,17 @@ fn generated_codec_has_no_dead_bytes_either() {
         RECORDS_KIND_RECORD,
         RECORDS_KIND_TOMBSTONE,
         RECORDS_KIND_UPDATE,
+        RECORDS_KIND_CHUNK,
     ] {
         let row = RecordsRow {
             kind,
             // A mid-range span: flipping any of its bits must be caught,
             // in either direction.
             span: 0b0010_1010,
+            // A mid-range length too, for the same reason.
+            len: 0b0000_1010,
             id: 0xDAB0_0001,
-            value: *b"0123456789abcdef",
+            value: *b"0123456789\0\0\0\0\0\0",
         };
         encode_records_row(&row, &mut slot);
         for byte in 0..RECORDS_ROW_SIZE {
@@ -190,7 +208,7 @@ fn both_codecs_refuse_a_span_the_format_does_not_define() {
         let mut slot = [0u8; RECORDS_ROW_SIZE];
         // Encode a legal row, then rewrite the span byte and re-checksum
         // by hand so the slot is impeccable except for that one field.
-        hand::encode_row(RowKind::Record, 0, 7, b"................", &mut slot);
+        hand::encode_row(RowKind::Record, 0, 16, 7, b"................", &mut slot);
         slot[RECORDS_SPAN_OFFSET] = span as u8;
         let crc = crc32_ieee(&slot[0..RECORDS_SPAN_OFFSET + 1]);
         slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
@@ -213,7 +231,14 @@ fn both_codecs_refuse_a_span_the_format_does_not_define() {
 fn both_codecs_round_trip_every_legal_span() {
     for span in 0..=RECORDS_SPAN_MAX {
         let mut slot = [0u8; RECORDS_ROW_SIZE];
-        hand::encode_row(RowKind::Update, span, 99, b"abcdefghijklmnop", &mut slot);
+        hand::encode_row(
+            RowKind::Update,
+            span,
+            16,
+            99,
+            b"abcdefghijklmnop",
+            &mut slot,
+        );
         let decoded = decode_records_row(&slot).expect("legal span must decode");
         assert_eq!(decoded.span, span);
         assert_eq!(hand::decode_row(&slot).expect("legal span").span, span);
@@ -236,4 +261,49 @@ fn crc32_ieee(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// A LEN beyond the bytes a slot can hold is damage, and both codecs must
+/// refuse it even with a perfect checksum — otherwise a flip could make a
+/// value claim bytes that are really its padding.
+#[test]
+fn both_codecs_refuse_a_len_longer_than_the_slot() {
+    for len in (RECORDS_LEN_MAX as u16 + 1)..=255 {
+        let mut slot = [0u8; RECORDS_ROW_SIZE];
+        hand::encode_row(RowKind::Record, 0, 16, 7, b"................", &mut slot);
+        slot[RECORDS_LEN_OFFSET] = len as u8;
+        let crc = crc32_ieee(&slot[0..RECORDS_LEN_OFFSET + 1]);
+        slot[RECORDS_LEN_OFFSET + 1..RECORDS_LEN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(
+            decode_records_row(&slot),
+            None,
+            "the generated codec accepted len {len}, longer than the slot"
+        );
+        assert!(
+            hand::decode_row(&slot).is_none(),
+            "the reference codec accepted len {len}, longer than the slot"
+        );
+    }
+}
+
+/// And every legal length round-trips, carrying exactly those bytes back
+/// — no more (the padding is not data) and no fewer.
+#[test]
+fn a_row_gives_back_exactly_the_bytes_its_len_claims() {
+    let full = *b"0123456789abcdef";
+    for len in 0..=RECORDS_LEN_MAX {
+        let mut value = full;
+        value[len as usize..].fill(0);
+        let mut slot = [0u8; RECORDS_ROW_SIZE];
+        hand::encode_row(RowKind::Record, 0, len, 1, &value, &mut slot);
+        let decoded = hand::decode_row(&slot).expect("legal len must decode");
+        assert_eq!(decoded.len, len);
+        assert_eq!(
+            decoded.payload(),
+            &full[..len as usize],
+            "payload for len {len}"
+        );
+        assert_eq!(decode_records_row(&slot).expect("generated").len, len);
+    }
 }

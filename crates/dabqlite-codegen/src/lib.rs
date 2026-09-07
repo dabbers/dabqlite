@@ -73,6 +73,15 @@ pub struct Schema {
     /// Like KIND, SPAN sits inside the CRC: a bit flip must not be able to
     /// re-draw a commit boundary.
     ///
+    /// v4 adds a third checksummed byte, LEN: how many bytes of the final
+    /// fixed-width column this row actually carries. Without it a value is
+    /// exactly as long as its slot, and a caller storing something shorter
+    /// has to encode the real length itself — which is why trailing zero
+    /// bytes could not survive a round trip. With it, a row carries a
+    /// length, and a CHUNK row (kind 3) can carry the continuation of a
+    /// value too long for one slot, so a value is no longer bounded by the
+    /// row it starts in.
+    ///
     /// The version is part of the schema hash, so a binary that does not
     /// understand a format refuses the file at open (`SchemaMismatch`)
     /// instead of misreading it. Declare an older format with
@@ -81,7 +90,7 @@ pub struct Schema {
 }
 
 /// The current row format emitted for a schema that does not say otherwise.
-pub const CURRENT_ROW_FORMAT: u8 = 3;
+pub const CURRENT_ROW_FORMAT: u8 = 4;
 
 /// Row kinds, v2 and later. The discriminant lives inside the checksum.
 pub const ROW_KIND_RECORD: u8 = 0;
@@ -92,8 +101,14 @@ pub const ROW_KIND_TOMBSTONE: u8 = 1;
 /// appended row rather than a delete followed by an insert, which a crash
 /// could split and lose the row between.
 pub const ROW_KIND_UPDATE: u8 = 2;
+/// The continuation of a value too long for one slot (v4+). A chunk
+/// belongs to the nearest preceding non-chunk row, and carries its own
+/// LEN, so a value's exact length is the sum of the lengths of the rows
+/// that hold it. Chunks are written in the same commit as their head, so
+/// a value is never half-stored.
+pub const ROW_KIND_CHUNK: u8 = 3;
 /// Largest kind this format defines; anything above is damaged or foreign.
-pub const ROW_KIND_MAX: u8 = ROW_KIND_UPDATE;
+pub const ROW_KIND_MAX: u8 = ROW_KIND_CHUNK;
 
 /// Largest SPAN a v3 row may carry: the number of further rows written in
 /// the same commit. A commit of `n` rows writes spans `n-1, n-2, ..., 0`,
@@ -119,6 +134,14 @@ pub struct Layout {
     /// Offset of the one-byte commit SPAN (v3+), inside the checksummed
     /// region, immediately after the kind. `None` before v3.
     pub span_offset: Option<usize>,
+    /// Offset of the one-byte payload LEN (v4+), inside the checksummed
+    /// region, immediately after the span. `None` before v4.
+    pub len_offset: Option<usize>,
+    /// Largest value LEN may take: the width of the final fixed-width
+    /// column, which is the column a row's payload length describes.
+    /// `None` when the format has no LEN byte, or the last column is not
+    /// fixed-width bytes.
+    pub len_max: Option<u8>,
     pub crc_offset: usize,
     pub row_size: usize,
 }
@@ -444,12 +467,28 @@ impl Schema {
         if span_offset.is_some() {
             at += 1;
         }
+        // v4+ reserves one more byte for the payload length, also before
+        // the CRC (see `Schema::format`).
+        let len_offset = (self.format >= 4).then_some(at);
+        if len_offset.is_some() {
+            at += 1;
+        }
+        // A row's LEN describes the final fixed-width column, so it is
+        // bounded by that column's width — and a column wider than 255
+        // could not be described by one byte at all, which the format
+        // refuses rather than silently truncating.
+        let len_max = len_offset.and(match self.columns.last().map(|c| c.ty) {
+            Some(ColType::FixedBytes(n)) => u8::try_from(n).ok(),
+            _ => None,
+        });
         let crc_offset = at;
         let row_size = (crc_offset + 4).next_multiple_of(8);
         Layout {
             field_offsets: offsets,
             kind_offset,
             span_offset,
+            len_offset,
+            len_max,
             crc_offset,
             row_size,
         }
@@ -581,6 +620,11 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
             "| {span} | 1 | span | rows still to come in the same commit (0..={ROW_SPAN_MAX}) |"
         ));
     }
+    if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
+        w(format!(
+            "| {len} | 1 | len | bytes of the final column this row carries (0..={len_max}) |"
+        ));
+    }
     let crc = layout.crc_offset;
     w(format!("| {crc} | 4 | crc32 | IEEE, over bytes 0..{crc} |"));
     w(format!(
@@ -593,12 +637,14 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
     w("every byte of a committed row is covered by verification.".into());
     w(String::new());
     if layout.span_offset.is_some() {
-        w("`kind` and `span` sit INSIDE the checksummed region, not in the".into());
-        w("padding. `kind` decides whether a slot holds data or deletes it, and".into());
-        w("`span` decides where one commit ends and the next begins; a bit flip".into());
-        w("that could silently change either would be able to resurrect a".into());
-        w("deleted row, or to disguise a rolled-back commit as an interrupted".into());
-        w("one. Covering them by the CRC makes both impossible to miss.".into());
+        w("`kind`, `span` and `len` all sit INSIDE the checksummed region, not".into());
+        w("in the padding. `kind` decides whether a slot holds data or deletes".into());
+        w("it; `span` decides where one commit ends and the next begins; `len`".into());
+        w("decides how much of the slot is really the value. A bit flip that".into());
+        w("could silently change any of them would be able to resurrect a".into());
+        w("deleted row, disguise a rolled-back commit as an interrupted one, or".into());
+        w("lengthen a value into its own padding. Covering them by the CRC makes".into());
+        w("all three impossible to miss.".into());
         w(String::new());
     }
     w("## Superblock copy (64 bytes × 4 slots)".into());
@@ -690,13 +736,18 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     ));
     if let Some(kind) = layout.kind_offset {
         o.push_str(&format!(
-            "/// Offset of the row-kind discriminant. INSIDE the checksummed\n             /// region: a bit flip here must not be able to turn a deletion\n             /// back into a record.\n             pub const {upper}_KIND_OFFSET: usize = {kind};\n             pub const {upper}_KIND_RECORD: u8 = {};\n             pub const {upper}_KIND_TOMBSTONE: u8 = {};\n             pub const {upper}_KIND_UPDATE: u8 = {};\n             pub const {upper}_KIND_MAX: u8 = {};\n",
-            ROW_KIND_RECORD, ROW_KIND_TOMBSTONE, ROW_KIND_UPDATE, ROW_KIND_MAX
+            "/// Offset of the row-kind discriminant. INSIDE the checksummed\n             /// region: a bit flip here must not be able to turn a deletion\n             /// back into a record.\n             pub const {upper}_KIND_OFFSET: usize = {kind};\n             pub const {upper}_KIND_RECORD: u8 = {};\n             pub const {upper}_KIND_TOMBSTONE: u8 = {};\n             pub const {upper}_KIND_UPDATE: u8 = {};\n             pub const {upper}_KIND_CHUNK: u8 = {};\n             pub const {upper}_KIND_MAX: u8 = {};\n",
+            ROW_KIND_RECORD, ROW_KIND_TOMBSTONE, ROW_KIND_UPDATE, ROW_KIND_CHUNK, ROW_KIND_MAX
         ));
     }
     if let Some(span) = layout.span_offset {
         o.push_str(&format!(
             "/// Offset of the commit SPAN: how many further rows were written\n             /// as part of the same commit. Also INSIDE the checksummed region —\n             /// a bit flip here must not be able to re-draw a commit boundary.\n             pub const {upper}_SPAN_OFFSET: usize = {span};\n             /// Largest span a slot may claim; beyond it the slot is damaged\n             /// or foreign, and the decoder refuses it.\n             pub const {upper}_SPAN_MAX: u8 = {ROW_SPAN_MAX};\n"
+        ));
+    }
+    if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
+        o.push_str(&format!(
+            "/// Offset of the payload LEN: how many bytes of the final\n             /// fixed-width column this row carries. Also INSIDE the checksummed\n             /// region — a flip here would silently lengthen or shorten a value.\n             pub const {upper}_LEN_OFFSET: usize = {len};\n             /// Largest payload a single row can carry.\n             pub const {upper}_LEN_MAX: u8 = {len_max};\n"
         ));
     }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
@@ -718,6 +769,11 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     if layout.span_offset.is_some() {
         o.push_str(
             "    /// Rows still to come in the same commit: 0 for the last (or\n             \x20   /// only) row of a commit, `n-1` for the first of `n`.\n             \x20   pub span: u8,\n",
+        );
+    }
+    if layout.len_offset.is_some() {
+        o.push_str(
+            "    /// Bytes of the final column this row actually carries.\n             \x20   pub len: u8,\n",
         );
     }
     for col in &schema.columns {
@@ -782,6 +838,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     if layout.span_offset.is_some() {
         o.push_str(&format!("    out[{upper}_SPAN_OFFSET] = row.span;\n"));
     }
+    if layout.len_offset.is_some() {
+        o.push_str(&format!("    out[{upper}_LEN_OFFSET] = row.len;\n"));
+    }
     o.push_str(&format!(
         "    let crc = gen_crc32(&out[0..{upper}_CRC_OFFSET]);\n\
          \x20   out[{upper}_CRC_OFFSET..{upper}_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());\n\
@@ -822,6 +881,14 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
              \x20   }}\n"
         ));
     }
+    if layout.len_offset.is_some() {
+        o.push_str(&format!(
+            "    let len = bytes[{upper}_LEN_OFFSET];\n\
+             \x20   if len > {upper}_LEN_MAX {{\n\
+             \x20       return None;\n\
+             \x20   }}\n"
+        ));
+    }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
         match col.ty {
             ColType::BigInt => o.push_str(&format!(
@@ -842,6 +909,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if layout.span_offset.is_some() {
         fields.push("span");
+    }
+    if layout.len_offset.is_some() {
+        fields.push("len");
     }
     fields.extend(schema.columns.iter().map(|c| c.name.as_str()));
     o.push_str(&format!(

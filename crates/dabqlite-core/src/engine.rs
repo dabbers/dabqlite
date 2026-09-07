@@ -1225,6 +1225,21 @@ impl Engine {
                     self.trigram.insert(row, &slot.value);
                     self.set_live(row, true);
                 }
+                RowKind::Chunk => {
+                    // The engine writes a chunk only directly after the row
+                    // it continues, in the same commit. Nothing here can
+                    // continue it — this replay has not yet grown the
+                    // ability to attach one — so a chunk at this point is
+                    // evidence of damage or of a file we did not write.
+                    if self.salvage {
+                        self.quarantined += 1;
+                        self.trigram.skip_row(row);
+                        continue;
+                    }
+                    return self.fail_open(DbError::Corrupt {
+                        what: crate::defect::ORPHAN_CHUNK,
+                    });
+                }
                 RowKind::Tombstone => {
                     // A deletion of something not live cannot be produced by
                     // the engine (it refuses `NotFound` before any I/O), so
@@ -1351,7 +1366,7 @@ impl Engine {
             .expect("fixed slice");
         // Span 0: a single-row commit, the only kind these three paths
         // make. `Input::Batch` is where a span above 0 comes from.
-        encode_row(RowKind::Update, 0, id, &value, slot);
+        encode_row(RowKind::Update, 0, VALUE_LEN as u8, id, &value, slot);
         self.pending_update = Some((id, value, old_row));
         self.state = State::UpdateWriteRow;
         Output::Write {
@@ -1391,7 +1406,9 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Tombstone, 0, id, &[0u8; VALUE_LEN], slot);
+        // A tombstone carries no payload at all: len 0, so every byte of
+        // its value field is padding the decoder will never hand back.
+        encode_row(RowKind::Tombstone, 0, 0, id, &[0u8; VALUE_LEN], slot);
         self.pending_delete = Some((id, record_row));
         self.state = State::DeleteWriteRow;
         Output::Write {
@@ -1432,7 +1449,7 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Record, 0, id, &value, slot);
+        encode_row(RowKind::Record, 0, VALUE_LEN as u8, id, &value, slot);
         self.pending = Some((id, value));
         self.state = State::InsertWriteRow;
         Output::Write {
@@ -1624,16 +1641,18 @@ impl Engine {
         // when the superblock generation flips, all at once.
         let n = self.batch.len();
         for i in 0..n {
-            let (kind, id, value) = match self.batch[i] {
-                BatchEffect::Insert { id, value } => (RowKind::Record, id, value),
-                BatchEffect::Update { id, value, .. } => (RowKind::Update, id, value),
-                BatchEffect::Delete { id, .. } => (RowKind::Tombstone, id, [0u8; VALUE_LEN]),
+            let (kind, len, id, value) = match self.batch[i] {
+                BatchEffect::Insert { id, value } => (RowKind::Record, VALUE_LEN as u8, id, value),
+                BatchEffect::Update { id, value, .. } => {
+                    (RowKind::Update, VALUE_LEN as u8, id, value)
+                }
+                BatchEffect::Delete { id, .. } => (RowKind::Tombstone, 0, id, [0u8; VALUE_LEN]),
             };
             let off = (base as usize + i) * ROW_SIZE;
             let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
                 .try_into()
                 .expect("fixed slice");
-            encode_row(kind, (n - 1 - i) as u8, id, &value, slot);
+            encode_row(kind, (n - 1 - i) as u8, len, id, &value, slot);
         }
         self.state = State::BatchWriteRow { next: 0 };
         self.batch_row_write(0)

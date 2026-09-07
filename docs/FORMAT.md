@@ -13,7 +13,7 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-a621c5242711bdf9.dabq` | row slots for `records` under the current schema |
+| `rows-5b3f0b9084f97598.dabq` | row slots for `records` under the current schema |
 | `rows-c4345b300a440058.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
@@ -21,7 +21,7 @@ Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0xA621C5242711BDF9`)
+## Row slot (32 bytes, table `records`, schema hash `0x5B3F0B9084F97598`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
@@ -29,18 +29,21 @@ after a migration the legacy file is an orphan nothing references.
 | 8 | 16 | `value` | 16 raw bytes, fixed width |
 | 24 | 1 | kind | 0 = record, 1 = tombstone, 2 = update |
 | 25 | 1 | span | rows still to come in the same commit (0..=63) |
-| 26 | 4 | crc32 | IEEE, over bytes 0..26 |
-| 30 | 2 | padding | must be zero (validated on decode: no dead bytes) |
+| 26 | 1 | len | bytes of the final column this row carries (0..=16) |
+| 27 | 4 | crc32 | IEEE, over bytes 0..27 |
+| 31 | 1 | padding | must be zero (validated on decode: no dead bytes) |
 
 A slot decodes only if the checksum matches AND the padding is zero —
 every byte of a committed row is covered by verification.
 
-`kind` and `span` sit INSIDE the checksummed region, not in the
-padding. `kind` decides whether a slot holds data or deletes it, and
-`span` decides where one commit ends and the next begins; a bit flip
-that could silently change either would be able to resurrect a
-deleted row, or to disguise a rolled-back commit as an interrupted
-one. Covering them by the CRC makes both impossible to miss.
+`kind`, `span` and `len` all sit INSIDE the checksummed region, not
+in the padding. `kind` decides whether a slot holds data or deletes
+it; `span` decides where one commit ends and the next begins; `len`
+decides how much of the slot is really the value. A bit flip that
+could silently change any of them would be able to resurrect a
+deleted row, disguise a rolled-back commit as an interrupted one, or
+lengthen a value into its own padding. Covering them by the CRC makes
+all three impossible to miss.
 
 ## Superblock copy (64 bytes × 4 slots)
 
@@ -49,7 +52,7 @@ one. Covering them by the CRC makes both impossible to miss.
 | 0 | 8 | magic | `"DABQSB01"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0xA621C5242711BDF9` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0x5B3F0B9084F97598` for this schema) |
 | 32 | 4 | crc32 | IEEE, over bytes 0..32 |
 | 36 | 28 | padding | must be zero (validated) |
 
@@ -85,7 +88,7 @@ and 1 with span 0 and claim sizes 1 and 2 — so it means an
 acknowledged commit was rolled back by storage that lied about an
 fsync, and the open reports that loudly.
 
-## Migration (schema `0xC4345B300A440058` → `0xA621C5242711BDF9`)
+## Migration (schema `0xC4345B300A440058` → `0x5B3F0B9084F97598`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to

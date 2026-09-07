@@ -61,6 +61,12 @@ pub mod defect {
     /// in the commit order.
     pub const ORPHAN_UPDATE: &str =
         "update of a row that was not live (reopen in salvage mode to read the rest)";
+    /// A continuation row with no value in front of it to continue. The
+    /// engine only ever writes a chunk immediately after the row it
+    /// belongs to, in the same commit, so a stranded chunk means a
+    /// misdirected write, a truncated file, or a file we did not write.
+    pub const ORPHAN_CHUNK: &str =
+        "value continuation with nothing to continue (reopen in salvage mode to read the rest)";
     /// Two committed rows claim the same primary key.
     pub const DUPLICATE_ID: &str =
         "duplicate id among committed rows (reopen in salvage mode to read the rest)";
