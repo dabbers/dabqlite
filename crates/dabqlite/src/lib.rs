@@ -1410,6 +1410,121 @@ impl<S: Storage> Db<S> {
         }
     }
 
+    /// Every row whose VALUE sorts in `lo..=hi`, byte-lexicographically,
+    /// in value order.
+    ///
+    /// This is the scan for an application whose real key is not a `u64`.
+    /// All three sample applications hash a byte key onto an id, probe
+    /// past collisions and answer "list everything under `session/`" with
+    /// a full scan and a sort, because id order is hash order. Put the key
+    /// at the FRONT of the record and this answers it directly, in order,
+    /// off an index — no schema change and no second table.
+    ///
+    /// An empty `hi` means "no upper bound": nothing sorts before the
+    /// empty string, so reading it literally could only ever have meant an
+    /// empty answer. For a prefix scan that is exactly what you want —
+    /// see [`Db::prefix`], which is this with the bound worked out.
+    pub fn range_by_value(&self, lo: &[u8], hi: &[u8]) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = self.range_page_by_value(lo, hi, cursor)?;
+            out.extend(page);
+            match next {
+                Some(n) => cursor = Some(n),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// The same range in value order, DESCENDING — greatest value first.
+    pub fn range_by_value_rev(&self, lo: &[u8], hi: &[u8]) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = self.range_page_by_value_rev(lo, hi, cursor)?;
+            out.extend(page);
+            match next {
+                Some(n) => cursor = Some(n),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// Every row whose value starts with `prefix`, in value order.
+    ///
+    /// The bound is derived rather than left to the caller, because
+    /// getting it wrong is silent: the natural-looking `lo = prefix,
+    /// hi = prefix` returns only exact matches, and appending `0xff`
+    /// bytes is wrong for a prefix that already ends in `0xff`. The
+    /// correct upper bound is the prefix with its last non-`0xff` byte
+    /// incremented and the `0xff` tail dropped — and when the prefix is
+    /// all `0xff` (or empty) there is no upper bound at all.
+    pub fn prefix(&self, prefix: &[u8]) -> Result<Vec<Row>, Error> {
+        let hi = prefix_upper_bound(prefix);
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = self.range_page_by_value(prefix, &hi, cursor)?;
+            for row in page {
+                // The upper bound is exclusive in spirit but the scan is
+                // inclusive, so the boundary value itself is filtered here
+                // rather than by a second, subtler bound.
+                if row.1.as_bytes().starts_with(prefix) {
+                    out.push(row);
+                }
+            }
+            match next {
+                Some(n) => cursor = Some(n),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One bounded page of a value-ordered range, plus where to continue.
+    pub fn range_page_by_value(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<u64>,
+    ) -> Result<(Vec<Row>, Option<u64>), Error> {
+        self.value_page(lo, hi, after, false)
+    }
+
+    /// One bounded page of a value-ordered range, greatest value first.
+    pub fn range_page_by_value_rev(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<u64>,
+    ) -> Result<(Vec<Row>, Option<u64>), Error> {
+        self.value_page(lo, hi, after, true)
+    }
+
+    fn value_page(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<u64>,
+        descending: bool,
+    ) -> Result<(Vec<Row>, Option<u64>), Error> {
+        use dabqlite_core::Input;
+        match self.h().read(Input::RangeByValue {
+            lo,
+            hi,
+            after,
+            descending,
+        }) {
+            Output::RangeDone { result: Ok(page) } => {
+                let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+                let next = page.next;
+                Ok((self.rows_from(&items)?, next))
+            }
+            Output::RangeDone { result: Err(e) } => Err(e.into()),
+            other => unreachable!("value range returned {other:?}"),
+        }
+    }
+
     /// The `n` rows with the highest ids, greatest first.
     ///
     /// For anything that hands out ascending ids — a log, an outbox, a
@@ -1676,4 +1791,24 @@ impl<S: Storage> Db<S> {
         }
         Ok(())
     }
+}
+
+/// The smallest byte string strictly greater than every string starting
+/// with `prefix`, or empty when there is none.
+///
+/// Written down once, here, because every application that wants a prefix
+/// scan needs it and the obvious versions are wrong: `prefix` itself
+/// matches only exact hits, and `prefix + 0xff` breaks the moment the
+/// prefix ends in `0xff`. Increment the last byte below `0xff` and drop
+/// the `0xff` tail; an all-`0xff` (or empty) prefix has no upper bound,
+/// which the scan reads as "unbounded".
+fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut hi = prefix.to_vec();
+    while let Some(last) = hi.pop() {
+        if last != 0xff {
+            hi.push(last + 1);
+            return hi;
+        }
+    }
+    Vec::new()
 }

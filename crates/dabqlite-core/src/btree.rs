@@ -20,6 +20,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 /// Max keys per node. Even, small (see module docs).
 pub const ORDER: usize = 8;
@@ -66,14 +67,28 @@ pub fn pool_nodes_for(rows: u64) -> u64 {
     rows / 3 + 16
 }
 
-/// Descent routing: does `key` belong strictly before separator `sep`?
-/// STRICTLY — equality routes right, toward the leaf that owns the
-/// separator's key. Through `insert` the equal case is unreachable
-/// (duplicates are rejected before the index), which makes the strictness
-/// untestable from the outside; naming the predicate lets the tests pin
-/// it directly instead of excluding the mutant as "equivalent".
-fn routes_before(key: u64, sep: u64) -> bool {
-    key < sep
+/// Descent routing: does the search target belong strictly before
+/// separator `sep`? STRICTLY — equality routes right, toward the leaf that
+/// owns the separator's key. Through `insert` the equal case is
+/// unreachable (duplicates are rejected before the index), which makes the
+/// strictness untestable from the outside; naming the predicate lets the
+/// tests pin it directly instead of excluding the mutant as "equivalent".
+///
+/// The target is not passed as a number. Every search here — insert,
+/// lookup, both range walks — compares ONE fixed target against the stored
+/// keys it meets, so the target is carried as a *probe*: a closure
+/// answering "how does this stored key order against what I am looking
+/// for?". For the ordinary `u64` index the probe is `stored.cmp(&target)`
+/// and the compiler turns it back into an integer comparison. For an index
+/// ordered by something the key only POINTS AT — value bytes in the row
+/// arena — the probe dereferences, and not one line of the tree changes.
+fn routes_before<P: Fn(u64) -> Ordering>(probe: &P, sep: u64) -> bool {
+    probe(sep) == Ordering::Greater
+}
+
+/// The probe for an ordinary numeric key: stored against target.
+fn numeric(target: u64) -> impl Fn(u64) -> Ordering {
+    move |stored| stored.cmp(&target)
 }
 
 impl BTreeIndex {
@@ -131,13 +146,22 @@ impl BTreeIndex {
     /// Insert a key. Keys are unique (the engine rejects duplicates before
     /// reaching the index); inserting a duplicate is a caller bug.
     pub fn insert(&mut self, key: u64, row: u64) {
+        self.insert_by(key, row, &numeric(key));
+    }
+
+    /// Insert under an explicit probe, for an index whose order is not the
+    /// key's own numeric order. `probe(stored)` must answer how `stored`
+    /// orders against `key`, and must agree with the probe every other
+    /// operation on this tree uses — a tree ordered two ways at once is
+    /// not a tree.
+    pub fn insert_by<P: Fn(u64) -> Ordering>(&mut self, key: u64, row: u64, probe: &P) {
         debug_assert_eq!(
             self.pool.as_ptr() as usize,
             self.pool_addr,
             "btree pool moved: allocation after init is forbidden"
         );
-        debug_assert!(self.get(key).is_none(), "duplicate key {key} in btree");
-        if let Some((sep, right)) = self.insert_into(self.root, key, row) {
+        debug_assert!(self.get_by(probe).is_none(), "duplicate key {key} in btree");
+        if let Some((sep, right)) = self.insert_into(self.root, key, row, probe) {
             // Root split: the tree grows one level.
             let old_root = self.root;
             let new_root = self.alloc_node();
@@ -151,7 +175,7 @@ impl BTreeIndex {
         }
         self.len += 1;
         // Pair assertion: what went in must come out.
-        debug_assert_eq!(self.get(key), Some(row));
+        debug_assert_eq!(self.get_by(probe), Some(row));
     }
 
     /// Point lookup (used only by assertions; the hash index serves gets).
@@ -164,21 +188,29 @@ impl BTreeIndex {
     /// the tree's shape, occupancy and ordering are untouched, so none of
     /// the structural invariants can be disturbed by it.
     pub fn repoint(&mut self, key: u64, row: u64) -> bool {
+        self.repoint_by(&numeric(key), row)
+    }
+
+    /// `repoint` under an explicit probe. See [`BTreeIndex::insert_by`].
+    pub fn repoint_by<P: Fn(u64) -> Ordering>(&mut self, probe: &P, row: u64) -> bool {
         let mut id = self.root;
         loop {
             let n = self.node(id);
             let len = n.len as usize;
             if n.leaf {
-                let Some(i) = n.keys[..len].iter().position(|&k| k == key) else {
+                let Some(i) = n.keys[..len]
+                    .iter()
+                    .position(|&k| probe(k) == Ordering::Equal)
+                else {
                     return false;
                 };
                 self.node_mut(id).vals[i] = row;
-                debug_assert_eq!(self.get(key), Some(row));
+                debug_assert_eq!(self.get_by(probe), Some(row));
                 return true;
             }
             let mut child = len;
             for (i, &k) in n.keys[..len].iter().enumerate() {
-                if key < k {
+                if routes_before(probe, k) {
                     child = i;
                     break;
                 }
@@ -188,6 +220,11 @@ impl BTreeIndex {
     }
 
     pub fn get(&self, key: u64) -> Option<u64> {
+        self.get_by(&numeric(key))
+    }
+
+    /// `get` under an explicit probe. See [`BTreeIndex::insert_by`].
+    pub fn get_by<P: Fn(u64) -> Ordering>(&self, probe: &P) -> Option<u64> {
         let mut id = self.root;
         loop {
             let n = self.node(id);
@@ -195,12 +232,12 @@ impl BTreeIndex {
             if n.leaf {
                 return n.keys[..len]
                     .iter()
-                    .position(|&k| k == key)
+                    .position(|&k| probe(k) == Ordering::Equal)
                     .map(|i| n.vals[i]);
             }
             let mut child = len; // rightmost unless a separator exceeds key
             for (i, &k) in n.keys[..len].iter().enumerate() {
-                if key < k {
+                if routes_before(probe, k) {
                     child = i;
                     break;
                 }
@@ -239,8 +276,18 @@ impl BTreeIndex {
         }
     }
 
-    pub fn for_each_from(&self, start: u64, mut f: impl FnMut(u64, u64) -> bool) {
-        // Descend to the leaf that could contain `start`.
+    pub fn for_each_from(&self, start: u64, f: impl FnMut(u64, u64) -> bool) {
+        self.for_each_from_by(&numeric(start), f);
+    }
+
+    /// `for_each_from` under an explicit probe. See
+    /// [`BTreeIndex::insert_by`].
+    pub fn for_each_from_by<P: Fn(u64) -> Ordering>(
+        &self,
+        probe: &P,
+        mut f: impl FnMut(u64, u64) -> bool,
+    ) {
+        // Descend to the leaf that could contain the start bound.
         let mut id = self.root;
         loop {
             let n = self.node(id);
@@ -255,7 +302,7 @@ impl BTreeIndex {
                 // (Routing left would still be correct — the chain walk
                 // filters — just one leaf slower, which is why only the
                 // shared pinned predicate can hold the strictness.)
-                if routes_before(start, k) {
+                if routes_before(probe, k) {
                     child = i;
                     break;
                 }
@@ -268,7 +315,7 @@ impl BTreeIndex {
             assert!(steps <= self.used as u64, "leaf chain cycle");
             let n = self.node(id);
             for i in 0..n.len as usize {
-                if n.keys[i] >= start && !f(n.keys[i], n.vals[i]) {
+                if probe(n.keys[i]) != Ordering::Less && !f(n.keys[i], n.vals[i]) {
                     return;
                 }
             }
@@ -293,9 +340,19 @@ impl BTreeIndex {
     /// the tree's depth rather than its size. That bound is the whole
     /// point: "the twenty highest keys" costs twenty keys and a couple of
     /// leaves, not a scan of everything below them.
-    pub fn for_each_down_from(&self, start: u64, mut f: impl FnMut(u64, u64) -> bool) {
-        // Descend to the leaf that could own `start`, remembering which
-        // child was taken at every level.
+    pub fn for_each_down_from(&self, start: u64, f: impl FnMut(u64, u64) -> bool) {
+        self.for_each_down_from_by(&numeric(start), f);
+    }
+
+    /// `for_each_down_from` under an explicit probe. See
+    /// [`BTreeIndex::insert_by`].
+    pub fn for_each_down_from_by<P: Fn(u64) -> Ordering>(
+        &self,
+        probe: &P,
+        mut f: impl FnMut(u64, u64) -> bool,
+    ) {
+        // Descend to the leaf that could own the start bound, remembering
+        // which child was taken at every level.
         let mut path = [(NIL, 0usize); Self::MAX_DEPTH];
         let mut depth = 0usize;
         let mut id = self.root;
@@ -307,7 +364,7 @@ impl BTreeIndex {
             let len = n.len as usize;
             let mut child = len;
             for (i, &k) in n.keys[..len].iter().enumerate() {
-                if routes_before(start, k) {
+                if routes_before(probe, k) {
                     child = i;
                     break;
                 }
@@ -326,7 +383,7 @@ impl BTreeIndex {
             for i in (0..n.len as usize).rev() {
                 // The bound only bites in the first leaf; every later one
                 // lies entirely below `start`.
-                if n.keys[i] <= start && !f(n.keys[i], n.vals[i]) {
+                if probe(n.keys[i]) != Ordering::Greater && !f(n.keys[i], n.vals[i]) {
                     return;
                 }
             }
@@ -364,20 +421,26 @@ impl BTreeIndex {
 
     /// Recursive insert; returns `Some((separator, new_right))` if `id`
     /// split.
-    fn insert_into(&mut self, id: u32, key: u64, row: u64) -> Option<(u64, u32)> {
+    fn insert_into<P: Fn(u64) -> Ordering>(
+        &mut self,
+        id: u32,
+        key: u64,
+        row: u64,
+        probe: &P,
+    ) -> Option<(u64, u32)> {
         if self.node(id).leaf {
-            return self.insert_into_leaf(id, key, row);
+            return self.insert_into_leaf(id, key, row, probe);
         }
         let len = self.node(id).len as usize;
         let mut child_idx = len;
         for i in 0..len {
-            if routes_before(key, self.node(id).keys[i]) {
+            if routes_before(probe, self.node(id).keys[i]) {
                 child_idx = i;
                 break;
             }
         }
         let child = self.node(id).children[child_idx];
-        let (sep, right) = self.insert_into(child, key, row)?;
+        let (sep, right) = self.insert_into(child, key, row, probe)?;
 
         // The child split: insert (sep, right) into this internal node.
         let len = self.node(id).len as usize;
@@ -425,11 +488,17 @@ impl BTreeIndex {
         Some((keys[MID], new_right))
     }
 
-    fn insert_into_leaf(&mut self, id: u32, key: u64, row: u64) -> Option<(u64, u32)> {
+    fn insert_into_leaf<P: Fn(u64) -> Ordering>(
+        &mut self,
+        id: u32,
+        key: u64,
+        row: u64,
+        probe: &P,
+    ) -> Option<(u64, u32)> {
         let len = self.node(id).len as usize;
         let pos = self.node(id).keys[..len]
             .iter()
-            .position(|&k| routes_before(key, k))
+            .position(|&k| routes_before(probe, k))
             .unwrap_or(len);
         if len < ORDER {
             let n = self.node_mut(id);
@@ -484,17 +553,42 @@ impl BTreeIndex {
     /// uniform leaf depth, occupancy minimums, separator bounds, leaf-chain
     /// completeness, and the length accounting.
     pub fn check_invariants(&self) {
+        self.check_invariants_by(&|a: u64, b: u64| a.cmp(&b), &|_| Ordering::Greater);
+    }
+
+    /// `check_invariants` for a tree ordered by something other than the
+    /// key's own numeric order: `order(a, b)` compares two STORED keys,
+    /// and `lowest` is the probe for a bound at or below every key (so the
+    /// chain walk starts at the first one). See [`BTreeIndex::insert_by`].
+    pub fn check_invariants_by<O, P>(&self, order: &O, lowest: &P)
+    where
+        O: Fn(u64, u64) -> Ordering,
+        P: Fn(u64) -> Ordering,
+    {
         let mut leaf_depth: Option<u32> = None;
         let mut count = 0u64;
-        self.check_node(self.root, 0, None, None, &mut leaf_depth, &mut count, true);
+        self.check_node(
+            self.root,
+            0,
+            None,
+            None,
+            &mut leaf_depth,
+            &mut count,
+            true,
+            order,
+        );
         assert_eq!(count, self.len, "btree length accounting diverged");
 
         // The leaf chain must visit exactly the in-order keys, sorted.
         let mut last: Option<u64> = None;
         let mut chained = 0u64;
-        self.for_each_from(0, |k, _| {
+        self.for_each_from_by(lowest, |k, _| {
             if let Some(l) = last {
-                assert!(k > l, "leaf chain out of order: {l} then {k}");
+                assert_eq!(
+                    order(k, l),
+                    Ordering::Greater,
+                    "leaf chain out of order: {l} then {k}"
+                );
             }
             last = Some(k);
             chained += 1;
@@ -504,7 +598,7 @@ impl BTreeIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn check_node(
+    fn check_node<O: Fn(u64, u64) -> Ordering>(
         &self,
         id: u32,
         depth: u32,
@@ -513,6 +607,7 @@ impl BTreeIndex {
         leaf_depth: &mut Option<u32>,
         count: &mut u64,
         is_root: bool,
+        order: &O,
     ) {
         let n = self.node(id);
         let len = n.len as usize;
@@ -521,14 +616,22 @@ impl BTreeIndex {
             assert!(len >= min, "under-occupied node ({len} < {min})");
         }
         for w in n.keys[..len].windows(2) {
-            assert!(w[0] < w[1], "node keys out of order");
+            assert_eq!(order(w[0], w[1]), Ordering::Less, "node keys out of order");
         }
         for &k in &n.keys[..len] {
             if let Some(lo) = lo {
-                assert!(k >= lo, "key {k} below subtree bound {lo}");
+                assert_ne!(
+                    order(k, lo),
+                    Ordering::Less,
+                    "key {k} below subtree bound {lo}"
+                );
             }
             if let Some(hi) = hi {
-                assert!(k < hi, "key {k} at/above subtree bound {hi}");
+                assert_eq!(
+                    order(k, hi),
+                    Ordering::Less,
+                    "key {k} at/above subtree bound {hi}"
+                );
             }
         }
         if n.leaf {
@@ -550,6 +653,7 @@ impl BTreeIndex {
                     leaf_depth,
                     count,
                     false,
+                    order,
                 );
             }
         }
@@ -693,9 +797,29 @@ mod tests {
         // Equality routes RIGHT: the separator's key lives in the right
         // subtree. Unreachable via insert (duplicates rejected upstream),
         // so pinned here directly.
-        assert!(routes_before(1, 2));
-        assert!(!routes_before(2, 2));
-        assert!(!routes_before(3, 2));
+        assert!(routes_before(&numeric(1), 2));
+        assert!(!routes_before(&numeric(2), 2));
+        assert!(!routes_before(&numeric(3), 2));
+    }
+
+    /// The numeric probe must be exactly the integer comparison it
+    /// replaced. Everything ordered by `u64` now reaches the tree through
+    /// a closure, so this is the one place that says the closure means
+    /// what the `<` it stands in for meant — including at the boundaries,
+    /// where an off-by-one probe would still pass every ordinary test.
+    #[test]
+    fn the_numeric_probe_is_the_comparison_it_replaced() {
+        for target in [0u64, 1, 2, 41, 42, 43, u64::MAX - 1, u64::MAX] {
+            let p = numeric(target);
+            for stored in [0u64, 1, 2, 41, 42, 43, u64::MAX - 1, u64::MAX] {
+                assert_eq!(p(stored), stored.cmp(&target), "{stored} vs {target}");
+                assert_eq!(
+                    routes_before(&p, stored),
+                    target < stored,
+                    "routing {target} against separator {stored}"
+                );
+            }
+        }
     }
 
     #[test]

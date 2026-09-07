@@ -33,6 +33,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::btree::BTreeIndex;
 use crate::layout::{
@@ -505,6 +506,29 @@ pub enum Input<'a> {
     /// ascending scan means walking everything below them first, which is
     /// the difference between twenty rows of work and the whole database.
     RangeRev { lo: u64, hi: u64 },
+    /// Client: range scan in VALUE order, `lo..=hi` compared
+    /// lexicographically over the value bytes — the scan an application
+    /// whose real key is bytes actually wants. One bounded page per call;
+    /// continue by re-issuing with `after = page.next`.
+    ///
+    /// The bounds are inclusive and byte-lexicographic, so a PREFIX scan
+    /// is `lo = b"session/"`, `hi = b"session/\xff..."` — or, more
+    /// simply, `lo = prefix` with the caller stopping when a row stops
+    /// starting with it. An empty `hi` means "no upper bound": no value
+    /// sorts before the empty string, so an empty bound can only ever
+    /// have meant the whole range on that side.
+    ///
+    /// `descending` walks the same range greatest-first, for the same
+    /// reason [`Input::RangeRev`] exists.
+    RangeByValue {
+        lo: &'a [u8],
+        hi: &'a [u8],
+        /// Resume token from a previous page's `next`. Opaque: it is a
+        /// position in value order, not a key, and it is only meaningful
+        /// against the generation that produced it.
+        after: Option<u64>,
+        descending: bool,
+    },
     /// Client: substring search over `value` bytes (trigram-accelerated,
     /// verification-exact). One bounded page per call, newest row first;
     /// continue by re-issuing with `after = page.next`.
@@ -811,6 +835,16 @@ pub struct Engine {
     /// state like the btree — rebuilt at every recovery, updated at the
     /// commit point.
     trigram: TrigramIndex,
+    /// Ordered index over VALUE bytes: the same B+tree, keyed by the head
+    /// ROW of each record and compared by dereferencing into the arena
+    /// (see [`crate::vorder`]). This is what answers "everything under
+    /// `session/`, in order" without a scan and a sort, for an
+    /// application whose real key is bytes rather than a `u64`.
+    ///
+    /// Append-only, like the trigram postings: a superseded record keeps
+    /// its entry and liveness decides at query time, so no comparison
+    /// ever has to run backwards through a removal.
+    by_value: BTreeIndex,
     /// The delete in flight: the id, and the row slot holding the record
     /// it retires (cleared at the commit point).
     pending_delete: Option<(u64, u64)>,
@@ -988,6 +1022,7 @@ impl Engine {
         let index = vec![0u64; index_len];
         let ordered = BTreeIndex::new(caps.rows);
         let trigram = TrigramIndex::new(caps.rows);
+        let by_value = BTreeIndex::new(caps.rows);
         // Room for the longest commit the row format can describe, taken
         // once so that pushing effects during validation can never
         // reallocate (asserted in `check_invariants`).
@@ -1026,6 +1061,7 @@ impl Engine {
             index,
             ordered,
             trigram,
+            by_value,
             arena_addr,
             index_addr,
             batch_addr,
@@ -1306,6 +1342,7 @@ impl Engine {
             | Input::GetFrom { .. }
             | Input::Range { .. }
             | Input::RangeRev { .. }
+            | Input::RangeByValue { .. }
             | Input::Find { .. } => self.read(input),
         }
     }
@@ -1333,6 +1370,12 @@ impl Engine {
             Input::GetFrom { id, offset } => self.read_window(id, offset),
             Input::Range { lo, hi } => self.on_range(lo, hi, false),
             Input::RangeRev { lo, hi } => self.on_range(lo, hi, true),
+            Input::RangeByValue {
+                lo,
+                hi,
+                after,
+                descending,
+            } => self.on_range_by_value(lo, hi, after, descending),
             Input::Find {
                 needle,
                 mode,
@@ -1694,7 +1737,7 @@ impl Engine {
                         let o = (r as usize) * ROW_SIZE;
                         self.arena[o..o + ROW_SIZE].copy_from_slice(&data[o..o + ROW_SIZE]);
                     }
-                    self.bind_indices(id, row);
+                    self.bind_indices(id, row, row + rows);
                     self.set_live(row, true);
                     self.chunks += rows - 1;
                     if rows > 1 {
@@ -2317,7 +2360,7 @@ impl Engine {
                     } else {
                         self.live_count += 1;
                     }
-                    self.bind_indices(id, row);
+                    self.bind_indices(id, row, row + rows as u64);
                     self.set_live(row, true);
                     let mut value = [0u8; MAX_VALUE_LEN];
                     let len = self.assemble_from_arena(row, rows as u64, &mut value);
@@ -2502,7 +2545,7 @@ impl Engine {
                 self.generation += 1;
                 // The superseded slot stops being live; the new one starts.
                 self.retire(old_row, self.row_count);
-                self.bind_indices(id, self.row_count);
+                self.bind_indices(id, self.row_count, self.row_count + 1);
                 self.trigram.insert(self.row_count, &value);
                 self.set_live(self.row_count, true);
                 self.row_count += 1;
@@ -2574,7 +2617,7 @@ impl Engine {
                 // `bind`, not blind insert: this id may have been deleted
                 // earlier, in which case both indices still hold an entry
                 // for it pointing at the retired slot.
-                self.bind_indices(id, self.row_count);
+                self.bind_indices(id, self.row_count, self.row_count + 1);
                 self.trigram.insert(self.row_count, &value);
                 self.set_live(self.row_count, true);
                 self.row_count += 1;
@@ -2890,6 +2933,165 @@ impl Engine {
     /// One bounded page of `lo..=hi`, ascending. Reads only committed
     /// state: the ordered index is updated at the commit point, so an
     /// in-flight insert is never visible here (serializable, §5).
+    /// Gate a value-ordered scan on the same states an id-ordered one is
+    /// gated on. Shares `on_range`'s reasoning; written out rather than
+    /// abstracted so the state list stays greppable.
+    fn on_range_by_value(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<u64>,
+        descending: bool,
+    ) -> Output {
+        if lo.len() > MAX_VALUE_LEN || hi.len() > MAX_VALUE_LEN {
+            // Longer than any value can be. An upper bound that long is
+            // harmless, but a LOWER bound that long excludes everything,
+            // and an empty page that looks like a real answer is worse
+            // than a refusal that names the reason.
+            return Output::RangeDone {
+                result: Err(DbError::ValueTooLong {
+                    len: lo.len().max(hi.len()) as u32,
+                    max: MAX_VALUE_LEN as u32,
+                }),
+            };
+        }
+        let result = match self.state {
+            State::Ready | State::Degraded => {
+                Ok(self.scan_page_by_value(lo, hi, after, descending))
+            }
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverTruncateRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
+            | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb
+            | State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => Err(DbError::Busy),
+            State::Failed(e) => Err(e),
+        };
+        Output::RangeDone { result }
+    }
+
+    /// One page of the value-ordered scan.
+    ///
+    /// The shape mirrors [`Engine::scan_page`] exactly — descend to the
+    /// bound, walk, skip what is not live, stop at the far bound, hand
+    /// back a resume token — and the only difference is what "order"
+    /// means. That is deliberate: two scans that look different are two
+    /// scans that drift.
+    ///
+    /// Values are compared without being assembled (see [`crate::vorder`]),
+    /// so a page costs its own rows and not the bytes behind them.
+    fn scan_page_by_value(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<u64>,
+        descending: bool,
+    ) -> RangePage {
+        let mut page = RangePage {
+            items: [RowRef::EMPTY; RANGE_PAGE],
+            count: 0,
+            next: None,
+            incomplete: self.quarantined > 0,
+        };
+        // An empty upper bound is "no upper bound": nothing sorts before
+        // the empty string, so reading it literally would make every
+        // prefix scan return nothing at all.
+        let unbounded_hi = hi.is_empty();
+        if !unbounded_hi && lo > hi {
+            return page; // inverted bounds: honestly empty, not an error
+        }
+        let arena = &self.arena[..];
+        let n_rows = self.row_count;
+        let mut hits = [(0u64, 0u64); RANGE_PAGE];
+        let mut n = 0usize;
+        let mut next = None;
+        let mut visit = |row: u64| {
+            // Past the far bound: this page, and the scan, are done.
+            let past = if descending {
+                crate::vorder::cmp_run_bytes(arena, n_rows, row, lo) == Ordering::Less
+            } else {
+                !unbounded_hi
+                    && crate::vorder::cmp_run_bytes(arena, n_rows, row, hi) == Ordering::Greater
+            };
+            if past {
+                return false;
+            }
+            // The index keeps an entry for every record row ever written,
+            // including ones since superseded or deleted. Liveness decides.
+            if !self.is_live(row) {
+                return true;
+            }
+            if n == RANGE_PAGE {
+                next = Some(row);
+                return false;
+            }
+            hits[n] = (row, row);
+            n += 1;
+            true
+        };
+        // The start bound. A resume token is a position in the order and
+        // therefore compares by the index's own total order; a byte bound
+        // compares by value alone, which accepts every row holding it.
+        match (after, descending) {
+            (Some(cursor), _) => {
+                let probe = |stored: u64| crate::vorder::order(arena, n_rows, stored, cursor);
+                if descending {
+                    self.by_value.for_each_down_from_by(&probe, |k, _| visit(k));
+                } else {
+                    self.by_value.for_each_from_by(&probe, |k, _| visit(k));
+                }
+            }
+            (None, true) => {
+                if unbounded_hi {
+                    // Greatest-first with no upper bound: start at the end.
+                    let probe = |_: u64| Ordering::Less;
+                    self.by_value.for_each_down_from_by(&probe, |k, _| visit(k));
+                } else {
+                    let probe =
+                        |stored: u64| crate::vorder::cmp_run_bytes(arena, n_rows, stored, hi);
+                    self.by_value.for_each_down_from_by(&probe, |k, _| visit(k));
+                }
+            }
+            (None, false) => {
+                let probe = |stored: u64| crate::vorder::cmp_run_bytes(arena, n_rows, stored, lo);
+                self.by_value.for_each_from_by(&probe, |k, _| visit(k));
+            }
+        }
+        for (slot, &(row, _)) in page.items.iter_mut().zip(hits.iter().take(n)) {
+            *slot = self.row_ref(self.row_id_at(row), row);
+        }
+        for pair in hits[..n].windows(2) {
+            let ord = crate::vorder::order(arena, n_rows, pair[0].0, pair[1].0);
+            if descending {
+                debug_assert_eq!(ord, Ordering::Greater, "descending page out of order");
+            } else {
+                debug_assert_eq!(ord, Ordering::Less, "value page out of order");
+            }
+        }
+        page.count = n as u8;
+        page.next = next;
+        page
+    }
+
     fn scan_page(&self, lo: u64, hi: u64, descending: bool) -> RangePage {
         let mut page = RangePage {
             items: [RowRef::EMPTY; RANGE_PAGE],
@@ -3308,13 +3510,34 @@ impl Engine {
         debug_assert_eq!(self.index_lookup(id), Some(row));
     }
 
-    /// Bind `id` in both keyed indices — the hash table and the ordered
-    /// tree — to the slot that now holds its record.
-    fn bind_indices(&mut self, id: u64, row: u64) {
+    /// Bind `id` in every keyed index — the hash table, the ordered tree
+    /// and the value-ordered tree — to the slot that now holds its
+    /// record. `limit` is one past the last arena row this record's run
+    /// can reach; at a commit point the new rows are staged but
+    /// `row_count` has not moved yet, so the bound has to be passed in.
+    ///
+    /// One choke point on purpose: a read path that forgets an index is
+    /// how a query starts answering a different question from the one
+    /// beside it.
+    fn bind_indices(&mut self, id: u64, row: u64, limit: u64) {
         self.index_bind(id, row);
         if !self.ordered.repoint(id, row) {
             self.ordered.insert(id, row);
         }
+        // The value-ordered index is keyed by the ROW, not the id: a
+        // superseded record keeps its entry (liveness decides at query
+        // time) exactly like the trigram postings, so the same id can be
+        // present several times and the key has to stay unique.
+        let Engine {
+            arena,
+            by_value,
+            row_count,
+            ..
+        } = self;
+        let bound = limit.max(*row_count);
+        by_value.insert_by(row, row, &|stored| {
+            crate::vorder::order(arena, bound, stored, row)
+        });
     }
 
     fn row_id_at(&self, row: u64) -> u64 {

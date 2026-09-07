@@ -82,6 +82,7 @@ pub mod inspect;
 pub mod layout;
 pub mod migration;
 pub mod trigram;
+pub mod vorder;
 
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{

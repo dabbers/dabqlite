@@ -26,22 +26,47 @@
 //! sibling test thread can allocate inside the measured window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 struct CountingAlloc;
 
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+// PER THREAD, not per process, and that distinction is load-bearing.
+//
+// This counter used to be a global `AtomicU64`. libtest runs the test
+// body on a spawned thread while its own harness thread keeps working —
+// formatting names, writing results, growing buffers — so any allocation
+// the HARNESS made while the engine was mid-workload was counted against
+// the engine. The measurement was a race: the same engine, the same
+// workload, "4 allocations" or "0" depending on how the two threads
+// interleaved. A zero-allocation proof that can be polluted by the thing
+// running it proves nothing, and it fails at random in CI.
+//
+// A thread-local counter measures exactly the thread doing the work.
+// `const`-initialized, so touching it never allocates and cannot recurse
+// into this allocator; `try_with` because TLS is gone during teardown and
+// an allocation then must not panic.
+thread_local! {
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn bump() {
+    let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+}
+
+fn allocations() -> u64 {
+    ALLOCATIONS.with(|c| c.get())
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        bump();
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        bump();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -96,9 +121,9 @@ fn drive(engine: &mut Engine, sb: &mut [u8], rows: &mut [u8], first: Input<'_>) 
 #[test]
 fn steady_state_performs_zero_heap_allocations() {
     // Construction allocates (the one and only time) — count it happening.
-    let before_new = ALLOCATIONS.load(Ordering::SeqCst);
+    let before_new = allocations();
     let mut engine = Engine::new(CAPS);
-    let init_allocs = ALLOCATIONS.load(Ordering::SeqCst) - before_new;
+    let init_allocs = allocations() - before_new;
     assert!(init_allocs > 0, "init must be where allocation happens");
 
     // Preallocated file images and lengths — the host's read buffers.
@@ -108,7 +133,7 @@ fn steady_state_performs_zero_heap_allocations() {
     let mut rows_len = 0u64;
 
     // --- the measured window: EVERYTHING after init ---------------------
-    let start = ALLOCATIONS.load(Ordering::SeqCst);
+    let start = allocations();
 
     // Fresh init-open (writes + fsyncs, no reads).
     match drive(
@@ -186,7 +211,7 @@ fn steady_state_performs_zero_heap_allocations() {
     // would hide its init allocs — so construct it outside afterwards
     // is impossible; instead: recovery on the SAME engine is a protocol
     // violation. Measure recovery separately below.
-    let steady_allocs = ALLOCATIONS.load(Ordering::SeqCst) - start;
+    let steady_allocs = allocations() - start;
     assert_eq!(
         steady_allocs, 0,
         "the engine allocated {steady_allocs} times after init — \
@@ -195,7 +220,7 @@ fn steady_state_performs_zero_heap_allocations() {
 
     // --- recovery window: a new engine's post-init recovery ------------
     let mut engine2 = Engine::new(CAPS); // allocates: outside the window
-    let start = ALLOCATIONS.load(Ordering::SeqCst);
+    let start = allocations();
     match drive(
         &mut engine2,
         &mut sb,
@@ -218,7 +243,7 @@ fn steady_state_performs_zero_heap_allocations() {
             other => panic!("recovered get {i}: {other:?}"),
         }
     }
-    let recovery_allocs = ALLOCATIONS.load(Ordering::SeqCst) - start;
+    let recovery_allocs = allocations() - start;
     assert_eq!(
         recovery_allocs, 0,
         "recovery allocated {recovery_allocs} times — rebuilding every \
