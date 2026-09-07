@@ -399,14 +399,35 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-- Concurrent readers during a write, or serialize everything. (Recommendation:
-  serialize for v1.)
-- Inline threshold for varlen fields: 32 or 48 bytes.
+Three of these have since been decided by building the thing. They are kept
+here with the reasoning rather than deleted, because the reasoning is the
+part worth reading.
+
+- **Concurrent readers during a write** — DECIDED: readers, and any number of
+  them. Writers stay serialized (one writer, always), but a reader takes no
+  lock and writes nothing at all, and sees the committed generation it opened
+  on. That fell out of the commit protocol rather than being added to it: a
+  commit becomes visible only when the superblock flips, and the previous
+  generation survives in its own pair of slots throughout, so a reader can
+  never observe a half-commit. All three sample applications named the
+  absence of readers as a hard limitation before this existed.
+- **Inline threshold for varlen fields** — DECIDED, and the question turned
+  out to be the wrong one. There is no threshold and no spill: a value too
+  long for one row slot is a RUN of slots written inside one commit, so a
+  long value is atomic for the same reason a short one is, and there is no
+  second allocator to keep consistent with the first. The ceiling is what
+  one commit can carry (2 KiB today), and beyond that the answer is object
+  storage with a reference stored here, as §4.5 always said.
+- **Which hard index ships in v1** — DECIDED: trigram, for the reason §4.6
+  gives. Its oracle is exact, and every other index in this project is held
+  to equality against an oracle.
+
+Still open:
+
 - Size class growth ratio: 2x (simple, ~50% worst-case internal fragmentation) versus
   1.25x (tighter, more free lists).
 - `BLOB_HARD_MAX` exact value.
 - Page size, and whether it is fixed or schema-declared.
-- Which hard index ships in v1: vector or trigram.
 - Multi-tab coordination mechanism in the browser.
 
 ## 11. Prior art to read before building
