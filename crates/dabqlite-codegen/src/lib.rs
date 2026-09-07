@@ -513,7 +513,32 @@ impl Schema {
     /// §4.8): FNV-1a 64 over a canonical rendering of everything that
     /// affects layout. Two schemas hash equal iff their files are
     /// byte-compatible.
+    ///
+    /// That claim is why the hash exists — a binary that would misread a
+    /// file has to refuse it instead — so it is made true BY
+    /// CONSTRUCTION rather than by discipline. The canonical rendering
+    /// includes the DERIVED layout, not just the declaration it came
+    /// from: every offset, the row size, and the payload ceiling. Without
+    /// that, changing how a layout is computed from an unchanged
+    /// declaration — widening the span field, moving the checksum — would
+    /// leave the hash alone, and every existing file would be read with
+    /// the wrong ruler while claiming to match. Nothing would fail; rows
+    /// would simply mean something else.
+    ///
+    /// With the layout folded in, that mistake is not possible to make:
+    /// a layout change moves the hash whether or not anyone remembered to
+    /// bump the format number.
     pub fn schema_hash(&self) -> u64 {
+        self.hash_with_layout(&self.layout())
+    }
+
+    /// The hash this schema WOULD have with that layout.
+    ///
+    /// Exposed so the property above can be tested rather than asserted:
+    /// hand a schema a layout it did not derive, and the hash must move.
+    /// There is no other way to check that the layout is really part of
+    /// the identity, because a schema always computes its own.
+    pub fn hash_with_layout(&self, l: &Layout) -> u64 {
         let mut canon = format!("dabqlite-schema-v{};table={};", self.format, self.table);
         for col in &self.columns {
             let ty = match col.ty {
@@ -527,6 +552,14 @@ impl Schema {
                 if col.primary_key { "pk" } else { "col" }
             ));
         }
+        canon.push_str("layout=");
+        for off in &l.field_offsets {
+            canon.push_str(&format!("f{off},"));
+        }
+        canon.push_str(&format!(
+            "kind={:?},span={:?},len={:?},lenmax={:?},crc={},row={};",
+            l.kind_offset, l.span_offset, l.len_offset, l.len_max, l.crc_offset, l.row_size
+        ));
         fnv1a64(canon.as_bytes())
     }
 }

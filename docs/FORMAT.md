@@ -13,15 +13,15 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-84ee7f59f027fa5f.dabq` | row slots for `records` under the current schema |
-| `rows-c4345b300a440058.dabq` | row slots under the legacy schema (inert once migrated) |
+| `rows-7ac9964eb9cd3119.dabq` | row slots for `records` under the current schema |
+| `rows-8153d1c75e5f8249.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
 Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0x84EE7F59F027FA5F`)
+## Row slot (32 bytes, table `records`, schema hash `0x7AC9964EB9CD3119`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
@@ -52,7 +52,7 @@ all three impossible to miss.
 | 0 | 8 | magic | `"DABQSB02"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0x84EE7F59F027FA5F` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0x7AC9964EB9CD3119` for this schema) |
 | 32 | 8 | capacity | u64 LE, the row capacity this database was created with |
 | 40 | 4 | crc32 | IEEE, over bytes 0..40 |
 | 44 | 20 | padding | must be zero (validated) |
@@ -97,7 +97,7 @@ and 1 with span 0 and claim sizes 1 and 2 — so it means an
 acknowledged commit was rolled back by storage that lied about an
 fsync, and the open reports that loudly.
 
-## Migration (schema `0xC4345B300A440058` → `0x84EE7F59F027FA5F`)
+## Migration (schema `0x8153D1C75E5F8249` → `0x7AC9964EB9CD3119`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to

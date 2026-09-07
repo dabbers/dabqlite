@@ -3,7 +3,7 @@
 //   cargo run -p dabqlite-codegen -- schema/records.sql <this file>
 
 pub const RECORDS_TABLE: &str = "records";
-pub const RECORDS_SCHEMA_HASH: u64 = 0x84EE7F59F027FA5F;
+pub const RECORDS_SCHEMA_HASH: u64 = 0x7AC9964EB9CD3119;
 pub const RECORDS_ROW_SIZE: usize = 32;
 pub const RECORDS_CRC_OFFSET: usize = 27;
 /// Offset of the row-kind discriminant. INSIDE the checksummed

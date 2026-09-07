@@ -89,6 +89,66 @@ fn hash_is_sensitive_to_every_layout_input() {
     );
 }
 
+/// The hash's whole job is "equal iff byte-compatible", and the way that
+/// claim dies is a layout change from an UNCHANGED declaration.
+///
+/// Widen the span field, move the checksum, pad the row differently — the
+/// SQL says the same thing, the ruler is different, and every existing
+/// file gets read with the wrong one while claiming to match. Nothing
+/// fails; rows just mean something else. So the hash covers the derived
+/// layout, not only the declaration, and this is that: the same schema
+/// with a hand-altered layout must not hash the same.
+#[test]
+fn a_layout_change_moves_the_hash_even_when_the_declaration_does_not() {
+    let schema = parse_schema(&records_sql()).unwrap();
+    let base = schema.schema_hash();
+    let layout = schema.layout();
+
+    // Every layout field, moved by one, one at a time. Each stands for a
+    // real change: a wider span, a wider len, a relocated checksum, a
+    // different row size, a different payload ceiling.
+    let mut mutated = 0;
+    for k in 0..6 {
+        let s = parse_schema(&records_sql()).unwrap();
+        let mut l = s.layout();
+        match k {
+            0 => l.kind_offset = l.kind_offset.map(|o| o + 1),
+            1 => l.span_offset = l.span_offset.map(|o| o + 1),
+            2 => l.len_offset = l.len_offset.map(|o| o + 1),
+            3 => l.len_max = l.len_max.map(|m| m - 1),
+            4 => l.crc_offset += 1,
+            _ => l.row_size += 8,
+        }
+        assert_ne!(
+            (
+                l.kind_offset,
+                l.span_offset,
+                l.len_offset,
+                l.len_max,
+                l.crc_offset,
+                l.row_size
+            ),
+            (
+                layout.kind_offset,
+                layout.span_offset,
+                layout.len_offset,
+                layout.len_max,
+                layout.crc_offset,
+                layout.row_size
+            ),
+            "variant {k} changed nothing"
+        );
+        assert_ne!(
+            s.hash_with_layout(&l),
+            base,
+            "variant {k}: a different layout hashed the same, so a file \
+             written with one ruler would be read with the other"
+        );
+        mutated += 1;
+    }
+    assert_eq!(mutated, 6);
+}
+
 #[test]
 fn parse_errors_are_loud_and_specific() {
     let cases: &[(&str, &str)] = &[
