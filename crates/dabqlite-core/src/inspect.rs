@@ -71,6 +71,10 @@ pub struct RowScan {
     pub tombstones: u64,
     /// Committed rows that supersede an earlier value for the same id.
     pub superseded: u64,
+    /// Rows still LIVE after replaying the whole commit order — the
+    /// inspector's own answer to "how many rows would open serve", worked
+    /// out independently of the engine.
+    pub live_records: u64,
     /// Updates referring to an id that was not live at that point in the
     /// commit order — impossible for the engine to write.
     pub orphan_updates: u64,
@@ -249,6 +253,7 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
             }
         }
     }
+    scan.live_records = seen.len() as u64;
     let mut off = live_bytes;
     while off + ROW_SIZE <= rows.len() {
         if decode_row(&rows[off..off + ROW_SIZE]).is_some() {

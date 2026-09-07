@@ -117,7 +117,28 @@ fn print_report(dir: &Path, report: &InspectReport) {
     println!();
 
     println!("row zone:");
+    println!("  live records       {}", report.rows.live_records);
     println!("  committed valid    {}", report.rows.committed_valid);
+    println!(
+        "  deletions          {}  (each retires a record; both are dead weight)",
+        report.rows.tombstones
+    );
+    println!("  superseded by update {}", report.rows.superseded);
+    if report.rows.orphan_tombstones > 0 || report.rows.orphan_updates > 0 {
+        println!(
+            "  ORPHANED           {} deletion(s), {} update(s) referring to rows that \
+             were not live — the engine cannot write these",
+            report.rows.orphan_tombstones, report.rows.orphan_updates
+        );
+    }
+    // Dead weight is the retired records plus the deletions that retired
+    // them: an update retires one record, a delete retires one record AND
+    // occupies a slot itself.
+    let retired = report.rows.superseded + report.rows.tombstones;
+    let dead = retired + report.rows.tombstones;
+    if dead > 0 {
+        println!("  reclaimable slots  {dead}  (rebuild with --repair-to to compact)");
+    }
     println!("  committed corrupt  {}", report.rows.committed_corrupt);
     for off in &report.rows.corrupt_offsets {
         println!("    corrupt slot at byte offset {off}");

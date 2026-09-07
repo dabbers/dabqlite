@@ -534,6 +534,20 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 "[{ctx}] inspector verdict diverged: {:?} vs {used} rows",
                 report.verdict
             );
+            // A stronger agreement than the row count: the inspector
+            // replays the commit order itself — records, updates and
+            // tombstones — so its answer to "what survives" must match the
+            // engine's, arrived at independently.
+            assert_eq!(
+                report.rows.live_records,
+                host.engine.live_count(),
+                "[{ctx}] inspector and engine disagree about what is LIVE"
+            );
+            assert_eq!(
+                report.rows.live_records,
+                oracle.len() as u64,
+                "[{ctx}] inspector diverged from the oracle"
+            );
             let rr = host.engine.recovery_report();
             assert_eq!(
                 report.rollback_evidence, rr.rollback_evidence,
