@@ -33,7 +33,13 @@ const _: () = assert!(V1_SCHEMA_HASH != records::RECORDS_SCHEMA_HASH);
 pub fn migrate_row(old: records_v1::RecordsRow) -> records::RecordsRow {
     let mut value = [0u8; 16];
     value[..V1_VALUE_LEN].copy_from_slice(&old.value);
-    records::RecordsRow { id: old.id, value }
+    records::RecordsRow {
+        // Every migrated row is a record: the legacy format had no
+        // deletions to carry across.
+        kind: records::RECORDS_KIND_RECORD,
+        id: old.id,
+        value,
+    }
 }
 
 use alloc::vec;
@@ -41,8 +47,8 @@ use alloc::vec::Vec;
 
 use crate::engine::{Capacities, DbError, Engine, FileId, Input, Output, WriteBuf};
 use crate::layout::{
-    decode_row, decode_sb_any, encode_row, SbDecodeError, ROW_SIZE, SB_COPY_SIZE, SB_ZONE_SIZE,
-    SCHEMA_HASH,
+    decode_row, decode_sb_any, encode_row, RowKind, SbDecodeError, ROW_SIZE, SB_COPY_SIZE,
+    SB_ZONE_SIZE, SCHEMA_HASH,
 };
 
 /// The offline migration state machine (docs/DESIGN.md §4.8). Sans-I/O,
@@ -535,7 +541,7 @@ impl MigrationEngine {
         let old = records_v1::decode_records_row(slot).expect("validated during on_old_rows");
         let new = migrate_row(old);
         let mut out = [0u8; ROW_SIZE];
-        encode_row(new.id, &new.value, &mut out);
+        encode_row(RowKind::Record, new.id, &new.value, &mut out);
         self.state = MState::WriteNewRows {
             generation,
             row_count,

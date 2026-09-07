@@ -25,7 +25,12 @@ fn records_schema_matches_the_engine_exactly() {
 
     let layout = schema.layout();
     assert_eq!(layout.field_offsets, vec![0, 8]);
-    assert_eq!(layout.crc_offset, 24);
+    // v2 rows carry the kind discriminant between the fields and the CRC,
+    // so the CRC covers it — a flip there must never be able to turn a
+    // deletion back into a record.
+    assert_eq!(schema.format, dabqlite_codegen::CURRENT_ROW_FORMAT);
+    assert_eq!(layout.kind_offset, Some(24));
+    assert_eq!(layout.crc_offset, 25);
     assert_eq!(layout.row_size, dabqlite_core::ROW_SIZE);
     assert_eq!(
         schema.columns[1].ty.width(),

@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 
 use crate::btree::BTreeIndex;
 use crate::layout::{
-    decode_row, decode_sb, encode_row, encode_sb, SbDecodeError, ROW_SIZE, SB_COPIES, SB_COPY_SIZE,
-    SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
+    decode_row, decode_sb, encode_row, encode_sb, RowKind, SbDecodeError, ROW_SIZE, SB_COPIES,
+    SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
 use crate::trigram::TrigramIndex;
 
@@ -482,7 +482,7 @@ impl Engine {
     pub fn live_rows(&self) -> impl Iterator<Item = (u64, [u8; VALUE_LEN])> + '_ {
         (0..self.row_count).filter_map(move |row| {
             let off = (row as usize) * ROW_SIZE;
-            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])?;
+            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])?.record()?;
             // Quarantined slots were never copied into the arena, so they
             // hold zeros — which `decode_row` rejects, since the checksum
             // of 24 zero bytes is not zero. The index check is the belt to
@@ -784,7 +784,7 @@ impl Engine {
             let chunk = &data[off..off + ROW_SIZE];
             // Pair assertion (docs/DESIGN.md §7.4): rows were verified when
             // encoded on the write path; verify again reading them back.
-            let Some((id, value)) = decode_row(chunk) else {
+            let Some(slot) = decode_row(chunk) else {
                 if self.salvage {
                     self.quarantined += 1;
                     // Account for the slot without indexing it, so every
@@ -796,6 +796,7 @@ impl Engine {
                     what: crate::defect::ROW_CHECKSUM,
                 });
             };
+            let (id, value) = (slot.id, slot.value);
             if self.index_lookup(id).is_some() {
                 if self.salvage {
                     // Keep the first occurrence; the later duplicate is the
@@ -928,7 +929,7 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(id, &value, slot);
+        encode_row(RowKind::Record, id, &value, slot);
         self.pending = Some((id, value));
         self.state = State::InsertWriteRow;
         Output::Write {
@@ -1182,9 +1183,13 @@ impl Engine {
         let n = self.trigram.find_page(needle, after, &mut rows, |row| {
             let off = (row as usize) * ROW_SIZE;
             match decode_row(&self.arena[off..off + ROW_SIZE]) {
-                Some((_, value)) => {
-                    needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
-                }
+                Some(slot) => match slot.record() {
+                    Some((_, value)) => {
+                        needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
+                    }
+                    // A tombstone indexes nothing and matches nothing.
+                    None => false,
+                },
                 // A quarantined slot holds no verified row, so it matches
                 // nothing. Short needles scan every row number, so this is
                 // reachable in salvage mode — and ONLY there: in every
@@ -1207,8 +1212,9 @@ impl Engine {
         };
         for (slot, &row) in page.items.iter_mut().zip(rows.iter().take(n)) {
             let off = (row as usize) * ROW_SIZE;
-            let (id, value) =
-                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])
+                .and_then(|r| r.record())
+                .expect("live arena row must decode");
             *slot = (id, value);
         }
         if n == FIND_PAGE {
@@ -1247,8 +1253,9 @@ impl Engine {
         });
         for (slot, &(key, row)) in page.items.iter_mut().zip(hits.iter().take(n)) {
             let off = (row as usize) * ROW_SIZE;
-            let (rid, value) =
-                decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+            let (rid, value) = decode_row(&self.arena[off..off + ROW_SIZE])
+                .and_then(|r| r.record())
+                .expect("live arena row must decode");
             // Pair assertion: the ordered index must point at the row it
             // claims, and pages must be strictly ascending.
             debug_assert_eq!(rid, key);
@@ -1265,8 +1272,9 @@ impl Engine {
     fn lookup_value(&self, id: u64) -> Option<[u8; VALUE_LEN]> {
         let row = self.index_lookup(id)?;
         let off = (row as usize) * ROW_SIZE;
-        let (row_id, value) =
-            decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+        let (row_id, value) = decode_row(&self.arena[off..off + ROW_SIZE])
+            .and_then(|r| r.record())
+            .expect("live arena row must decode");
         // Pair assertion: the index must point at the row it claims.
         debug_assert_eq!(row_id, id);
         Some(value)

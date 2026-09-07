@@ -13,7 +13,7 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-181f56c6632bc4e3.dabq` | row slots for `records` under the current schema |
+| `rows-9407a7e1d5cbe17a.dabq` | row slots for `records` under the current schema |
 | `rows-c4345b300a440058.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
@@ -21,14 +21,14 @@ Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0x181F56C6632BC4E3`)
+## Row slot (32 bytes, table `records`, schema hash `0x9407A7E1D5CBE17A`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
 | 0 | 8 | `id` (primary key) | u64, little-endian |
 | 8 | 16 | `value` | 16 raw bytes, fixed width |
-| 24 | 4 | crc32 | IEEE, over bytes 0..24 |
-| 28 | 4 | padding | must be zero (validated on decode: no dead bytes) |
+| 25 | 4 | crc32 | IEEE, over bytes 0..25 |
+| 29 | 3 | padding | must be zero (validated on decode: no dead bytes) |
 
 A slot decodes only if the checksum matches AND the padding is zero —
 every byte of a committed row is covered by verification.
@@ -40,7 +40,7 @@ every byte of a committed row is covered by verification.
 | 0 | 8 | magic | `"DABQSB01"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0x181F56C6632BC4E3` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0x9407A7E1D5CBE17A` for this schema) |
 | 32 | 4 | crc32 | IEEE, over bytes 0..32 |
 | 36 | 28 | padding | must be zero (validated) |
 
@@ -57,7 +57,7 @@ Insert: write row slot → fsync rows → write both superblock copies of
 generation g+1 → fsync superblock (the commit point). Rows are always
 durable before the superblock that references them.
 
-## Migration (schema `0xC4345B300A440058` → `0x181F56C6632BC4E3`)
+## Migration (schema `0xC4345B300A440058` → `0x9407A7E1D5CBE17A`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to

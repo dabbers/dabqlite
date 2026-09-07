@@ -187,7 +187,8 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     for row in 0..committed {
         let off = (row as usize) * ROW_SIZE;
         match rows.get(off..off + ROW_SIZE).and_then(decode_row) {
-            Some((id, _)) => {
+            Some(slot) => {
+                let id = slot.id;
                 if seen.insert(id) {
                     scan.committed_valid += 1;
                 } else {

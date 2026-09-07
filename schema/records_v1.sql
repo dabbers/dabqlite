@@ -9,6 +9,9 @@
 -- append in slot terms: the old 8 bytes keep their offsets, the new tail
 -- is zero-filled by the migration function.
 
+-- @format(1) — the pre-tombstone row layout: fields, CRC, padding, and
+-- no kind byte. Pinned here so this legacy fixture keeps its original
+-- hash and the migration path stays exactly what it was.
 CREATE TABLE records (
     id    BIGINT NOT NULL PRIMARY KEY,
     value BYTEA  NOT NULL -- @fixed(8)

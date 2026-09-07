@@ -49,7 +49,30 @@ pub struct Column {
 pub struct Schema {
     pub table: String,
     pub columns: Vec<Column>,
+    /// Row FORMAT version — how a row slot is laid out, as distinct from
+    /// which columns it holds.
+    ///
+    /// v1 rows are `fields | crc | padding`. v2 inserts a one-byte KIND
+    /// discriminant between the fields and the CRC, so that a row can say
+    /// whether it is a record or a deletion — and, critically, so that the
+    /// byte saying which is INSIDE the checksummed region. Put it in the
+    /// padding instead and a single bit flip could resurrect a deleted
+    /// row with a valid checksum, which is precisely the silent wrongness
+    /// this project does not permit.
+    ///
+    /// The version is part of the schema hash, so a binary that does not
+    /// understand a format refuses the file at open (`SchemaMismatch`)
+    /// instead of misreading it. Declare an older format with
+    /// `-- @format(1)`; new schemas default to the current one.
+    pub format: u8,
 }
+
+/// The current row format emitted for a schema that does not say otherwise.
+pub const CURRENT_ROW_FORMAT: u8 = 2;
+
+/// Row kinds, v2 and later. The discriminant lives inside the checksum.
+pub const ROW_KIND_RECORD: u8 = 0;
+pub const ROW_KIND_TOMBSTONE: u8 = 1;
 
 /// Computed record layout: sequential field offsets, then the CRC, then
 /// zero padding to an 8-byte multiple. Every byte of the row is covered:
@@ -57,6 +80,9 @@ pub struct Schema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub field_offsets: Vec<usize>,
+    /// Offset of the one-byte row-kind discriminant (v2+), inside the
+    /// checksummed region. `None` in v1, which has no kind byte.
+    pub kind_offset: Option<usize>,
     pub crc_offset: usize,
     pub row_size: usize,
 }
@@ -95,6 +121,7 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
     let mut columns: Vec<Column> = Vec::new();
     let mut in_columns = false;
     let mut closed = false;
+    let mut format = CURRENT_ROW_FORMAT;
 
     for (idx, raw) in sql.lines().enumerate() {
         let lineno = idx + 1;
@@ -102,6 +129,23 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
             Some((c, m)) => (c.trim(), m.trim()),
             None => (raw.trim(), ""),
         };
+        // `@format(n)` may appear anywhere, including before the table:
+        // it describes the row layout, not a column.
+        if let Some(rest) = comment.split_once("@format(") {
+            let digits: String = rest.1.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let n: u8 = digits
+                .parse()
+                .map_err(|_| err(lineno, "@format(n) needs a version number, e.g. @format(1)"))?;
+            if n == 0 || n > CURRENT_ROW_FORMAT {
+                return Err(err(
+                    lineno,
+                    &format!(
+                        "unknown row format {n}; this generator emits 1..={CURRENT_ROW_FORMAT}"
+                    ),
+                ));
+            }
+            format = n;
+        }
         if code.is_empty() {
             continue;
         }
@@ -290,7 +334,11 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
         ));
     }
 
-    Ok(Schema { table, columns })
+    Ok(Schema {
+        table,
+        columns,
+        format,
+    })
 }
 
 /// Parse column annotations from the trailing comment: `@fixed(n)` and
@@ -347,10 +395,17 @@ impl Schema {
             offsets.push(at);
             at += col.ty.width();
         }
+        // v2+ reserves one byte for the row kind, BEFORE the CRC, so the
+        // checksum covers it (see `Schema::format`).
+        let kind_offset = (self.format >= 2).then_some(at);
+        if kind_offset.is_some() {
+            at += 1;
+        }
         let crc_offset = at;
         let row_size = (crc_offset + 4).next_multiple_of(8);
         Layout {
             field_offsets: offsets,
+            kind_offset,
             crc_offset,
             row_size,
         }
@@ -361,7 +416,7 @@ impl Schema {
     /// affects layout. Two schemas hash equal iff their files are
     /// byte-compatible.
     pub fn schema_hash(&self) -> u64 {
-        let mut canon = format!("dabqlite-schema-v1;table={};", self.table);
+        let mut canon = format!("dabqlite-schema-v{};table={};", self.format, self.table);
         for col in &self.columns {
             let ty = match col.ty {
                 ColType::BigInt => "bigint".to_string(),
@@ -549,6 +604,12 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
         "pub const {upper}_CRC_OFFSET: usize = {};\n",
         layout.crc_offset
     ));
+    if let Some(kind) = layout.kind_offset {
+        o.push_str(&format!(
+            "/// Offset of the row-kind discriminant. INSIDE the checksummed\n             /// region: a bit flip here must not be able to turn a deletion\n             /// back into a record.\n             pub const {upper}_KIND_OFFSET: usize = {kind};\n             pub const {upper}_KIND_RECORD: u8 = {};\n             pub const {upper}_KIND_TOMBSTONE: u8 = {};\n",
+            ROW_KIND_RECORD, ROW_KIND_TOMBSTONE
+        ));
+    }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
         o.push_str(&format!(
             "pub const {upper}_COL_{}_OFFSET: usize = {off};\n",
@@ -560,6 +621,11 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     // Row struct.
     o.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
     o.push_str(&format!("pub struct {row_ty} {{\n"));
+    if layout.kind_offset.is_some() {
+        o.push_str(
+            "    /// `KIND_RECORD` for a row that holds data, `KIND_TOMBSTONE`\n             \x20   /// for one that records a deletion.\n             \x20   pub kind: u8,\n",
+        );
+    }
     for col in &schema.columns {
         let ty = match col.ty {
             ColType::BigInt => "u64".to_string(),
@@ -616,6 +682,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
             )),
         }
     }
+    if layout.kind_offset.is_some() {
+        o.push_str(&format!("    out[{upper}_KIND_OFFSET] = row.kind;\n"));
+    }
     o.push_str(&format!(
         "    let crc = gen_crc32(&out[0..{upper}_CRC_OFFSET]);\n\
          \x20   out[{upper}_CRC_OFFSET..{upper}_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());\n\
@@ -640,6 +709,14 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
          \x20   }}\n",
         schema.table
     ));
+    if layout.kind_offset.is_some() {
+        o.push_str(&format!(
+            "    let kind = bytes[{upper}_KIND_OFFSET];\n\
+             \x20   if kind != {upper}_KIND_RECORD && kind != {upper}_KIND_TOMBSTONE {{\n\
+             \x20       return None;\n\
+             \x20   }}\n"
+        ));
+    }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
         match col.ty {
             ColType::BigInt => o.push_str(&format!(
@@ -654,14 +731,14 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
             )),
         }
     }
+    let mut fields: Vec<&str> = Vec::new();
+    if layout.kind_offset.is_some() {
+        fields.push("kind");
+    }
+    fields.extend(schema.columns.iter().map(|c| c.name.as_str()));
     o.push_str(&format!(
         "    Some({row_ty} {{ {} }})\n}}\n",
-        schema
-            .columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        fields.join(", ")
     ));
 
     o

@@ -3,14 +3,23 @@
 //   cargo run -p dabqlite-codegen -- schema/records.sql <this file>
 
 pub const RECORDS_TABLE: &str = "records";
-pub const RECORDS_SCHEMA_HASH: u64 = 0x181F56C6632BC4E3;
+pub const RECORDS_SCHEMA_HASH: u64 = 0x9407A7E1D5CBE17A;
 pub const RECORDS_ROW_SIZE: usize = 32;
-pub const RECORDS_CRC_OFFSET: usize = 24;
+pub const RECORDS_CRC_OFFSET: usize = 25;
+/// Offset of the row-kind discriminant. INSIDE the checksummed
+             /// region: a bit flip here must not be able to turn a deletion
+             /// back into a record.
+             pub const RECORDS_KIND_OFFSET: usize = 24;
+             pub const RECORDS_KIND_RECORD: u8 = 0;
+             pub const RECORDS_KIND_TOMBSTONE: u8 = 1;
 pub const RECORDS_COL_ID_OFFSET: usize = 0;
 pub const RECORDS_COL_VALUE_OFFSET: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordsRow {
+    /// `KIND_RECORD` for a row that holds data, `KIND_TOMBSTONE`
+                 /// for one that records a deletion.
+                 pub kind: u8,
     pub id: u64,
     pub value: [u8; 16],
 }
@@ -43,6 +52,7 @@ fn gen_crc32(data: &[u8]) -> u32 {
 pub fn encode_records_row(row: &RecordsRow, out: &mut [u8; RECORDS_ROW_SIZE]) {
     out[0..8].copy_from_slice(&row.id.to_le_bytes());
     out[8..24].copy_from_slice(&row.value);
+    out[RECORDS_KIND_OFFSET] = row.kind;
     let crc = gen_crc32(&out[0..RECORDS_CRC_OFFSET]);
     out[RECORDS_CRC_OFFSET..RECORDS_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out[RECORDS_CRC_OFFSET + 4..].fill(0);
@@ -60,7 +70,11 @@ pub fn decode_records_row(bytes: &[u8]) -> Option<RecordsRow> {
     if bytes[RECORDS_CRC_OFFSET + 4..RECORDS_ROW_SIZE].iter().any(|&b| b != 0) {
         return None;
     }
+    let kind = bytes[RECORDS_KIND_OFFSET];
+    if kind != RECORDS_KIND_RECORD && kind != RECORDS_KIND_TOMBSTONE {
+        return None;
+    }
     let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
     let value: [u8; 16] = bytes[8..24].try_into().ok()?;
-    Some(RecordsRow { id, value })
+    Some(RecordsRow { kind, id, value })
 }

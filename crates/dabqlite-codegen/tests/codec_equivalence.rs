@@ -10,8 +10,12 @@
 
 use dabqlite_core::generated::records as generated;
 use dabqlite_core::layout::reference as hand;
+use dabqlite_core::layout::RowKind;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
-use generated::{decode_records_row, encode_records_row, RecordsRow, RECORDS_ROW_SIZE};
+use generated::{
+    decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_RECORD,
+    RECORDS_KIND_TOMBSTONE, RECORDS_ROW_SIZE,
+};
 
 /// Deterministic pseudo-random stream without pulling rand into this crate:
 /// splitmix64, the canonical seed expander.
@@ -36,15 +40,29 @@ impl Splitmix {
 fn generated_encode_is_byte_identical_to_hand_written() {
     assert_eq!(RECORDS_ROW_SIZE, ROW_SIZE);
     let mut rng = Splitmix(1);
-    for _ in 0..10_000 {
+    for round in 0..10_000 {
         let id = rng.next();
         let mut value = [0u8; VALUE_LEN];
         rng.fill(&mut value);
+        // Both row kinds, so the discriminant byte is covered by the
+        // equivalence too — not just the record path.
+        let (kind, kind_byte) = if round % 3 == 0 {
+            (RowKind::Tombstone, RECORDS_KIND_TOMBSTONE)
+        } else {
+            (RowKind::Record, RECORDS_KIND_RECORD)
+        };
 
         let mut hand_bytes = [0u8; ROW_SIZE];
-        hand::encode_row(id, &value, &mut hand_bytes);
+        hand::encode_row(kind, id, &value, &mut hand_bytes);
         let mut gen_bytes = [0u8; RECORDS_ROW_SIZE];
-        encode_records_row(&RecordsRow { id, value }, &mut gen_bytes);
+        encode_records_row(
+            &RecordsRow {
+                kind: kind_byte,
+                id,
+                value,
+            },
+            &mut gen_bytes,
+        );
 
         assert_eq!(
             hand_bytes, gen_bytes,
@@ -64,7 +82,12 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
             let id = rng.next();
             let mut value = [0u8; VALUE_LEN];
             rng.fill(&mut value);
-            hand::encode_row(id, &value, &mut slot);
+            let kind = if round % 6 == 0 {
+                RowKind::Tombstone
+            } else {
+                RowKind::Record
+            };
+            hand::encode_row(kind, id, &value, &mut slot);
             if round % 4 == 0 {
                 // Corrupt a random byte with a random mask (sometimes 0 =
                 // no corruption; both decoders must still agree).
@@ -79,11 +102,19 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
         let gen_verdict = decode_records_row(&slot);
         match (hand_verdict, gen_verdict) {
             (None, None) => {}
-            (Some((id, value)), Some(row)) => {
+            (Some(hand_slot), Some(row)) => {
                 assert_eq!(
-                    (id, value),
+                    (hand_slot.id, hand_slot.value),
                     (row.id, row.value),
                     "round {round}: values diverged"
+                );
+                let hand_kind = match hand_slot.kind {
+                    RowKind::Record => RECORDS_KIND_RECORD,
+                    RowKind::Tombstone => RECORDS_KIND_TOMBSTONE,
+                };
+                assert_eq!(
+                    hand_kind, row.kind,
+                    "round {round}: row KIND diverged - a record and a deletion must never be confused"
                 );
             }
             (h, g) => panic!(
@@ -99,21 +130,26 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
 fn generated_codec_has_no_dead_bytes_either() {
     // The same exhaustive property proven for the hand codec: every single
     // bit flip anywhere in a slot must be detected.
+    // Both kinds: a tombstone's bytes must be as fully covered as a
+    // record's, or a flip could turn a deletion back into data.
     let mut slot = [0u8; RECORDS_ROW_SIZE];
-    let row = RecordsRow {
-        id: 0xDAB0_0001,
-        value: *b"0123456789abcdef",
-    };
-    encode_records_row(&row, &mut slot);
-    for byte in 0..RECORDS_ROW_SIZE {
-        for bit in 0..8 {
-            let mut damaged = slot;
-            damaged[byte] ^= 1 << bit;
-            assert_eq!(
-                decode_records_row(&damaged),
-                None,
-                "generated codec missed a flip at byte {byte} bit {bit}"
-            );
+    for kind in [RECORDS_KIND_RECORD, RECORDS_KIND_TOMBSTONE] {
+        let row = RecordsRow {
+            kind,
+            id: 0xDAB0_0001,
+            value: *b"0123456789abcdef",
+        };
+        encode_records_row(&row, &mut slot);
+        for byte in 0..RECORDS_ROW_SIZE {
+            for bit in 0..8 {
+                let mut damaged = slot;
+                damaged[byte] ^= 1 << bit;
+                assert_eq!(
+                    decode_records_row(&damaged),
+                    None,
+                    "generated codec missed a flip at byte {byte} bit {bit} (kind {kind})"
+                );
+            }
         }
     }
     // And short input is rejected, not sliced.

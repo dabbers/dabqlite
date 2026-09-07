@@ -10,8 +10,17 @@
 //! offset  size  field
 //!      0     8  id        (u64 LE)
 //!      8    16  value     (fixed-width payload)
-//!     24     4  crc32     (over bytes 0..24)
-//!     28     4  padding   (zero)
+//!     24     1  kind      (0 = record, 1 = tombstone)
+//!     25     4  crc32     (over bytes 0..25 — the kind byte INCLUDED)
+//!     29     3  padding   (zero)
+//!
+//! The kind byte is inside the checksummed region on purpose. A deletion
+//! is recorded by appending a tombstone rather than overwriting anything,
+//! so the byte distinguishing "this row holds data" from "this row
+//! deletes data" is the most safety-critical byte in the slot: if a bit
+//! flip could turn a tombstone back into a record with a still-valid
+//! checksum, a deleted row would silently reappear. Covering it by the
+//! CRC makes that impossible to miss.
 //! ```
 //!
 //! ## Superblock copy (64 bytes, SB_COPIES redundant slots in the zone)
@@ -41,8 +50,56 @@ pub const ROW_SIZE: usize = records::RECORDS_ROW_SIZE;
 const _: () = assert!(ROW_SIZE == 32);
 const _: () = assert!(records::RECORDS_COL_ID_OFFSET == 0);
 const _: () = assert!(records::RECORDS_COL_VALUE_OFFSET == 8);
-const _: () = assert!(records::RECORDS_CRC_OFFSET == 8 + VALUE_LEN);
-const _: () = assert!(VALUE_LEN == records::RECORDS_CRC_OFFSET - records::RECORDS_COL_VALUE_OFFSET);
+const _: () = assert!(records::RECORDS_KIND_OFFSET == 8 + VALUE_LEN);
+const _: () = assert!(records::RECORDS_CRC_OFFSET == records::RECORDS_KIND_OFFSET + 1);
+const _: () =
+    assert!(VALUE_LEN == records::RECORDS_KIND_OFFSET - records::RECORDS_COL_VALUE_OFFSET);
+
+/// What a row slot says about itself. The discriminant lives inside the
+/// checksum (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A record: `id` holds `value`.
+    Record,
+    /// A deletion of `id`. Appended rather than overwriting the record it
+    /// removes, so the rows file stays append-only and a crash mid-delete
+    /// resolves all-or-nothing like every other commit.
+    Tombstone,
+}
+
+impl RowKind {
+    fn byte(self) -> u8 {
+        match self {
+            RowKind::Record => records::RECORDS_KIND_RECORD,
+            RowKind::Tombstone => records::RECORDS_KIND_TOMBSTONE,
+        }
+    }
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            records::RECORDS_KIND_RECORD => Some(RowKind::Record),
+            records::RECORDS_KIND_TOMBSTONE => Some(RowKind::Tombstone),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded, checksum-valid row slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowSlot {
+    pub kind: RowKind,
+    pub id: u64,
+    pub value: [u8; VALUE_LEN],
+}
+
+impl RowSlot {
+    /// The record this slot holds, or `None` if it is a deletion.
+    pub fn record(&self) -> Option<(u64, [u8; VALUE_LEN])> {
+        match self.kind {
+            RowKind::Record => Some((self.id, self.value)),
+            RowKind::Tombstone => None,
+        }
+    }
+}
 /// Fixed width of one superblock copy.
 pub const SB_COPY_SIZE: usize = 64;
 /// Number of redundant superblock copies (docs/DESIGN.md §4.4). Commits
@@ -66,14 +123,21 @@ pub const SCHEMA_HASH: u64 = records::RECORDS_SCHEMA_HASH;
 /// Encode a row into its slot. Delegates to the schema-compiled codec; the
 /// hand-written [`reference`] implementation exists as a permanent second
 /// opinion and is asserted equivalent in debug builds and test suites.
-pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
-    records::encode_records_row(&records::RecordsRow { id, value: *value }, out);
+pub fn encode_row(kind: RowKind, id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
+    records::encode_records_row(
+        &records::RecordsRow {
+            kind: kind.byte(),
+            id,
+            value: *value,
+        },
+        out,
+    );
     // Pair assertion (docs/DESIGN.md §7.4): the independent reference codec
     // must agree byte-for-byte with the generated one.
     #[cfg(debug_assertions)]
     {
         let mut check = [0u8; ROW_SIZE];
-        reference::encode_row(id, value, &mut check);
+        reference::encode_row(kind, id, value, &mut check);
         debug_assert_eq!(*out, check, "generated and reference codecs diverged");
     }
 }
@@ -82,8 +146,14 @@ pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
 /// fails its checksum, or has damaged padding. Padding is validated so that
 /// *every* byte of a live slot is covered: a single-bit flip anywhere in a
 /// committed row must be detectable, with no dead zones.
-pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
-    let decoded = records::decode_records_row(bytes).map(|row| (row.id, row.value));
+pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
+    let decoded = records::decode_records_row(bytes).and_then(|row| {
+        Some(RowSlot {
+            kind: RowKind::from_byte(row.kind)?,
+            id: row.id,
+            value: row.value,
+        })
+    });
     debug_assert_eq!(
         decoded,
         reference::decode_row(bytes),
@@ -97,30 +167,39 @@ pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
 /// in debug builds on every call above, and exhaustively in the codegen
 /// equivalence suite). Never wired into the engine directly.
 pub mod reference {
-    use super::{crc32, ROW_SIZE, VALUE_LEN};
+    use super::{crc32, RowKind, RowSlot, ROW_SIZE, VALUE_LEN};
 
-    pub fn encode_row(id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
+    pub fn encode_row(kind: RowKind, id: u64, value: &[u8; VALUE_LEN], out: &mut [u8; ROW_SIZE]) {
         out[0..8].copy_from_slice(&id.to_le_bytes());
         out[8..8 + VALUE_LEN].copy_from_slice(value);
-        let crc = crc32(&out[0..24]);
-        out[24..28].copy_from_slice(&crc.to_le_bytes());
-        out[28..32].fill(0);
+        out[24] = match kind {
+            RowKind::Record => 0,
+            RowKind::Tombstone => 1,
+        };
+        let crc = crc32(&out[0..25]);
+        out[25..29].copy_from_slice(&crc.to_le_bytes());
+        out[29..32].fill(0);
     }
 
-    pub fn decode_row(bytes: &[u8]) -> Option<(u64, [u8; VALUE_LEN])> {
+    pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
         if bytes.len() < ROW_SIZE {
             return None;
         }
-        let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
-        if crc32(&bytes[0..24]) != stored {
+        let stored = u32::from_le_bytes(bytes[25..29].try_into().ok()?);
+        if crc32(&bytes[0..25]) != stored {
             return None;
         }
-        if bytes[28..32] != [0u8; 4] {
+        if bytes[29..32] != [0u8; 3] {
             return None;
         }
+        let kind = match bytes[24] {
+            0 => RowKind::Record,
+            1 => RowKind::Tombstone,
+            _ => return None,
+        };
         let id = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
         let value: [u8; VALUE_LEN] = bytes[8..8 + VALUE_LEN].try_into().ok()?;
-        Some((id, value))
+        Some(RowSlot { kind, id, value })
     }
 }
 
@@ -210,8 +289,26 @@ mod tests {
     fn row_roundtrip() {
         let mut slot = [0u8; ROW_SIZE];
         let value = *b"0123456789abcdef";
-        encode_row(42, &value, &mut slot);
-        assert_eq!(decode_row(&slot), Some((42, value)));
+        encode_row(RowKind::Record, 42, &value, &mut slot);
+        assert_eq!(
+            decode_row(&slot),
+            Some(RowSlot {
+                kind: RowKind::Record,
+                id: 42,
+                value
+            })
+        );
+        assert_eq!(
+            decode_row(&slot).and_then(|r| r.record()),
+            Some((42, value))
+        );
+
+        // A tombstone round-trips too, and is NOT a record.
+        encode_row(RowKind::Tombstone, 42, &value, &mut slot);
+        let decoded = decode_row(&slot).expect("tombstone must decode");
+        assert_eq!(decoded.kind, RowKind::Tombstone);
+        assert_eq!(decoded.id, 42);
+        assert_eq!(decoded.record(), None, "a deletion is not a record");
     }
 
     /// The length gates are exact in both directions: a short buffer is
@@ -223,7 +320,7 @@ mod tests {
     fn length_gates_are_exact_in_both_codecs() {
         let value = *b"0123456789abcdef";
         let mut slot = [0u8; ROW_SIZE];
-        encode_row(42, &value, &mut slot);
+        encode_row(RowKind::Record, 42, &value, &mut slot);
         let mut long_row = [0u8; ROW_SIZE + 1];
         long_row[..ROW_SIZE].copy_from_slice(&slot);
         for short in 0..ROW_SIZE {
@@ -234,8 +331,13 @@ mod tests {
                 "reference, len {short}"
             );
         }
-        assert_eq!(decode_row(&long_row), Some((42, value)));
-        assert_eq!(reference::decode_row(&long_row), Some((42, value)));
+        let want = RowSlot {
+            kind: RowKind::Record,
+            id: 42,
+            value,
+        };
+        assert_eq!(decode_row(&long_row), Some(want));
+        assert_eq!(reference::decode_row(&long_row), Some(want));
 
         let mut sb = [0u8; SB_COPY_SIZE];
         encode_sb(7, 123, &mut sb);
@@ -257,7 +359,7 @@ mod tests {
     #[test]
     fn row_rejects_corruption() {
         let mut slot = [0u8; ROW_SIZE];
-        encode_row(42, &[7u8; VALUE_LEN], &mut slot);
+        encode_row(RowKind::Record, 42, &[7u8; VALUE_LEN], &mut slot);
         slot[3] ^= 0x01;
         assert_eq!(decode_row(&slot), None);
         // Negative space: an all-zero slot must not decode.
@@ -268,17 +370,22 @@ mod tests {
     fn every_single_bit_flip_in_a_slot_is_detected() {
         // Full-coverage guarantee: no byte of a row or superblock copy is a
         // dead zone. Flip every bit of every byte, one at a time.
-        let mut row = [0u8; ROW_SIZE];
-        encode_row(42, &[7u8; VALUE_LEN], &mut row);
-        for byte in 0..ROW_SIZE {
-            for bit in 0..8 {
-                let mut damaged = row;
-                damaged[byte] ^= 1 << bit;
-                assert_eq!(
-                    decode_row(&damaged),
-                    None,
-                    "row flip at byte {byte} bit {bit} undetected"
-                );
+        // Both kinds. The KIND byte is the one this matters most for: if
+        // a flip there went undetected, a deletion would silently become a
+        // record again and deleted data would reappear.
+        for kind in [RowKind::Record, RowKind::Tombstone] {
+            let mut row = [0u8; ROW_SIZE];
+            encode_row(kind, 42, &[7u8; VALUE_LEN], &mut row);
+            for byte in 0..ROW_SIZE {
+                for bit in 0..8 {
+                    let mut damaged = row;
+                    damaged[byte] ^= 1 << bit;
+                    assert_eq!(
+                        decode_row(&damaged),
+                        None,
+                        "row flip at byte {byte} bit {bit} undetected ({kind:?})"
+                    );
+                }
             }
         }
         let mut sb = [0u8; SB_COPY_SIZE];
