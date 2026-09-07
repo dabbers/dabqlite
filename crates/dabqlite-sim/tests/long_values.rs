@@ -78,7 +78,7 @@ fn open_salvage(disk: SimDisk) -> (SimHost, Result<u64, DbError>) {
 }
 
 fn put(host: &mut SimHost, id: u64, value: &[u8]) -> Result<u64, DbError> {
-    match host.batch(&[dabqlite_core::BatchOp::Put { id, value }]) {
+    match host.batch(&[BatchOp::Put { id, value }]) {
         Driven::Done(Output::BatchDone {
             rows,
             result: Ok(()),
@@ -257,7 +257,7 @@ fn a_crash_at_every_boundary_of_a_long_write_is_all_or_nothing() {
                 let mut host = SimHost::new(CAPS, base.clone(), None);
                 host.open();
                 host.crash_after = Some(host.io_count + boundary);
-                let _ = host.batch(&[dabqlite_core::BatchOp::Put { id: 2, value }]);
+                let _ = host.batch(&[BatchOp::Put { id: 2, value }]);
 
                 let mut disk = std::mem::take(&mut host.disk);
                 let mut rng = crash_rng(0x10_4EA7, settle);
@@ -299,7 +299,7 @@ fn an_io_failure_at_every_boundary_of_a_long_write_fail_stops_cleanly() {
         let mut host = SimHost::new(CAPS, base.clone(), None);
         host.open();
         host.fail_after = Some(host.io_count + fail_at);
-        match host.batch(&[dabqlite_core::BatchOp::Put { id: 2, value }]) {
+        match host.batch(&[BatchOp::Put { id: 2, value }]) {
             Driven::Done(Output::BatchDone { result: Err(r), .. }) => {
                 assert!(matches!(r.error, DbError::IoFailed { .. }), "[{ctx}] {r:?}")
             }
@@ -675,13 +675,59 @@ fn a_long_value_that_would_not_fit_is_refused_before_any_io() {
 
 #[test]
 fn a_batch_of_long_values_is_bounded_by_the_commit_not_the_op_count() {
-    let mut host = fresh();
-    // Two values that together need more slots than one commit can carry.
+    // The bound is the COMMIT's width in slots, and nothing else. It is not
+    // the number of operations, and — since v6 widened the span field — it
+    // is no longer the width of a single value either: a maximum-length
+    // value costs `MAX_VALUE_LEN / VALUE_LEN` slots out of a commit that
+    // can carry `MAX_COMMIT_ROWS`, so several of them compose atomically.
+    const PER_OP: u64 = (MAX_VALUE_LEN / VALUE_LEN) as u64;
+    const FITS: u64 = MAX_COMMIT_ROWS as u64 / PER_OP;
+    const _: () = assert!(
+        FITS > 1,
+        "the largest value must compose with at least one other"
+    );
+    assert_eq!(
+        FITS * PER_OP,
+        MAX_COMMIT_ROWS as u64,
+        "this test reads the boundary exactly, so it must land on one"
+    );
+
     let big = payload(1, MAX_VALUE_LEN);
-    let ops = [
-        dabqlite_core::BatchOp::Put { id: 1, value: big },
-        dabqlite_core::BatchOp::Put { id: 2, value: big },
-    ];
+    // The longest commit the format allows needs a database that can hold
+    // it, which is more than the rest of this suite works in.
+    let caps = Capacities {
+        rows: (MAX_COMMIT_ROWS as u64 + 8).max(CAPS.rows),
+    };
+
+    // Exactly a commit's worth of maximum-length values: accepted, in one
+    // commit, and every one of them readable afterwards.
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    let ops: Vec<BatchOp> = (0..FITS)
+        .map(|i| BatchOp::Put { id: i, value: big })
+        .collect();
+    match host.batch(&ops) {
+        Driven::Done(Output::BatchDone {
+            rows,
+            result: Ok(()),
+        }) => assert_eq!(rows, MAX_COMMIT_ROWS as u64),
+        other => panic!("a commit-sized batch of long values: {other:?}"),
+    }
+    for i in 0..FITS {
+        assert_eq!(host.get_bytes(i).as_deref(), Some(big), "value {i}");
+    }
+
+    // One more of them does not fit, and says so by name, before any I/O
+    // — in a database with room to spare, so the refusal is about the
+    // COMMIT's width and not about the database being full.
+    let roomy = Capacities {
+        rows: (MAX_COMMIT_ROWS as u64 * 2 + 8).max(CAPS.rows),
+    };
+    let mut host = SimHost::new(roomy, SimDisk::new(), None);
+    host.open();
+    let ops: Vec<BatchOp> = (0..=FITS)
+        .map(|i| BatchOp::Put { id: i, value: big })
+        .collect();
     let io_before = host.io_count;
     match host.batch(&ops) {
         Driven::Done(Output::BatchDone {
@@ -689,13 +735,14 @@ fn a_batch_of_long_values_is_bounded_by_the_commit_not_the_op_count() {
             result: Err(reject),
         }) => {
             assert_eq!(
-                reject.at, 1,
-                "the second value is the one that does not fit"
+                u64::from(reject.at),
+                FITS,
+                "the operation that crosses the boundary is the one blamed"
             );
             assert_eq!(
                 reject.error,
                 DbError::BatchTooLong {
-                    rows: MAX_COMMIT_ROWS as u64 * 2,
+                    rows: (FITS + 1) * PER_OP,
                     max: MAX_COMMIT_ROWS as u64
                 }
             );
@@ -703,5 +750,5 @@ fn a_batch_of_long_values_is_bounded_by_the_commit_not_the_op_count() {
         other => panic!("expected a refusal: {other:?}"),
     }
     assert_eq!(host.io_count, io_before);
-    assert_eq!(host.get_bytes(1), None, "nothing may be written");
+    assert_eq!(host.get_bytes(0), None, "nothing may be written");
 }

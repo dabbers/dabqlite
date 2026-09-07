@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Four of these have since been decided by building the thing. They are kept
+Five of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -415,9 +415,30 @@ part worth reading.
   out to be the wrong one. There is no threshold and no spill: a value too
   long for one row slot is a RUN of slots written inside one commit, so a
   long value is atomic for the same reason a short one is, and there is no
-  second allocator to keep consistent with the first. The ceiling is what
-  one commit can carry (2 KiB today), and beyond that the answer is object
+  second allocator to keep consistent with the first. The ceiling is
+  `MAX_VALUE_LEN`, 2 KiB today, and beyond that the answer is object
   storage with a reference stored here, as §4.5 always said.
+- **How wide a commit is, next to how long a value is** — DECIDED: they are
+  two numbers, and making them one was a mistake worth recording. Row
+  format v5 spent one byte on the commit span, which capped a commit at
+  128 row slots — exactly what a `MAX_VALUE_LEN` value costs. The two
+  ceilings coincided, and the consequence was not a size limit but an
+  ATOMICITY limit: a maximum-length value filled a commit by itself, so it
+  could never land in the same commit as anything else. All three sample
+  applications hit it independently and all three worked around it the
+  same way, by holding back a slot and documenting a ceiling the library
+  never mentions — a job queue cannot enqueue a full-size job and move its
+  watermark, a bookmark store cannot write a full-size record and the
+  counter that names it. Format v6 widens the span to two bytes (`u16`,
+  little-endian, at offsets 25..27, inside the checksummed region and
+  consuming the row's last padding byte, so every byte of a row is now
+  covered by the CRC rather than by a zero check). A commit holds
+  `MAX_COMMIT_ROWS` = 1024 slots; a value still costs at most 128 of them.
+  The longest value the library will store now composes with seven more of
+  its kind, and the workarounds are gone from all three samples. The
+  general rule the episode teaches: a limit that exists for a FORMAT
+  reason must not be spent as if it were a limit that exists for a
+  CAPACITY reason.
 - **Which hard index ships in v1** — DECIDED: trigram, for the reason §4.6
   gives. Its oracle is exact, and every other index in this project is held
   to equality against an oracle.

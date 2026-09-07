@@ -3,9 +3,9 @@
 //   cargo run -p dabqlite-codegen -- schema/records.sql <this file>
 
 pub const RECORDS_TABLE: &str = "records";
-pub const RECORDS_SCHEMA_HASH: u64 = 0x7AC9964EB9CD3119;
+pub const RECORDS_SCHEMA_HASH: u64 = 0x649973635A2664C3;
 pub const RECORDS_ROW_SIZE: usize = 32;
-pub const RECORDS_CRC_OFFSET: usize = 27;
+pub const RECORDS_CRC_OFFSET: usize = 28;
 /// Offset of the row-kind discriminant. INSIDE the checksummed
              /// region: a bit flip here must not be able to turn a deletion
              /// back into a record.
@@ -19,15 +19,17 @@ pub const RECORDS_CRC_OFFSET: usize = 27;
              /// as part of the same commit. Also INSIDE the checksummed region —
              /// a bit flip here must not be able to re-draw a commit boundary.
              pub const RECORDS_SPAN_OFFSET: usize = 25;
+             /// Bytes the span occupies.
+             pub const RECORDS_SPAN_WIDTH: usize = 2;
              /// Largest span a slot may claim; beyond it the slot is damaged
              /// or foreign, and the decoder refuses it.
-             pub const RECORDS_SPAN_MAX: u8 = 127;
+             pub const RECORDS_SPAN_MAX: u16 = 1023;
 /// Offset of the payload LEN: how many bytes of the final
              /// fixed-width column this row carries, in the low bits, with
              /// `LEN_MORE` set when the value continues into the next row.
              /// Also INSIDE the checksummed region — a flip here would silently
              /// lengthen, shorten, or re-end a value.
-             pub const RECORDS_LEN_OFFSET: usize = 26;
+             pub const RECORDS_LEN_OFFSET: usize = 27;
              /// Largest payload a single row can carry.
              pub const RECORDS_LEN_MAX: u8 = 16;
              /// Set in the LEN byte when this row is NOT the last of its
@@ -43,7 +45,7 @@ pub struct RecordsRow {
                  pub kind: u8,
     /// Rows still to come in the same commit: 0 for the last (or
                  /// only) row of a commit, `n-1` for the first of `n`.
-                 pub span: u8,
+                 pub span: u16,
     /// Bytes of the final column this row actually carries.
                  pub len: u8,
                  /// True when the value continues into the next row.
@@ -81,7 +83,8 @@ pub fn encode_records_row(row: &RecordsRow, out: &mut [u8; RECORDS_ROW_SIZE]) {
     out[0..8].copy_from_slice(&row.id.to_le_bytes());
     out[8..24].copy_from_slice(&row.value);
     out[RECORDS_KIND_OFFSET] = row.kind;
-    out[RECORDS_SPAN_OFFSET] = row.span;
+    out[RECORDS_SPAN_OFFSET..RECORDS_SPAN_OFFSET + 2]
+        .copy_from_slice(&row.span.to_le_bytes());
     out[RECORDS_LEN_OFFSET] = row.len | if row.more { RECORDS_LEN_MORE } else { 0 };
     let crc = gen_crc32(&out[0..RECORDS_CRC_OFFSET]);
     out[RECORDS_CRC_OFFSET..RECORDS_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -104,7 +107,10 @@ pub fn decode_records_row(bytes: &[u8]) -> Option<RecordsRow> {
     if kind > RECORDS_KIND_MAX {
         return None;
     }
-    let span = bytes[RECORDS_SPAN_OFFSET];
+    let span = u16::from_le_bytes([
+        bytes[RECORDS_SPAN_OFFSET],
+        bytes[RECORDS_SPAN_OFFSET + 1],
+    ]);
     if span > RECORDS_SPAN_MAX {
         return None;
     }

@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dabqlite::{MAX_COMMIT_ROWS, VALUE_LEN};
+use dabqlite::{MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
 use jobqueue::{audit, churn_verify, ChurnConfig};
 
 const EXE: &str = env!("CARGO_BIN_EXE_jobqueue");
@@ -285,16 +285,16 @@ fn sigkill_inside_a_batch_never_leaves_half_of_it_or_a_short_value() {
         },
         &mut t,
     );
-    // The case this revision is about: ONE value per batch, nearly as long
-    // as the format allows, so the commit is a run of ~126 row slots
-    // belonging to a SINGLE value. A kill inside it is the best shot
-    // anyone has at a short read.
+    // The case this revision is about: ONE value per batch, as long as the
+    // format allows, so the commit is a run of ~128 row slots belonging to
+    // a SINGLE value. A kill inside it is the best shot anyone has at a
+    // short read.
     hammer(
         Hammer {
             tag: "huge",
             batch: MAX_COMMIT_ROWS - 1,
-            max_cell: (MAX_COMMIT_ROWS - 2) * VALUE_LEN - 8,
-            // 24 cells x 126 slots = 3024 live slots at worst, under the
+            max_cell: MAX_VALUE_LEN - 8,
+            // 24 cells x 128 slots = 3072 live slots at worst, under the
             // 0.7 x 8192 compaction threshold. Capacity is in slots, so
             // this sum is the application's to do.
             cells: 24,

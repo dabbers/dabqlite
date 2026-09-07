@@ -4,9 +4,9 @@
 
 use std::path::PathBuf;
 
-use dabqlite::{Db, Error, Op, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
+use dabqlite::{Db, Error, Op, Value, MAX_VALUE_LEN, VALUE_LEN};
 use jobqueue::{
-    audit, payload_of, run, slot_cost, Config, Job, Journal, MAX_PAYLOAD, PENDING,
+    audit, payload_of, run, slot_cost, Config, Job, Journal, JOB_HEADER, MAX_PAYLOAD, PENDING,
     ROW_COMMIT_WATERMARK, ROW_ENQUEUE_WATERMARK,
 };
 
@@ -470,12 +470,14 @@ fn a_long_running_queue_compacts_repeatedly_at_constant_depth() {
     let root = scratch("long");
     let journal_path = root.join("j.log");
     let mut cfg = Config::new(root.join("db"), &journal_path, 120);
-    // Eight commits' worth of slots. It has to be at least twice the
-    // largest single job's slot cost plus headroom, because a job at the
-    // payload ceiling is 127 slots to insert and 127 more to claim — a
-    // sizing rule the library states nowhere, since capacity is denominated
-    // in slots and an application thinks in payloads.
-    cfg.capacity = 8 * MAX_COMMIT_ROWS as u64;
+    // Eight of the largest jobs. It has to be at least twice the largest
+    // single job's slot cost plus headroom, because a job at the payload
+    // ceiling is 128 slots to insert and 128 more to claim — a sizing rule
+    // the library states nowhere, since capacity is denominated in slots
+    // and an application thinks in payloads. Written against the job's own
+    // cost rather than against MAX_COMMIT_ROWS: those two numbers used to
+    // be the same and are now eight times apart.
+    cfg.capacity = 8 * slot_cost(MAX_PAYLOAD + JOB_HEADER) as u64;
     cfg.window = 3;
     cfg.compact_at = 0.6;
 

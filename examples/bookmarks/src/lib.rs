@@ -62,14 +62,17 @@ pub const TS: u8 = 0x1e;
 const HEADER_KEY: u64 = 0;
 const HEADER_MAGIC: &str = "BMK3";
 
-/// The longest record this crate will write.
+/// The longest record this crate will write: the whole of [`MAX_VALUE_LEN`].
 ///
-/// [`MAX_VALUE_LEN`] is 2048 and [`MAX_COMMIT_ROWS`] is 128 ROW SLOTS — and
-/// 2048/16 is exactly 128. A maximum-length value therefore consumes an
-/// entire commit, leaving no room for the id-counter row that has to land
-/// with it. One slot is reserved for that; see
-/// `a_full_length_value_leaves_no_room_for_anything_else_in_its_commit`.
-pub const MAX_RECORD: usize = MAX_VALUE_LEN - VALUE_LEN;
+/// This used to be one slot short of it. [`MAX_VALUE_LEN`] is 2048 bytes,
+/// which is 128 ROW SLOTS, and a commit used to hold exactly 128 — so a
+/// maximum-length record consumed the entire commit and left no room for
+/// the id-counter row that has to land WITH it. The store reserved a slot
+/// rather than discover that in production. A commit now holds
+/// [`MAX_COMMIT_ROWS`] slots, eight times a maximum-length value, so the
+/// reservation is gone and the ceiling is the library's own; see
+/// `a_full_length_value_still_leaves_room_for_the_counter_beside_it`.
+pub const MAX_RECORD: usize = MAX_VALUE_LEN;
 
 /// Field ceilings. Generous, because the binding constraint is
 /// [`MAX_RECORD`] on the encoded whole, which is checked separately.

@@ -110,21 +110,29 @@ pub const DONE: u8 = 3;
 /// `[0] state | [1] attempts | [2..4] declared payload length | [4..] payload`.
 pub const JOB_HEADER: usize = 4;
 
-/// The longest payload a job may carry.
+/// The longest payload a job may carry: the value ceiling, less this
+/// crate's own header.
 ///
-/// Not `MAX_VALUE_LEN - JOB_HEADER`, and the difference is a real
-/// constraint rather than caution. A value of `MAX_VALUE_LEN` bytes
-/// occupies `MAX_VALUE_LEN / VALUE_LEN` slots, which is exactly
-/// [`MAX_COMMIT_ROWS`] — the whole commit. So a maximum-length value can only
-/// ever be written ALONE, and this queue never writes a job row alone: an
-/// enqueue is `[job..., watermark]` and a commit is `[watermark, retire]`.
-/// One slot has to be left for the companion row, or the batch that
-/// carries the queue's cross-row invariant becomes unrepresentable.
+/// This used to hold back an extra `VALUE_LEN`, and the difference was a
+/// real constraint rather than caution. A value of `MAX_VALUE_LEN` bytes
+/// occupies `MAX_VALUE_LEN / VALUE_LEN` slots, which used to be exactly
+/// [`MAX_COMMIT_ROWS`] — the whole commit. A maximum-length value could
+/// therefore only ever be written ALONE, and this queue never writes a job
+/// row alone: an enqueue is `[job..., watermark]` and a commit is
+/// `[watermark, retire]`. A slot had to be left for the companion row, or
+/// the batch carrying the queue's cross-row invariant became
+/// unrepresentable — the library's advertised value ceiling and its
+/// advertised atomicity could not both be used at once.
 ///
-/// In other words the library's advertised value ceiling and its
-/// advertised atomicity cannot both be used at once, and an application
-/// has to work out where the real ceiling is for its own batch shapes.
-pub const MAX_PAYLOAD: usize = MAX_VALUE_LEN - VALUE_LEN - JOB_HEADER;
+/// A commit now holds [`MAX_COMMIT_ROWS`] slots and the longest value
+/// costs `MAX_VALUE_LEN / VALUE_LEN` of them, which is eight times
+/// smaller, so the reservation is gone and the only subtraction left is
+/// this crate's own header.
+pub const MAX_PAYLOAD: usize = MAX_VALUE_LEN - JOB_HEADER;
+const _: () = assert!(
+    MAX_VALUE_LEN / VALUE_LEN < MAX_COMMIT_ROWS,
+    "a longest-payload job must still fit in a commit beside its watermark row"
+);
 
 /// Row slots a value of `len` bytes consumes.
 ///
@@ -1213,7 +1221,12 @@ pub fn churn(cfg: &ChurnConfig, journal: &mut Journal) -> Result<ChurnReport, Qu
     let mut rng = cfg.seed ^ (rep0.row_count.wrapping_mul(0x0123_4567_89AB_CDEF));
     // One slot is reserved for the digest row that closes every batch.
     let max_width = cfg.batch.clamp(1, MAX_COMMIT_ROWS - 1);
-    let max_cell = cfg.max_cell.clamp(1, (MAX_COMMIT_ROWS - 2) * VALUE_LEN - 8);
+    // Two ceilings, and the cell has to be under both: what one VALUE can
+    // hold, and what is left of a commit once the digest row that closes
+    // every batch has its slot.
+    let max_cell = cfg
+        .max_cell
+        .clamp(1, MAX_VALUE_LEN.min((MAX_COMMIT_ROWS - 2) * VALUE_LEN) - 8);
     let cells_used = cfg.cells.clamp(1, CHURN_CELLS);
     // Capacity is in slots and the workload is described in bytes, so the
     // sizing rule has to be worked out by hand. Say so at the start rather

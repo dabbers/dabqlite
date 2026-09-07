@@ -193,46 +193,54 @@ fn an_oversized_batch_now_says_batch_too_long_and_not_database_full() {
     );
     assert_eq!(
         e.to_string(),
-        "batch refused at operation 128 (this batch needs 129 row slots and one \
-         commit holds 128; split it into several batches, each still atomic in \
-         itself); nothing in it was applied"
+        format!(
+            "batch refused at operation {max} (this batch needs {over} row slots \
+             and one commit holds {max}; split it into several batches, each \
+             still atomic in itself); nothing in it was applied",
+            max = MAX_COMMIT_ROWS,
+            over = MAX_COMMIT_ROWS + 1,
+        )
     );
     assert!(db.batch(&ops[..MAX_COMMIT_ROWS]).is_ok());
     assert_eq!(db.len(), MAX_COMMIT_ROWS as u64);
 }
 
 #[test]
-fn a_full_length_value_leaves_no_room_for_anything_else_in_its_commit() {
-    // LIMITATION, and a sharp edge. MAX_VALUE_LEN is exactly
-    // MAX_COMMIT_ROWS * VALUE_LEN, so a maximum-length value consumes the whole
-    // commit. "One record plus the counter that names it, atomically" —
-    // the most ordinary two-row invariant there is — is therefore
-    // impossible at the top of the value range. This crate reserves a slot
-    // (MAX_RECORD) rather than discover it in production.
-    assert_eq!(MAX_VALUE_LEN, MAX_COMMIT_ROWS * VALUE_LEN);
-    assert_eq!(MAX_RECORD, MAX_VALUE_LEN - VALUE_LEN);
+fn a_full_length_value_still_leaves_room_for_the_counter_beside_it() {
+    // FIXED, and it was the sharpest edge in the port. MAX_VALUE_LEN used
+    // to be exactly MAX_COMMIT_ROWS * VALUE_LEN, so a maximum-length value
+    // consumed the whole commit and "one record plus the counter that
+    // names it, atomically" — the most ordinary two-row invariant there
+    // is — was impossible at the top of the value range. This crate
+    // reserved a slot (MAX_RECORD = MAX_VALUE_LEN - VALUE_LEN) rather than
+    // discover it in production. The commit is now eight times the longest
+    // value, so the reservation is gone.
+    assert_eq!(MAX_VALUE_LEN * 8, MAX_COMMIT_ROWS * VALUE_LEN);
+    assert_eq!(MAX_RECORD, MAX_VALUE_LEN, "no slot is held back any more");
 
     let mut db = MemDb::in_memory_with(4096).unwrap();
     let full = Value::from_vec(vec![b'x'; MAX_VALUE_LEN]).unwrap();
     assert!(db.put(1, full.clone()).is_ok(), "alone, it fits");
-    assert_eq!(
-        db.batch(&[
-            Op::put(2, full),
-            Op::put(3, Value::from_bytes(b"!").unwrap())
-        ])
-        .unwrap_err(),
-        DbErr::BatchRejected {
-            at: 1,
-            cause: Box::new(DbErr::BatchTooLong {
-                rows: MAX_COMMIT_ROWS + 1,
-                max: MAX_COMMIT_ROWS
-            })
-        },
-        "but nothing may accompany it"
-    );
+    db.batch(&[
+        Op::put(2, full.clone()),
+        Op::put(3, Value::from_bytes(b"!").unwrap()),
+    ])
+    .expect("and so does a companion beside it");
+    assert_eq!(db.get(2).unwrap().unwrap().as_bytes(), full.as_bytes());
+    assert_eq!(db.get(3).unwrap().unwrap().as_bytes(), b"!");
 
-    // Which the store surfaces as its own ceiling, not as a runtime
-    // surprise: a record over MAX_RECORD is refused before any write.
+    // Several of them at once, too — the whole point of decoupling the
+    // two limits. Eight maximum-length values exactly fill one commit.
+    let mut db = MemDb::in_memory_with(4096).unwrap();
+    let ops: Vec<Op> = (0..(MAX_COMMIT_ROWS / (MAX_VALUE_LEN / VALUE_LEN)) as u64)
+        .map(|i| Op::put(i, full.clone()))
+        .collect();
+    assert_eq!(ops.len(), 8);
+    db.batch(&ops).expect("a commit's worth of longest values");
+    assert_eq!(db.len(), 8);
+
+    // And the store's ceiling is now the library's, applied to the whole
+    // encoded record and still refused before any write.
     let mut s = Store::in_memory().unwrap();
     let long_tags: Vec<String> = (0..MAX_TAGS).map(|i| format!("{i:0>63}")).collect();
     let e = s
@@ -266,8 +274,13 @@ fn add_many_is_one_commit_for_a_whole_import() {
     assert_eq!(s.count().unwrap(), 12);
 
     // The ceiling is row SLOTS, not bookmarks, so it depends on how long
-    // the bookmarks are. Past it the library says exactly that.
-    let too_many: Vec<NewBookmark> = (0..60)
+    // the bookmarks are — it used to be about a dozen of these and is now
+    // about a hundred. Past it, whatever it is, the library says exactly
+    // that. Stated against MAX_COMMIT_ROWS so the number moves with the
+    // format instead of going quietly stale: one bookmark costs at least
+    // one slot, so that many of them cannot fit alongside the counter.
+    let mut s = Store::in_memory_with(65_536).unwrap();
+    let too_many: Vec<NewBookmark> = (0..MAX_COMMIT_ROWS as u64)
         .map(|i| NewBookmark::new(&format!("https://example.com/{i}"), "T", &["x"], T0))
         .collect();
     let e = s.add_many(&too_many).unwrap_err();
@@ -279,7 +292,7 @@ fn add_many_is_one_commit_for_a_whole_import() {
         ),
         "{e:?}"
     );
-    assert_eq!(s.count().unwrap(), 12, "and nothing in it was applied");
+    assert_eq!(s.count().unwrap(), 0, "and nothing in it was applied");
 }
 
 #[test]
@@ -300,18 +313,21 @@ fn a_bulk_delete_of_a_hundred_bookmarks_is_one_commit() {
     );
     assert_eq!(s.count().unwrap(), 20);
 
-    // 129 does not fit, and is refused whole.
-    let mut s = Store::in_memory_with(8192).unwrap();
-    for i in 0..200u64 {
+    // One tombstone more than a commit holds does not fit, and is refused
+    // whole. That number is MAX_COMMIT_ROWS + 1 rather than a literal, so
+    // the test keeps testing the boundary when the boundary moves.
+    let over = MAX_COMMIT_ROWS as u64 + 1;
+    let mut s = Store::in_memory_with(65_536).unwrap();
+    for i in 0..over + 8 {
         s.add(&format!("https://example.com/{i}"), "T", &tags(&["x"]), T0)
             .unwrap();
     }
-    let e = s.remove_many(&(1..=129).collect::<Vec<_>>()).unwrap_err();
+    let e = s.remove_many(&(1..=over).collect::<Vec<_>>()).unwrap_err();
     assert!(
         matches!(e, StoreError::Db(DbErr::BatchRejected { .. })),
         "{e:?}"
     );
-    assert_eq!(s.count().unwrap(), 200);
+    assert_eq!(s.count().unwrap(), over + 8);
 }
 
 #[test]
@@ -332,11 +348,14 @@ fn delete_inside_a_batch_is_strict_and_remove_is_not() {
 
 #[test]
 fn renaming_a_tag_across_the_collection_is_still_not_atomic() {
-    // LIMITATION. A rename now packs ~13 bookmarks per commit instead of
-    // one, which is a 13x improvement and not a fix: a collection of any
-    // size still needs more than one commit, and a crash between them
-    // leaves the rename half-applied. Nothing in the library expresses
-    // "all of these commits or none".
+    // LIMITATION, though a much narrower one than it was. A rename used to
+    // cost one commit per bookmark; it then packed ~13 per commit; a
+    // commit now holds MAX_COMMIT_ROWS slots, so a few hundred bookmarks
+    // of this size rename in ONE commit and are atomic outright. That is
+    // an improvement and not a fix: past a commit's worth of slots the
+    // rename still needs more than one commit, a crash between them still
+    // leaves it half-applied, and nothing in the library expresses "all of
+    // these commits or none".
     let mut s = Store::in_memory_with(8192).unwrap();
     for i in 0..300u64 {
         s.add(
@@ -351,10 +370,12 @@ fn renaming_a_tag_across_the_collection_is_still_not_atomic() {
     assert_eq!(s.by_tag("databases").unwrap().len(), 300);
     assert!(s.by_tag("db").unwrap().is_empty());
 
-    // Prove the claim rather than assert it: the same rename as one batch
-    // is refused, and the refusal names the number of slots it needed.
+    // Prove the claim rather than assert it: a collection past the commit
+    // bound cannot be renamed as one batch, and the refusal names the
+    // number of slots it needed. One record of this length is three slots,
+    // so MAX_COMMIT_ROWS of them is three commits' worth.
     let mut db = MemDb::in_memory_with(65_536).unwrap();
-    let ops: Vec<Op> = (0..300u64)
+    let ops: Vec<Op> = (0..MAX_COMMIT_ROWS as u64)
         .map(|i| {
             Op::put(
                 i,

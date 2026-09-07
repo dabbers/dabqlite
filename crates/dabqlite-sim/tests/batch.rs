@@ -314,8 +314,17 @@ fn an_empty_batch_is_a_no_op_with_no_io_and_no_generation_flip() {
 /// write, not `2n`. Stated as an assertion rather than a README sentence.
 #[test]
 fn a_batch_costs_two_fsyncs_no_matter_how_long_it_is() {
-    for n in [1usize, 2, 8, 32, MAX_COMMIT_ROWS] {
-        let mut host = fresh();
+    for n in [1usize, 2, 8, 32, 128, MAX_COMMIT_ROWS] {
+        // The longest commit the format allows needs a database that can
+        // hold it, which is more than the rest of this suite works in.
+        let mut host = SimHost::new(
+            Capacities {
+                rows: (MAX_COMMIT_ROWS as u64 + 8).max(CAPS.rows),
+            },
+            SimDisk::new(),
+            None,
+        );
+        host.open();
         let ops: Vec<BatchOp> = (0..n as u64)
             .map(|i| BatchOp::Insert {
                 id: i,
@@ -892,7 +901,7 @@ fn an_orphan_claiming_an_impossible_commit_is_rollback_evidence() {
     let mut row = [0u8; dabqlite_core::ROW_SIZE];
     dabqlite_core::layout::encode_row(
         dabqlite_core::layout::RowKind::Record,
-        (dabqlite_core::MAX_COMMIT_ROWS - 1) as u8,
+        (dabqlite_core::MAX_COMMIT_ROWS - 1) as u16,
         VALUE_LEN as u8,
         false,
         900,

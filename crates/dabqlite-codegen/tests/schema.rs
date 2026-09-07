@@ -30,12 +30,22 @@ fn records_schema_matches_the_engine_exactly() {
     // deletion back into a record. v3 adds the commit span next to it,
     // under the same checksum, so a flip cannot redraw a commit boundary
     // either. v4 adds the payload length beside those, so a flip cannot
-    // lengthen a value into its own padding.
+    // lengthen a value into its own padding. v6 widens the span to two
+    // bytes, which is what separates the length of a COMMIT from the
+    // length of a VALUE — and consumes the row's last padding byte, so
+    // every byte of a row is now covered by the checksum rather than by
+    // a zero check.
     assert_eq!(schema.format, dabqlite_codegen::CURRENT_ROW_FORMAT);
     assert_eq!(layout.kind_offset, Some(24));
     assert_eq!(layout.span_offset, Some(25));
-    assert_eq!(layout.len_offset, Some(26));
-    assert_eq!(layout.crc_offset, 27);
+    assert_eq!(layout.span_width, 2);
+    assert_eq!(layout.len_offset, Some(27));
+    assert_eq!(layout.crc_offset, 28);
+    assert_eq!(
+        layout.crc_offset + 4,
+        layout.row_size,
+        "v6 rows have no padding left: the checksum reaches the end"
+    );
     // The length's ceiling is the value column's width, derived rather
     // than written down twice.
     assert_eq!(layout.len_max, Some(dabqlite_core::VALUE_LEN as u8));

@@ -3,7 +3,7 @@
 //   cargo run -p dabqlite-codegen -- schema/records_v1.sql <this file>
 
 pub const RECORDS_TABLE: &str = "records";
-pub const RECORDS_SCHEMA_HASH: u64 = 0x8153D1C75E5F8249;
+pub const RECORDS_SCHEMA_HASH: u64 = 0x38FF1170401353BA;
 pub const RECORDS_ROW_SIZE: usize = 24;
 pub const RECORDS_CRC_OFFSET: usize = 16;
 pub const RECORDS_COL_ID_OFFSET: usize = 0;

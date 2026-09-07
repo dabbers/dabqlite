@@ -210,10 +210,16 @@ fn slot_arithmetic_is_answerable_before_the_write() {
         Op::update(1, Value::from_bytes(&[0u8; VALUE_LEN + 1]).unwrap()).rows(),
         2
     );
+    // A maximum-length value is 128 slots of a 1024-slot commit, so it
+    // leaves room to land WITH something. While the span field was one
+    // byte these two numbers were the same and it did not.
     assert_eq!(
         Op::insert(1, Value::from_bytes(&[0u8; MAX_VALUE_LEN]).unwrap()).rows(),
-        MAX_COMMIT_ROWS,
-        "a maximum-length value fills a commit by itself"
+        MAX_VALUE_LEN / VALUE_LEN
+    );
+    const _: () = assert!(
+        MAX_VALUE_LEN / VALUE_LEN < MAX_COMMIT_ROWS,
+        "the largest value must leave room beside it in its commit"
     );
     assert_eq!(Op::delete(1).rows(), 1, "a tombstone is a slot");
     assert_eq!(Op::remove(1).rows(), 1);
@@ -250,33 +256,49 @@ fn slot_arithmetic_is_answerable_before_the_write() {
 }
 
 /// A batch is bounded in SLOTS, not operations — the constant is named
-/// for what it counts, and two operations can be too long for one.
+/// for what it counts, and enough operations can exceed it while each one
+/// is legal on its own.
 #[test]
 fn a_batch_is_bounded_in_slots_not_operations() {
-    let mut db = Db::in_memory_with(1024).expect("open");
-    let half = Value::from_bytes(&[b'x'; (MAX_COMMIT_ROWS / 2) * VALUE_LEN]).unwrap();
-    let ops = [
-        Op::insert(1, half.clone()),
-        Op::insert(2, half.clone()),
-        Op::insert(3, Value::from_text("one more slot").unwrap()),
-    ];
-    assert_eq!(ops.iter().map(Op::rows).sum::<usize>(), MAX_COMMIT_ROWS + 1);
+    let mut db = Db::in_memory_with(4096).expect("open");
+    // The largest value there is, repeated until the commit cannot hold
+    // another. Each one is a legal write by itself.
+    let biggest = Value::from_bytes(&[b'x'; MAX_VALUE_LEN]).unwrap();
+    let per_op = MAX_VALUE_LEN / VALUE_LEN;
+    let fits = MAX_COMMIT_ROWS / per_op;
+    assert!(fits > 1, "a commit must hold more than one maximum value");
+
+    let ops: Vec<Op> = (0..fits as u64 + 1)
+        .map(|i| Op::insert(i, biggest.clone()))
+        .collect();
+    assert_eq!(ops.iter().map(Op::rows).sum::<usize>(), (fits + 1) * per_op);
     // Refused, and it names the operation the commit overflowed at —
     // which an op-count limit could not have told anyone, because the
     // count was never the thing that overflowed.
     match db.batch(&ops) {
-        Err(Error::BatchRejected { at: 2, cause }) => match *cause {
-            Error::BatchTooLong { rows, max } => {
-                assert_eq!(max, MAX_COMMIT_ROWS);
-                assert_eq!(rows, MAX_COMMIT_ROWS + 1);
-            }
-            other => panic!("{other:?}"),
-        },
-        other => panic!("three operations, {} slots: {other:?}", MAX_COMMIT_ROWS + 1),
+        Err(Error::BatchRejected { at, cause }) => {
+            assert_eq!(
+                at, fits,
+                "the commit overflows at the operation past the last that fits"
+            );
+            assert!(matches!(*cause, Error::BatchTooLong { max, .. } if max == MAX_COMMIT_ROWS));
+        }
+        other => panic!("{other:?}"),
     }
-    // Drop the last one and the same two operations fit exactly.
-    db.batch(&ops[..2]).unwrap();
-    assert_eq!(db.stats().slots, MAX_COMMIT_ROWS as u64);
+    // Drop the last one and the rest fit exactly.
+    db.batch(&ops[..fits]).unwrap();
+    assert_eq!(db.stats().slots as usize, fits * per_op);
+    assert_eq!(db.len(), fits as u64);
+
+    // And the point of separating the two limits: the largest value the
+    // store holds can be committed ATOMICALLY with something else.
+    let mut db = Db::in_memory_with(4096).expect("open");
+    db.batch(&[
+        Op::insert(1, biggest.clone()),
+        Op::insert(2, Value::from_text("the counter that names it").unwrap()),
+    ])
+    .expect("a maximum value and a companion, in one commit");
+    assert_eq!(db.len(), 2);
 }
 
 #[test]

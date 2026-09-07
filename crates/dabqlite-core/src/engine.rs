@@ -145,13 +145,30 @@ pub enum DbError {
     IoFailed { file: FileId },
 }
 
-/// The longest value this store will hold.
+/// The longest value this store will hold: 128 row slots, 2 KiB.
 ///
 /// A value too long for one row slot is written as a run of slots inside
-/// ONE commit — that is what makes a long value atomic — so its ceiling is
-/// the longest commit the row format can describe. Larger payloads belong
-/// in object storage with a reference stored here (docs/DESIGN.md §4.5).
-pub const MAX_VALUE_LEN: usize = VALUE_LEN * MAX_COMMIT_ROWS;
+/// ONE commit — that is what makes a long value atomic — so it must fit a
+/// commit. It is no longer the SAME as a commit, which it was while the
+/// span field was one byte: a maximum-length value filled the whole
+/// commit and could never be made atomic with anything else, so "write
+/// the record and the counter that names it, together" was expressible
+/// only for small records. A commit is 1024 rows now and this is 128 of
+/// them, so the largest value leaves 896 slots for whatever has to land
+/// with it.
+///
+/// Bounded independently for a second reason: every place that compares a
+/// whole value takes a buffer this size, so raising it is paid for on
+/// every search candidate. Larger payloads belong in object storage with
+/// a reference stored here (docs/DESIGN.md §4.5).
+pub const MAX_VALUE_LEN: usize = VALUE_LEN * 128;
+
+/// A value's ceiling has to fit inside a commit, or a long value could
+/// not be written atomically at all.
+const _: () = assert!(MAX_VALUE_LEN <= VALUE_LEN * MAX_COMMIT_ROWS);
+/// ...and it has to leave room beside it, which is the whole point of
+/// separating the two.
+const _: () = assert!(MAX_VALUE_LEN / VALUE_LEN < MAX_COMMIT_ROWS);
 
 /// Bytes one [`ValueWindow`] can carry: sixteen row slots.
 ///
@@ -2255,7 +2272,7 @@ impl Engine {
         id: u64,
         value: &[u8; VALUE_LEN],
     ) {
-        let span = (total as u64 - 1 - (row - base)) as u8;
+        let span = (total as u64 - 1 - (row - base)) as u16;
         let off = (row as usize) * ROW_SIZE;
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()

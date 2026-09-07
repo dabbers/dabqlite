@@ -79,15 +79,25 @@ const _: () = assert!(records::RECORDS_COL_ID_OFFSET == 0);
 const _: () = assert!(records::RECORDS_COL_VALUE_OFFSET == 8);
 const _: () = assert!(records::RECORDS_KIND_OFFSET == 8 + VALUE_LEN);
 const _: () = assert!(records::RECORDS_SPAN_OFFSET == records::RECORDS_KIND_OFFSET + 1);
-const _: () = assert!(records::RECORDS_LEN_OFFSET == records::RECORDS_SPAN_OFFSET + 1);
+const _: () = assert!(records::RECORDS_SPAN_WIDTH == 2);
+const _: () = assert!(
+    records::RECORDS_LEN_OFFSET == records::RECORDS_SPAN_OFFSET + records::RECORDS_SPAN_WIDTH
+);
 const _: () = assert!(records::RECORDS_CRC_OFFSET == records::RECORDS_LEN_OFFSET + 1);
 const _: () = assert!(records::RECORDS_LEN_MAX as usize == VALUE_LEN);
 const _: () =
     assert!(VALUE_LEN == records::RECORDS_KIND_OFFSET - records::RECORDS_COL_VALUE_OFFSET);
 
-/// The largest number of rows one commit may contain, fixed by the width
-/// of the span byte's validated range. A commit of `n` rows writes spans
+/// The largest number of rows one commit may contain, fixed by the
+/// validated range of the span field. A commit of `n` rows writes spans
 /// `n-1 .. 0`, so `n` can be at most `SPAN_MAX + 1`.
+///
+/// Deliberately NOT the same number as the value ceiling. While the span
+/// was one byte they were the same by accident — a maximum-length value
+/// filled an entire commit and could never be made atomic with anything
+/// else, not even a sixteen-byte counter beside it. Two bytes separate
+/// them: a commit is 1024 rows, a value is 128 slots, and the largest
+/// value leaves 896 slots for whatever has to land with it.
 pub const MAX_COMMIT_ROWS: usize = records::RECORDS_SPAN_MAX as usize + 1;
 
 /// What a row slot says about itself. The discriminant lives inside the
@@ -145,7 +155,7 @@ pub struct RowSlot {
     pub kind: RowKind,
     /// Rows still to come in the same commit: 0 for the last (or only)
     /// row of a commit, `n-1` for the first row of an `n`-row batch.
-    pub span: u8,
+    pub span: u16,
     /// Bytes of `value` this row really carries. Everything past it is
     /// zero padding inside the slot, not data.
     pub len: u8,
@@ -230,7 +240,7 @@ pub const SCHEMA_HASH: u64 = records::RECORDS_SCHEMA_HASH;
 #[allow(clippy::too_many_arguments)]
 pub fn encode_row(
     kind: RowKind,
-    span: u8,
+    span: u16,
     len: u8,
     more: bool,
     id: u64,
@@ -304,7 +314,7 @@ pub mod reference {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_row(
         kind: RowKind,
-        span: u8,
+        span: u16,
         len: u8,
         more: bool,
         id: u64,
@@ -319,24 +329,22 @@ pub mod reference {
             RowKind::Update => 2,
             RowKind::Chunk => 3,
         };
-        out[25] = span;
-        out[26] = len | if more { 0x80 } else { 0 };
-        let crc = crc32(&out[0..27]);
-        out[27..31].copy_from_slice(&crc.to_le_bytes());
-        out[31..32].fill(0);
+        out[25..27].copy_from_slice(&span.to_le_bytes());
+        out[27] = len | if more { 0x80 } else { 0 };
+        let crc = crc32(&out[0..28]);
+        out[28..32].copy_from_slice(&crc.to_le_bytes());
     }
 
     pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
         if bytes.len() < ROW_SIZE {
             return None;
         }
-        let stored = u32::from_le_bytes(bytes[27..31].try_into().ok()?);
-        if crc32(&bytes[0..27]) != stored {
+        let stored = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
+        if crc32(&bytes[0..28]) != stored {
             return None;
         }
-        if bytes[31..32] != [0u8; 1] {
-            return None;
-        }
+        // No padding in this layout: every byte of the row is covered by
+        // the checksum, so there is nothing left to zero-check.
         let kind = match bytes[24] {
             0 => RowKind::Record,
             1 => RowKind::Tombstone,
@@ -344,12 +352,12 @@ pub mod reference {
             3 => RowKind::Chunk,
             _ => return None,
         };
-        let span = bytes[25];
+        let span = u16::from_le_bytes([bytes[25], bytes[26]]);
         if span as usize >= MAX_COMMIT_ROWS {
             return None;
         }
-        let more = bytes[26] & 0x80 != 0;
-        let len = bytes[26] & 0x7F;
+        let more = bytes[27] & 0x80 != 0;
+        let len = bytes[27] & 0x7F;
         if len as usize > VALUE_LEN {
             return None;
         }
@@ -595,10 +603,15 @@ mod tests {
             RowKind::Chunk,
         ] {
             for (span, len, more) in [
-                (0u8, 0u8, false),
+                (0u16, 0u8, false),
                 (1, 1, true),
                 (0b0010_1010, 10, false),
                 (127, 16, true),
+                // The span's high byte matters now: a flip in it must be
+                // caught like any other, and a span only reachable with
+                // two bytes must round-trip.
+                (256, 3, false),
+                (1023, 16, true),
             ] {
                 let mut row = [0u8; ROW_SIZE];
                 let mut value = [7u8; VALUE_LEN];

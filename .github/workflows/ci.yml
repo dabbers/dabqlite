@@ -36,7 +36,7 @@ jobs:
 
       # The OPFS backend is a wasm-only crate, so native clippy never sees
       # it. Lint it on the target it actually ships to.
-      - name: Clippy (wasm32: the OPFS backend)
+      - name: "Clippy (wasm32: the OPFS backend)"
         run: cargo clippy -p dabqlite-web --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       - name: Tests (unit, model-based, crash-recovery sweep)
@@ -111,3 +111,44 @@ jobs:
       # failure prints the seed that reproduces it.
       - name: VOPR soak (200 random lifetimes)
         run: cargo run --release -p dabqlite-sim --bin vopr -- --runs 200
+
+  # Compiling the samples is the cheap half and lives in the job above.
+  # This is the other half, and it exists because compiling was not
+  # enough: widening the commit span (row format v6) broke EIGHT sample
+  # tests that no CI job ran, every one of them a real statement about the
+  # API's contract. The samples are the library's regression suite for
+  # everything an application can feel, so they get run.
+  #
+  # The exclusions are the timing-sensitive harnesses: they SIGKILL child
+  # processes at microsecond offsets and measure throughput, which is a
+  # local and agent-driven exercise rather than something to flake on a
+  # shared runner. Everything else runs, including anything added later —
+  # the list below is what is skipped, not what is kept.
+  samples:
+    name: sample application test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Sample application tests
+        run: |
+          skip="batch_crash crash concurrency throughput"
+          for s in examples/*/; do
+            echo "== $s"
+            (
+              cd "$s"
+              cargo test --lib
+              for t in tests/*.rs; do
+                name=$(basename "$t" .rs)
+                case " $skip " in
+                  *" $name "*) echo "-- skipping $name (timing-sensitive)"; continue ;;
+                esac
+                echo "-- $name"
+                cargo test --test "$name"
+              done
+            )
+          done

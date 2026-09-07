@@ -136,39 +136,52 @@ fn reading_a_long_value_costs_about_linearly_more() {
     );
 }
 
-/// **Two maximum-length values cannot be written in one commit, and the
-/// error blames the wrong thing.**
+/// **Two maximum-length values now share a commit, and the batch bound is
+/// stated in the units it is actually enforced in.**
 ///
-/// `MAX_COMMIT_ROWS` is 128 row slots and `MAX_VALUE_LEN` is 2048 bytes,
-/// which is exactly 128 slots — so one full-length value consumes an
-/// entire commit and can never be made atomic with anything else. For a
-/// key/value store that means "rotate this session token and write the
-/// audit line" is expressible only if both records are small.
+/// `MAX_COMMIT_ROWS` used to be 128 row slots and `MAX_VALUE_LEN` 2048
+/// bytes — exactly 128 slots — so one full-length value consumed an entire
+/// commit and could never be made atomic with anything else. For a
+/// key/value store that meant "rotate this session token and write the
+/// audit line" was expressible only if both records were small. The two
+/// limits are now separate: the commit is eight times the longest value.
 ///
-/// The second half is an API bug. `Error::BatchRejected` documents `cause`
-/// as "the error that operation would have returned ON ITS OWN", and `at`
-/// as the operation that stopped the batch. Here `at: 1` and
-/// `cause: BatchTooLong { rows: 256 }` — but operation 1 on its own is a
-/// legal 128-slot write, as the first assertion proves. The batch is too
-/// long as a whole; there is no offending operation, and
-/// `Error::BatchTooLong` (which the docs contrast with `Full` for exactly
-/// this case) never reaches the caller unwrapped.
+/// The bound that remains is a commit's worth of SLOTS, and when a batch
+/// crosses it the rejection names the operation it crossed at. That
+/// operation may be perfectly legal on its own — which the library now
+/// says outright on `Error::BatchRejected` ("stopped at", not "was
+/// wrong"), rather than leaving the caller to infer it from a `cause`
+/// that contradicts the first assertion below.
 #[test]
-fn two_long_values_cannot_share_a_commit_and_the_error_blames_an_operation() {
+fn two_long_values_share_a_commit_and_the_slot_bound_is_stated_honestly() {
     let mut db = MemDb::in_memory_with(4096).unwrap();
     let big = || Value::from_vec(vec![b'x'; MAX_VALUE_LEN]).unwrap();
-    assert_eq!(Op::put(1, big()).rows(), MAX_COMMIT_ROWS);
+    let per_value = Op::put(1, big()).rows();
+    assert_eq!(per_value, MAX_VALUE_LEN / VALUE_LEN);
+    assert!(per_value < MAX_COMMIT_ROWS, "a value is not a whole commit");
     // On its own, that write is fine.
     db.put(1, big()).unwrap();
 
-    let err = db
-        .batch(&[Op::put(2, big()), Op::put(3, big())])
-        .unwrap_err();
+    // And so is the pair — the whole point. "Rotate the token and write
+    // the audit line" is now expressible at any record size.
+    db.batch(&[Op::put(2, big()), Op::put(3, big())])
+        .expect("two maximum-length values, atomically");
+    assert_eq!(db.get(2).unwrap().unwrap().as_bytes().len(), MAX_VALUE_LEN);
+    assert_eq!(db.get(3).unwrap().unwrap().as_bytes().len(), MAX_VALUE_LEN);
+
+    // The bound that IS still there, and the operation it is blamed on.
+    let fits = MAX_COMMIT_ROWS / per_value;
+    let ops: Vec<Op> = (0..=fits as u64).map(|i| Op::put(100 + i, big())).collect();
+    let err = db.batch(&ops).unwrap_err();
     match err {
         dabqlite::Error::BatchRejected { at, ref cause } => {
-            assert_eq!(at, 1, "blamed operation 1, which is legal on its own");
+            assert_eq!(at, fits, "the operation the batch crossed the line at");
             assert!(
-                matches!(**cause, dabqlite::Error::BatchTooLong { rows: 256, .. }),
+                matches!(
+                    **cause,
+                    dabqlite::Error::BatchTooLong { rows, .. }
+                        if rows == (fits + 1) * per_value
+                ),
                 "{cause:?}"
             );
         }
@@ -176,6 +189,7 @@ fn two_long_values_cannot_share_a_commit_and_the_error_blames_an_operation() {
     }
     // The remedy is still stated, one `source()` down.
     assert!(err.to_string().contains("split it into several batches"));
+    assert_eq!(db.get(100).unwrap(), None, "and nothing in it landed");
 }
 
 /// **`Stats::free()` is exact, and a write that uses the last slot lands.**

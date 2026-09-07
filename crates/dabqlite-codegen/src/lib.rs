@@ -99,7 +99,7 @@ pub struct Schema {
 }
 
 /// The current row format emitted for a schema that does not say otherwise.
-pub const CURRENT_ROW_FORMAT: u8 = 5;
+pub const CURRENT_ROW_FORMAT: u8 = 6;
 
 /// Row kinds, v2 and later. The discriminant lives inside the checksum.
 pub const ROW_KIND_RECORD: u8 = 0;
@@ -137,6 +137,26 @@ pub const ROW_KIND_MAX: u8 = ROW_KIND_CHUNK;
 /// vacuous one.
 pub const ROW_SPAN_MAX: u8 = 127;
 
+/// Largest SPAN a v6 row may carry.
+///
+/// v6 widens the span field from one byte to two, which decouples two
+/// limits that had been the same number by accident. The span bounds a
+/// COMMIT; the value ceiling bounds a VALUE; and while a span was one
+/// byte, a maximum-length value (128 slots) filled an entire commit (128
+/// rows) and could never be made atomic with anything else — not even a
+/// sixteen-byte counter beside it. "Write the record and the audit line
+/// together" was expressible only for small records.
+///
+/// Two bytes make a commit 1024 rows while a value stays 2 KiB, so the
+/// largest value leaves 896 slots for whatever has to land with it, and
+/// a batch of ordinary records is eight times longer than it was.
+///
+/// Deliberately not 65535, for the reason the byte version was not 255:
+/// leaving most of the range illegal keeps "this span cannot exist" a
+/// real check rather than a vacuous one, and it keeps the worst-case work
+/// a single commit can queue behind one fsync bounded.
+pub const ROW_SPAN_MAX_WIDE: u16 = 1023;
+
 /// Computed record layout: sequential field offsets, then the CRC, then
 /// zero padding to an 8-byte multiple. Every byte of the row is covered:
 /// fields and CRC by the checksum, padding by the zero check.
@@ -146,9 +166,13 @@ pub struct Layout {
     /// Offset of the one-byte row-kind discriminant (v2+), inside the
     /// checksummed region. `None` in v1, which has no kind byte.
     pub kind_offset: Option<usize>,
-    /// Offset of the one-byte commit SPAN (v3+), inside the checksummed
-    /// region, immediately after the kind. `None` before v3.
+    /// Offset of the commit SPAN (v3+), inside the checksummed region,
+    /// immediately after the kind. `None` before v3.
     pub span_offset: Option<usize>,
+    /// Bytes the span occupies: 1 in v3..v5, 2 in v6+, 0 when there is no
+    /// span. Part of the layout and therefore part of the schema hash, so
+    /// widening it cannot be mistaken for the narrow one.
+    pub span_width: usize,
     /// Offset of the one-byte payload LEN (v4+), inside the checksummed
     /// region, immediately after the span. `None` before v4.
     pub len_offset: Option<usize>,
@@ -479,9 +503,12 @@ impl Schema {
         // v3+ reserves one more byte for the commit span, also before the
         // CRC (see `Schema::format`).
         let span_offset = (self.format >= 3).then_some(at);
-        if span_offset.is_some() {
-            at += 1;
-        }
+        let span_width = match span_offset {
+            None => 0,
+            Some(_) if self.format >= 6 => 2,
+            Some(_) => 1,
+        };
+        at += span_width;
         // v4+ reserves one more byte for the payload length, also before
         // the CRC (see `Schema::format`).
         let len_offset = (self.format >= 4).then_some(at);
@@ -502,6 +529,7 @@ impl Schema {
             field_offsets: offsets,
             kind_offset,
             span_offset,
+            span_width,
             len_offset,
             len_max,
             crc_offset,
@@ -557,8 +585,14 @@ impl Schema {
             canon.push_str(&format!("f{off},"));
         }
         canon.push_str(&format!(
-            "kind={:?},span={:?},len={:?},lenmax={:?},crc={},row={};",
-            l.kind_offset, l.span_offset, l.len_offset, l.len_max, l.crc_offset, l.row_size
+            "kind={:?},span={:?}/{},len={:?},lenmax={:?},crc={},row={};",
+            l.kind_offset,
+            l.span_offset,
+            l.span_width,
+            l.len_offset,
+            l.len_max,
+            l.crc_offset,
+            l.row_size
         ));
         fnv1a64(canon.as_bytes())
     }
@@ -664,8 +698,13 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
         ));
     }
     if let Some(span) = layout.span_offset {
+        let (width, max, enc) = if layout.span_width == 2 {
+            (2, ROW_SPAN_MAX_WIDE, " u16 LE,")
+        } else {
+            (1, ROW_SPAN_MAX as u16, "")
+        };
         w(format!(
-            "| {span} | 1 | span | rows still to come in the same commit (0..={ROW_SPAN_MAX}) |"
+            "| {span} | {width} | span |{enc} rows still to come in the same commit (0..={max}) |"
         ));
     }
     if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
@@ -797,9 +836,17 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
             ROW_KIND_RECORD, ROW_KIND_TOMBSTONE, ROW_KIND_UPDATE, ROW_KIND_CHUNK, ROW_KIND_MAX
         ));
     }
+    let (span_ty, span_max) = if layout.span_width == 2 {
+        ("u16", ROW_SPAN_MAX_WIDE)
+    } else {
+        ("u8", ROW_SPAN_MAX as u16)
+    };
     if let Some(span) = layout.span_offset {
         o.push_str(&format!(
-            "/// Offset of the commit SPAN: how many further rows were written\n             /// as part of the same commit. Also INSIDE the checksummed region —\n             /// a bit flip here must not be able to re-draw a commit boundary.\n             pub const {upper}_SPAN_OFFSET: usize = {span};\n             /// Largest span a slot may claim; beyond it the slot is damaged\n             /// or foreign, and the decoder refuses it.\n             pub const {upper}_SPAN_MAX: u8 = {ROW_SPAN_MAX};\n"
+            "/// Offset of the commit SPAN: how many further rows were written\n             /// as part of the same commit. Also INSIDE the checksummed region —\n             /// a bit flip here must not be able to re-draw a commit boundary.\n             pub const {upper}_SPAN_OFFSET: usize = {span};\n             /// Bytes the span occupies.\n             pub const {upper}_SPAN_WIDTH: usize = {span_width};\n             /// Largest span a slot may claim; beyond it the slot is damaged\n             /// or foreign, and the decoder refuses it.\n             pub const {upper}_SPAN_MAX: {span_ty} = {span_max};\n",
+            span_width = layout.span_width,
+            span_ty = span_ty,
+            span_max = span_max
         ));
     }
     if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
@@ -825,7 +872,7 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if layout.span_offset.is_some() {
         o.push_str(
-            "    /// Rows still to come in the same commit: 0 for the last (or\n             \x20   /// only) row of a commit, `n-1` for the first of `n`.\n             \x20   pub span: u8,\n",
+            &format!("    /// Rows still to come in the same commit: 0 for the last (or\n             \x20   /// only) row of a commit, `n-1` for the first of `n`.\n             \x20   pub span: {span_ty},\n"),
         );
     }
     if layout.len_offset.is_some() {
@@ -893,7 +940,13 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
         o.push_str(&format!("    out[{upper}_KIND_OFFSET] = row.kind;\n"));
     }
     if layout.span_offset.is_some() {
-        o.push_str(&format!("    out[{upper}_SPAN_OFFSET] = row.span;\n"));
+        if layout.span_width == 2 {
+            o.push_str(&format!(
+                "    out[{upper}_SPAN_OFFSET..{upper}_SPAN_OFFSET + 2]\n        .copy_from_slice(&row.span.to_le_bytes());\n"
+            ));
+        } else {
+            o.push_str(&format!("    out[{upper}_SPAN_OFFSET] = row.span;\n"));
+        }
     }
     if layout.len_offset.is_some() {
         o.push_str(&format!(
@@ -933,12 +986,24 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
         ));
     }
     if layout.span_offset.is_some() {
-        o.push_str(&format!(
-            "    let span = bytes[{upper}_SPAN_OFFSET];\n\
-             \x20   if span > {upper}_SPAN_MAX {{\n\
-             \x20       return None;\n\
-             \x20   }}\n"
-        ));
+        if layout.span_width == 2 {
+            o.push_str(&format!(
+                "    let span = {span_ty}::from_le_bytes([\n\
+                 \x20       bytes[{upper}_SPAN_OFFSET],\n\
+                 \x20       bytes[{upper}_SPAN_OFFSET + 1],\n\
+                 \x20   ]);\n\
+                 \x20   if span > {upper}_SPAN_MAX {{\n\
+                 \x20       return None;\n\
+                 \x20   }}\n"
+            ));
+        } else {
+            o.push_str(&format!(
+                "    let span = bytes[{upper}_SPAN_OFFSET];\n\
+                 \x20   if span > {upper}_SPAN_MAX {{\n\
+                 \x20       return None;\n\
+                 \x20   }}\n"
+            ));
+        }
     }
     if layout.len_offset.is_some() {
         o.push_str(&format!(

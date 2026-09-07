@@ -13,9 +13,10 @@ use dabqlite_core::layout::reference as hand;
 use dabqlite_core::layout::RowKind;
 use dabqlite_core::{ROW_SIZE, VALUE_LEN};
 use generated::{
-    decode_records_row, encode_records_row, RecordsRow, RECORDS_KIND_CHUNK, RECORDS_KIND_RECORD,
-    RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_LEN_MAX, RECORDS_LEN_OFFSET,
-    RECORDS_ROW_SIZE, RECORDS_SPAN_MAX, RECORDS_SPAN_OFFSET,
+    decode_records_row, encode_records_row, RecordsRow, RECORDS_CRC_OFFSET, RECORDS_KIND_CHUNK,
+    RECORDS_KIND_RECORD, RECORDS_KIND_TOMBSTONE, RECORDS_KIND_UPDATE, RECORDS_LEN_MAX,
+    RECORDS_LEN_OFFSET, RECORDS_ROW_SIZE, RECORDS_SPAN_MAX, RECORDS_SPAN_OFFSET,
+    RECORDS_SPAN_WIDTH,
 };
 
 /// Deterministic pseudo-random stream without pulling rand into this crate:
@@ -63,7 +64,7 @@ fn generated_encode_is_byte_identical_to_hand_written() {
 
         // Every legal span, cycled, so the commit-group byte is covered by
         // the equivalence exactly like the kind byte is.
-        let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
+        let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u16;
 
         let mut hand_bytes = [0u8; ROW_SIZE];
         hand::encode_row(kind, span, len, more, id, &value, &mut hand_bytes);
@@ -104,7 +105,7 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                 4 => RowKind::Chunk,
                 _ => RowKind::Record,
             };
-            let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
+            let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u16;
             let len = (round % (RECORDS_LEN_MAX as usize + 1)) as u8;
             value[len as usize..].fill(0);
             let more = round % 3 == 0;
@@ -215,7 +216,15 @@ fn generated_codec_has_no_dead_bytes_either() {
 /// exactly how a misdirected write or a foreign file would mislead it.
 #[test]
 fn both_codecs_refuse_a_span_the_format_does_not_define() {
-    for span in (RECORDS_SPAN_MAX as u16 + 1)..=255 {
+    // Every illegal value the two-byte field can hold, sampled across the
+    // range and exhaustively just above the boundary — the interesting
+    // ones are the ones a single bit flip can reach from a legal span.
+    let illegal = (RECORDS_SPAN_MAX + 1..=RECORDS_SPAN_MAX + 512).chain(
+        (RECORDS_SPAN_MAX as u32 + 1..=u16::MAX as u32)
+            .step_by(97)
+            .map(|n| n as u16),
+    );
+    for span in illegal {
         let mut slot = [0u8; RECORDS_ROW_SIZE];
         // Encode a legal row, then rewrite the span byte and re-checksum
         // by hand so the slot is impeccable except for that one field.
@@ -228,9 +237,10 @@ fn both_codecs_refuse_a_span_the_format_does_not_define() {
             b"................",
             &mut slot,
         );
-        slot[RECORDS_SPAN_OFFSET] = span as u8;
-        let crc = crc32_ieee(&slot[0..RECORDS_SPAN_OFFSET + 1]);
-        slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
+        slot[RECORDS_SPAN_OFFSET..RECORDS_SPAN_OFFSET + RECORDS_SPAN_WIDTH]
+            .copy_from_slice(&span.to_le_bytes());
+        let crc = crc32_ieee(&slot[0..RECORDS_CRC_OFFSET]);
+        slot[RECORDS_CRC_OFFSET..RECORDS_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
         assert_eq!(
             decode_records_row(&slot),

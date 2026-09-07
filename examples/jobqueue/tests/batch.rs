@@ -3,7 +3,7 @@
 //! answer — now including the ones raised by values that span several row
 //! slots.
 
-use dabqlite::{Db, Error, Op, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
+use dabqlite::{Db, Error, Op, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN};
 use jobqueue::slot_cost;
 
 fn v(s: &str) -> Value {
@@ -164,63 +164,80 @@ fn the_cap_is_row_slots_and_the_refusal_names_them() {
         "a too-long batch is not a full database: {e}"
     );
 
-    // And TWO operations can be too long, if they are long enough: a batch
-    // is bounded by bytes/16, not by op count.
-    let e = db
-        .batch(&[Op::put(2000, bytes(1040)), Op::put(2001, bytes(1040))])
-        .unwrap_err();
+    // And a HANDFUL of operations can be too long, if they are long
+    // enough: a batch is bounded by bytes/16, not by op count. Nine
+    // maximum-length values is one more than a commit holds.
+    let big = bytes(MAX_VALUE_LEN);
+    let per_op = slot_cost(MAX_VALUE_LEN);
+    let over = MAX_COMMIT_ROWS / per_op + 1;
+    let ops: Vec<Op> = (0..over as u64)
+        .map(|i| Op::put(2000 + i, big.clone()))
+        .collect();
+    let e = db.batch(&ops).unwrap_err();
     match e {
         Error::BatchRejected { cause, .. } => assert_eq!(
             *cause,
             Error::BatchTooLong {
-                rows: 130,
+                rows: over * per_op,
                 max: MAX_COMMIT_ROWS
             },
-            "two ops, 130 slots"
+            "{over} ops, {} slots",
+            over * per_op
         ),
         other => panic!("expected BatchRejected, got {other:?}"),
     }
 }
 
-/// The ceiling and the atomicity guarantee cannot be used together.
+/// The ceiling and the atomicity guarantee compose. They did not always.
 ///
-/// A `MAX_VALUE_LEN` value is exactly `MAX_COMMIT_ROWS` slots, so it fills a
-/// commit by itself. It can be written — alone. It can NEVER be written in
-/// the same commit as anything else, not even a one-slot bookkeeping row.
-/// Any application that keeps an invariant across two rows (this one keeps
-/// two) therefore has a real value ceiling of `MAX_VALUE_LEN - VALUE_LEN`,
-/// which the library never mentions.
+/// `MAX_VALUE_LEN` used to be exactly `MAX_COMMIT_ROWS` slots, so the
+/// longest value filled a commit by itself. It could be written — alone.
+/// It could NEVER be written in the same commit as anything else, not even
+/// a one-slot bookkeeping row, so any application keeping an invariant
+/// across two rows (this one keeps two) had a real value ceiling of
+/// `MAX_VALUE_LEN - VALUE_LEN` that the library never mentioned. The two
+/// limits are now separate numbers: a commit holds eight of the longest
+/// value, so the ceiling is usable with the guarantee still on.
 #[test]
-fn a_maximum_length_value_cannot_share_a_commit_with_anything() {
+fn a_maximum_length_value_shares_a_commit_with_the_row_that_names_it() {
     let mut db = Db::in_memory_with(65_536).unwrap();
     let biggest = bytes(MAX_VALUE_LEN);
-    assert_eq!(slot_cost(MAX_VALUE_LEN), MAX_COMMIT_ROWS);
+    let per_value = slot_cost(MAX_VALUE_LEN);
+    assert!(
+        per_value < MAX_COMMIT_ROWS,
+        "the longest value must leave room beside it: {per_value} of {MAX_COMMIT_ROWS}"
+    );
 
     db.batch(&[Op::put(1, biggest.clone())]).unwrap();
     assert_eq!(db.get(1).unwrap().unwrap().len(), MAX_VALUE_LEN);
 
-    let e = db
-        .batch(&[Op::put(2, biggest.clone()), Op::put(3, v("bookkeeping"))])
-        .unwrap_err();
-    match e {
+    // The pair that used to be impossible.
+    db.batch(&[Op::put(2, biggest.clone()), Op::put(3, v("bookkeeping"))])
+        .expect("the longest value and its bookkeeping row, atomically");
+    assert_eq!(db.get(2).unwrap().unwrap().len(), MAX_VALUE_LEN);
+    assert_eq!(db.get(3).unwrap().unwrap().text(), "bookkeeping");
+
+    // The bound that IS still real: a commit's worth of slots. Fill it
+    // exactly, then exceed it by one value and be refused whole.
+    let fits = MAX_COMMIT_ROWS / per_value;
+    let ops: Vec<Op> = (0..fits as u64)
+        .map(|i| Op::put(100 + i, biggest.clone()))
+        .collect();
+    db.batch(&ops).expect("a commit's worth of longest values");
+    let ops: Vec<Op> = (0..=fits as u64)
+        .map(|i| Op::put(200 + i, biggest.clone()))
+        .collect();
+    match db.batch(&ops).unwrap_err() {
         Error::BatchRejected { cause, .. } => assert_eq!(
             *cause,
             Error::BatchTooLong {
-                rows: MAX_COMMIT_ROWS + 1,
+                rows: (fits + 1) * per_value,
                 max: MAX_COMMIT_ROWS
             }
         ),
         other => panic!("expected BatchRejected, got {other:?}"),
     }
-    assert_eq!(db.get(2).unwrap(), None, "nothing from the refused batch");
-
-    // One slot short of the ceiling, and the pair fits.
-    db.batch(&[
-        Op::put(2, bytes(MAX_VALUE_LEN - VALUE_LEN)),
-        Op::put(3, v("bookkeeping")),
-    ])
-    .unwrap();
-    assert_eq!(db.get(3).unwrap().unwrap().text(), "bookkeeping");
+    assert_eq!(db.get(200).unwrap(), None, "nothing from the refused batch");
 }
 
 /// Exactness, which is the whole point of the new `Value`: what goes in

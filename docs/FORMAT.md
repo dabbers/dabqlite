@@ -13,25 +13,25 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-7ac9964eb9cd3119.dabq` | row slots for `records` under the current schema |
-| `rows-8153d1c75e5f8249.dabq` | row slots under the legacy schema (inert once migrated) |
+| `rows-649973635a2664c3.dabq` | row slots for `records` under the current schema |
+| `rows-38ff1170401353ba.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
 Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0x7AC9964EB9CD3119`)
+## Row slot (32 bytes, table `records`, schema hash `0x649973635A2664C3`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
 | 0 | 8 | `id` (primary key) | u64, little-endian |
 | 8 | 16 | `value` | 16 raw bytes, fixed width |
 | 24 | 1 | kind | 0 = record, 1 = tombstone, 2 = update |
-| 25 | 1 | span | rows still to come in the same commit (0..=127) |
-| 26 | 1 | len | bytes this row carries (0..=16), plus `0x80` when the value continues into the next row |
-| 27 | 4 | crc32 | IEEE, over bytes 0..27 |
-| 31 | 1 | padding | must be zero (validated on decode: no dead bytes) |
+| 25 | 2 | span | u16 LE, rows still to come in the same commit (0..=1023) |
+| 27 | 1 | len | bytes this row carries (0..=16), plus `0x80` when the value continues into the next row |
+| 28 | 4 | crc32 | IEEE, over bytes 0..28 |
+| 32 | 0 | padding | must be zero (validated on decode: no dead bytes) |
 
 A slot decodes only if the checksum matches AND the padding is zero —
 every byte of a committed row is covered by verification.
@@ -52,7 +52,7 @@ all three impossible to miss.
 | 0 | 8 | magic | `"DABQSB02"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0x7AC9964EB9CD3119` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0x649973635A2664C3` for this schema) |
 | 32 | 8 | capacity | u64 LE, the row capacity this database was created with |
 | 40 | 4 | crc32 | IEEE, over bytes 0..40 |
 | 44 | 20 | padding | must be zero (validated) |
@@ -97,7 +97,7 @@ and 1 with span 0 and claim sizes 1 and 2 — so it means an
 acknowledged commit was rolled back by storage that lied about an
 fsync, and the open reports that loudly.
 
-## Migration (schema `0x8153D1C75E5F8249` → `0x7AC9964EB9CD3119`)
+## Migration (schema `0x38FF1170401353BA` → `0x649973635A2664C3`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to
