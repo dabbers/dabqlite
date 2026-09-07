@@ -10,7 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dabqlite_core::{BatchOp, Capacities, DbError, Input, Output, MAX_VALUE_LEN, VALUE_LEN};
+use dabqlite_core::{
+    BatchOp, Capacities, DbError, FileId, Input, Output, MAX_VALUE_LEN, VALUE_LEN,
+};
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{Driven, SimDisk, SimHost};
 
@@ -313,4 +315,223 @@ fn value_pages_are_bounded_and_the_cursor_advances() {
     }
     assert_eq!(seen, 60);
     assert!(pages >= 8, "60 rows cannot be one page");
+}
+
+/// **Two valid superblock copies of one generation, disagreeing.**
+///
+/// They are written from a single encoding, so they should be
+/// byte-identical. They are not always. A commit at generation g whose
+/// superblock writes were torn is never acknowledged, so the next
+/// incarnation legitimately re-uses g for a DIFFERENT commit — and a
+/// second torn write over the first one's remains can reassemble the
+/// earlier image byte for byte, checksum and all. Not a checksum
+/// collision: a real superblock from a real commit, resurrected.
+///
+/// The soak found it after 443 lifetimes. Generation 66 appeared twice,
+/// naming 150 rows and 152, with a four-slot value living at rows
+/// 148..151 — so electing the smaller cut that value in half and a strict
+/// open refused a database that had nothing wrong with it.
+///
+/// Reproduced directly here, because a bug that took 443 random lifetimes
+/// to find will not be caught again by luck.
+#[test]
+fn a_resurrected_superblock_does_not_cut_a_commit_in_half() {
+    use dabqlite_core::layout::{decode_sb, encode_sb, SB_COPIES, SB_COPY_SIZE};
+
+    let mut host = fresh();
+    let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for i in 0..4u64 {
+        let v = keyed(&format!("k{i}/"), 2);
+        put(&mut host, i, &v);
+        model.insert(i, v);
+    }
+    let short_at = host.engine.usage().0;
+    // A commit of one value four slots wide, so a manifest that stops
+    // inside it names half a commit.
+    let wide = keyed("wide/", VALUE_LEN * 3);
+    put(&mut host, 99, &wide);
+    model.insert(99, wide);
+    let full_at = host.engine.usage().0;
+    assert_eq!(full_at, short_at + 4, "the commit must be four slots wide");
+
+    // Forge the ghost: the CURRENT generation, but naming the row count
+    // as it was before that commit — exactly the shape a resurrected
+    // copy from a re-used generation has. It goes in the same pair, over
+    // one of the two live copies.
+    let mut disk = std::mem::take(&mut host.disk);
+    let sb = disk.contents(FileId::Superblock);
+    let live = (0..SB_COPIES)
+        .filter_map(|i| decode_sb(&sb[i * SB_COPY_SIZE..(i + 1) * SB_COPY_SIZE]).ok())
+        .max_by_key(|c| c.generation)
+        .expect("a valid superblock");
+    assert_eq!(live.row_count, full_at);
+    let mut ghost = [0u8; SB_COPY_SIZE];
+    encode_sb(live.generation, short_at, live.capacity, &mut ghost);
+    // Whichever slot of the pair holds the live copy first: overwrite it,
+    // so the ghost is the one an election scanning in slot order meets.
+    let slot = (0..SB_COPIES)
+        .find(|i| decode_sb(&sb[i * SB_COPY_SIZE..(i + 1) * SB_COPY_SIZE]).is_ok_and(|c| c == live))
+        .expect("the live copy is in a slot");
+    disk.overwrite_at_rest(FileId::Superblock, (slot * SB_COPY_SIZE) as u64, &ghost);
+
+    // The inspector — the independent implementation of these rules —
+    // must reject the ghost too, and it is asked FIRST, on the forged
+    // disk, before recovery repairs the pair. A forensics tool that
+    // called this database corrupt while recovery reads it fine would
+    // send an operator to a rebuild they do not need.
+    let report = dabqlite_core::inspect::inspect(
+        &disk.contents(FileId::Superblock),
+        &disk.contents(FileId::Rows),
+    );
+    assert_eq!(
+        report.verdict,
+        dabqlite_core::inspect::Verdict::Recovers { rows: full_at },
+        "{report:#?}"
+    );
+    assert_eq!(report.live.expect("a live copy").row_count, full_at);
+
+    // Strict open: the ghost must not be believed.
+    let mut host = SimHost::new(CAPS, disk, None);
+    match host.open() {
+        Driven::Done(Output::OpenDone { result: Ok(n) }) => {
+            assert_eq!(n, model.len() as u64, "every row must still be there")
+        }
+        other => panic!("a resurrected superblock must not brick the database: {other:?}"),
+    }
+    assert_eq!(host.engine.usage().0, full_at, "the whole commit is live");
+    assert_eq!(host.value_all(b"", b""), oracle(&model, b"", b""));
+    assert_eq!(
+        host.get_bytes(99).as_deref(),
+        model.get(&99).map(|v| v.as_slice()),
+        "the wide value came back whole"
+    );
+
+    // And after recovery has repaired the pair, the ghost is gone for
+    // good rather than waiting to be elected by the next open.
+    let after = dabqlite_core::inspect::inspect(
+        &host.disk.contents(FileId::Superblock),
+        &host.disk.contents(FileId::Rows),
+    );
+    assert_eq!(
+        after.verdict,
+        dabqlite_core::inspect::Verdict::Recovers { rows: full_at },
+        "{after:#?}"
+    );
+    for st in &after.slots {
+        if let dabqlite_core::inspect::SlotState::Valid {
+            generation,
+            row_count,
+            ..
+        } = st
+        {
+            assert!(
+                *generation != live.generation || *row_count == full_at,
+                "a ghost copy of generation {generation} survived the repair"
+            );
+        }
+    }
+}
+
+/// **Recovery must not leave a database in a state its own next open
+/// judges differently.**
+///
+/// A ghost at a HIGHER generation than the manifest recovery chooses is
+/// the sharp case. Recovery passes over the ghost (it names half a
+/// commit), picks an older manifest, and truncates the residue — and the
+/// truncation is what makes the ghost dangerous: it now names rows the
+/// file no longer has, which is no longer recognisable as a ghost and
+/// looks instead like a manifest whose data vanished. The next open would
+/// then refuse a database this one just read.
+///
+/// So recovery zeroes it. Two opens in a row must reach the same answer,
+/// and the inspector must reach it too.
+#[test]
+fn a_ghost_from_a_later_generation_is_cleared_rather_than_left_to_confuse() {
+    use dabqlite_core::layout::{decode_sb, encode_sb, SB_COPIES, SB_COPY_SIZE};
+
+    let mut host = fresh();
+    let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for i in 0..4u64 {
+        let v = keyed(&format!("g{i}/"), 2);
+        put(&mut host, i, &v);
+        model.insert(i, v);
+    }
+    let committed = host.engine.usage().0;
+    // Residue: a wide commit whose superblock never lands, so these rows
+    // are past the manifest.
+    let wide = keyed("wide/", VALUE_LEN * 3);
+    let slots = (wide.len().div_ceil(VALUE_LEN)) as u64;
+    // Die after every row of the commit has been written and fsynced, but
+    // before the superblock names them: a COMPLETE commit that is still
+    // residue, which is what makes a manifest pointing into it a ghost
+    // rather than merely damage.
+    host.crash_after = Some(host.io_count + slots + 1);
+    assert!(matches!(
+        host.batch(&[BatchOp::Put {
+            id: 99,
+            value: &wide
+        }]),
+        Driven::Crashed
+    ));
+    let mut disk = std::mem::take(&mut host.disk);
+    // Keep every byte that reached the cache: the residue must be REAL,
+    // so that a manifest naming part of it is a genuine ghost.
+    disk.fsync(FileId::Rows);
+    disk.fsync(FileId::Superblock);
+    let rows_now = disk.len(FileId::Rows) / 32;
+    assert_eq!(rows_now, committed + slots, "the whole commit is residue");
+
+    // Forge a ghost at a HIGHER generation naming a row count that lands
+    // inside the residue commit — the shape a resurrected superblock has.
+    let sb = disk.contents(FileId::Superblock);
+    let live = (0..SB_COPIES)
+        .filter_map(|i| decode_sb(&sb[i * SB_COPY_SIZE..(i + 1) * SB_COPY_SIZE]).ok())
+        .max_by_key(|c| c.generation)
+        .expect("a valid superblock");
+    let ghost_gen = live.generation + 1;
+    let mut ghost = [0u8; SB_COPY_SIZE];
+    encode_sb(ghost_gen, committed + 1, live.capacity, &mut ghost);
+    // Its home pair, so it is not dismissed as a misdirected write.
+    let slot = (ghost_gen % 2) as usize * 2;
+    disk.overwrite_at_rest(FileId::Superblock, (slot * SB_COPY_SIZE) as u64, &ghost);
+
+    // First open: the ghost is passed over, the real manifest wins.
+    let mut host = SimHost::new(CAPS, disk, None);
+    match host.open() {
+        Driven::Done(Output::OpenDone { result: Ok(n) }) => assert_eq!(n, model.len() as u64),
+        other => panic!("the ghost must not brick the database: {other:?}"),
+    }
+    assert_eq!(host.engine.usage().0, committed);
+    assert_eq!(host.value_all(b"", b""), oracle(&model, b"", b""));
+
+    // The ghost is GONE, not merely ignored.
+    let sb = host.disk.contents(FileId::Superblock);
+    for i in 0..SB_COPIES {
+        if let Ok(c) = decode_sb(&sb[i * SB_COPY_SIZE..(i + 1) * SB_COPY_SIZE]) {
+            assert!(
+                c.generation <= live.generation,
+                "slot {i} still holds generation {}",
+                c.generation
+            );
+        }
+    }
+
+    // And the second open agrees with the first — which is the property
+    // the clearing exists for.
+    let disk = std::mem::take(&mut host.disk);
+    let report = dabqlite_core::inspect::inspect(
+        &disk.contents(FileId::Superblock),
+        &disk.contents(FileId::Rows),
+    );
+    assert_eq!(
+        report.verdict,
+        dabqlite_core::inspect::Verdict::Recovers { rows: committed },
+        "{report:#?}"
+    );
+    let mut again = SimHost::new(CAPS, disk, None);
+    match again.open() {
+        Driven::Done(Output::OpenDone { result: Ok(n) }) => assert_eq!(n, model.len() as u64),
+        other => panic!("the second open disagreed with the first: {other:?}"),
+    }
+    assert_eq!(again.value_all(b"", b""), oracle(&model, b"", b""));
 }

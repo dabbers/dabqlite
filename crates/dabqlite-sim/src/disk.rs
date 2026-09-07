@@ -327,6 +327,28 @@ impl SimDisk {
         f.current = f.durable.clone();
     }
 
+    /// Overwrite bytes in the durable image directly, modelling a
+    /// resurrected superblock copy — one a sequence of torn writes
+    /// reassembled from an earlier incarnation. `corrupt` cannot express
+    /// it: the result is not damage, it is a perfectly valid image of a
+    /// state that used to be real, which is exactly what makes it
+    /// dangerous.
+    ///
+    /// Call on a quiescent disk, like `corrupt`.
+    pub fn overwrite_at_rest(&mut self, id: FileId, offset: u64, bytes: &[u8]) {
+        let f = self.file_mut(id);
+        assert!(
+            f.unsynced.is_empty(),
+            "overwrite_at_rest models the state a restart finds; settle or fsync first"
+        );
+        assert!(
+            offset as usize + bytes.len() <= f.durable.len(),
+            "overwriting past EOF"
+        );
+        f.durable[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+        f.current = f.durable.clone();
+    }
+
     /// At-rest truncation: the tail of the file is gone (lost extent,
     /// filesystem repair, backup/restore of a shorter version).
     pub fn truncate_at_rest(&mut self, id: FileId, new_len: u64) {

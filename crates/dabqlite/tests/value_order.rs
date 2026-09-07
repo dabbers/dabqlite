@@ -405,3 +405,97 @@ fn a_batch_lands_in_the_value_order_all_at_once() {
     assert!(err.is_err(), "duplicate insert must be refused");
     assert_eq!(db.range_by_value(b"", b"").unwrap().len(), 3);
 }
+
+/// **Many rows sharing one value must ALL come back, however the tree is
+/// shaped.**
+///
+/// A B+tree routes right at equality, straight to the single leaf that
+/// owns the separator's key. That is correct exactly when at most one
+/// stored key can compare equal to the search bound — true of the
+/// `u64` index, false here: the probe compares VALUE BYTES while the keys
+/// are (value, id, row), so many keys compare equal to a byte bound and
+/// sit on both sides of a separator. Routing right then skipped every one
+/// of them in the left subtree.
+///
+/// The soak found it with three live rows holding an empty value, of
+/// which a scan returned one. This is that, at enough sizes to push the
+/// equal keys across several separators at every tree depth.
+#[test]
+fn a_bound_that_many_rows_share_returns_all_of_them() {
+    for n in [1u64, 2, 5, 9, 17, 33, 64, 129] {
+        let mut empties = db(4096);
+        // Every row holds the SAME value, so every key compares equal to
+        // the bound and the tree cannot use the bytes to separate them.
+        for id in 0..n {
+            empties.put(id, Value::from_bytes(b"").unwrap()).unwrap();
+        }
+        let got = got(empties.range_by_value(b"", b"").unwrap());
+        assert_eq!(got.len() as u64, n, "empty values, n={n}");
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            (0..n).collect::<Vec<_>>(),
+            "n={n}: equal values come back in id order"
+        );
+        // The same, for a non-empty shared value and a bound equal to it.
+        let mut shared = db(4096);
+        for id in 0..n {
+            shared.put(id, Value::from_bytes(b"same").unwrap()).unwrap();
+        }
+        for bound in [&b""[..], b"s", b"sam", b"same"] {
+            assert_eq!(
+                shared.range_by_value(bound, b"").unwrap().len() as u64,
+                n,
+                "n={n} bound={:?}",
+                String::from_utf8_lossy(bound)
+            );
+        }
+        // And descending, which reaches the same entries the other way.
+        assert_eq!(
+            shared.range_by_value_rev(b"same", b"same").unwrap().len() as u64,
+            n,
+            "n={n} descending"
+        );
+    }
+}
+
+/// A mixed database where the shared-value rows are neither the smallest
+/// nor the largest, so the bound lands in the MIDDLE of the tree and the
+/// equal run straddles separators on both sides.
+#[test]
+fn a_shared_value_in_the_middle_of_the_order_is_not_split_by_a_separator() {
+    let mut db = db(4096);
+    let mut id = 0u64;
+    for i in 0..40u64 {
+        db.put(
+            id,
+            Value::from_vec(format!("aaa{i:03}").into_bytes()).unwrap(),
+        )
+        .unwrap();
+        id += 1;
+    }
+    let shared: Vec<u64> = (0..40)
+        .map(|_| {
+            let k = id;
+            db.put(k, Value::from_bytes(b"mmm").unwrap()).unwrap();
+            id += 1;
+            k
+        })
+        .collect();
+    for i in 0..40u64 {
+        db.put(
+            id,
+            Value::from_vec(format!("zzz{i:03}").into_bytes()).unwrap(),
+        )
+        .unwrap();
+        id += 1;
+    }
+    let hits = got(db.range_by_value(b"mmm", b"mmm").unwrap());
+    assert_eq!(
+        hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        shared,
+        "the whole equal run, in id order"
+    );
+    assert_eq!(db.range_by_value(b"", b"").unwrap().len(), 120);
+    assert_eq!(db.range_by_value_rev(b"", b"").unwrap().len(), 120);
+    assert_eq!(db.prefix(b"mmm").unwrap().len(), 40);
+}

@@ -739,6 +739,28 @@ enum State {
         /// The pair-relative index (0 or 1) of the twin being repaired.
         copy: u8,
     },
+    /// Recovery: zeroing a superblock slot that holds a manifest this
+    /// open PROVED to be a ghost — a resurrected copy from an earlier
+    /// incarnation that re-used the generation number.
+    ///
+    /// It has to go, and this is why. Recovery truncates the residue past
+    /// the manifest it chose. A ghost naming MORE rows than that then
+    /// stops being recognisable as a ghost and starts looking like a
+    /// manifest whose rows have vanished — so the next open reads the
+    /// same bytes and reaches a different, worse conclusion than this one
+    /// did. Recovery is not allowed to leave a database in a state its
+    /// own next open judges differently.
+    ///
+    /// Zeroed rather than rewritten: a slot of zeros fails its magic and
+    /// its checksum, so it is simply "nothing here", which is the truth.
+    /// Only slots outside the chosen generation's home pair are cleared —
+    /// inside it, the twin repair already writes the right thing.
+    RecoverClearSb {
+        generation: u64,
+        row_count: u64,
+        /// Absolute slot index being zeroed.
+        slot: u8,
+    },
     /// Recovery: superblock fsync in flight (see `RecoverFsyncRows`).
     RecoverFsyncSb { generation: u64, row_count: u64 },
     /// Open and idle.
@@ -851,10 +873,23 @@ pub struct Engine {
     /// True when those rows cannot all have come from one interrupted
     /// commit. See [`scan_orphans`].
     orphan_rollback: bool,
+    /// Recovery scratch: every superblock copy this open decoded, by
+    /// SLOT — `None` for one that failed its checksum or landed in a
+    /// foreign slot. Kept past the superblock read so the choice between
+    /// candidate manifests can be finished once the rows are in hand.
+    sb_slots: [Option<crate::layout::SbCopy>; SB_COPIES],
+    /// Recovery scratch: candidate slots in preference order (generation
+    /// descending, then row count descending), duplicates removed.
+    sb_order: [u8; SB_COPIES],
+    sb_order_len: u8,
     /// Recovery scratch: the chosen generation's twin slot needs repair
     /// (pair-relative copy index). Set while reading the superblock,
     /// consumed when staging the recovery fsyncs.
     pending_repair: Option<u8>,
+    /// Recovery scratch: bitmask of superblock slots holding a PROVEN
+    /// ghost manifest, to be zeroed before the recovery fsync. See
+    /// [`State::RecoverClearSb`].
+    clear_slots: u8,
     /// Row-slot arena: one allocation at init, never grown (§4.2).
     arena: Vec<u8>,
     /// Open-addressing primary-key index: slot -> row index + 1 (0 = empty).
@@ -1073,7 +1108,11 @@ impl Engine {
             opened_rows_len: 0,
             orphan_valid_rows: 0,
             orphan_rollback: false,
+            sb_slots: [None; SB_COPIES],
+            sb_order: [0; SB_COPIES],
+            sb_order_len: 0,
             pending_repair: None,
+            clear_slots: 0,
             pending_delete: None,
             pending_update: None,
             batch: batch_staging,
@@ -1490,6 +1529,39 @@ impl Engine {
         }
     }
 
+    /// Zero one superblock slot. See [`State::RecoverClearSb`].
+    fn sb_slot_clear(slot: u8) -> Output {
+        let bytes = [0u8; SB_COPY_SIZE];
+        Output::Write {
+            file: FileId::Superblock,
+            offset: slot as u64 * SB_COPY_SIZE as u64,
+            data: WriteBuf::from_slice(&bytes),
+        }
+    }
+
+    /// The next superblock write recovery still owes, or the final fsync
+    /// when it owes none. One place, so the repair and the ghost-clearing
+    /// cannot get out of step with each other.
+    fn next_sb_fixup(&mut self, generation: u64, row_count: u64) -> Output {
+        if self.clear_slots != 0 {
+            let slot = self.clear_slots.trailing_zeros() as u8;
+            self.clear_slots &= !(1u8 << slot);
+            self.state = State::RecoverClearSb {
+                generation,
+                row_count,
+                slot,
+            };
+            return Self::sb_slot_clear(slot);
+        }
+        self.state = State::RecoverFsyncSb {
+            generation,
+            row_count,
+        };
+        Output::Fsync {
+            file: FileId::Superblock,
+        }
+    }
+
     fn stage_initial_superblock(&mut self) -> Output {
         self.state = State::InitWriteSb { copy: 0 };
         Self::sb_copy_write(1, 0, self.caps.rows, 0)
@@ -1621,10 +1693,31 @@ impl Engine {
     }
 
     fn recover_from_sb(&mut self, data: &[u8]) -> Output {
-        // Read all copies, take the highest generation with a valid
-        // checksum (docs/DESIGN.md §4.4).
-        let mut best: Option<(u8, crate::layout::SbCopy)> = None;
+        // Read every copy and RANK them (docs/DESIGN.md §4.4). Highest
+        // generation first, and — this is the part that used to be a
+        // tie-break by slot number — within one generation the copy
+        // naming the MOST rows.
+        //
+        // Two valid copies of the same generation should be impossible:
+        // they are written from one encoding, so they are byte-identical.
+        // They are not impossible. A commit at generation g whose
+        // superblock writes were torn is never acknowledged, so the next
+        // incarnation legitimately re-uses g for a DIFFERENT commit — and
+        // a second torn write over the first one's remains can reassemble
+        // the earlier image byte for byte, checksum and all. That is not
+        // a checksum collision; it is a real superblock from a real
+        // commit, resurrected. The soak found it after 443 lifetimes: two
+        // valid copies at generation 66, one naming 150 rows and one 152,
+        // with a four-slot value living at rows 148..151 — so electing
+        // the smaller one cut that value in half and a strict open
+        // refused a database nothing was actually wrong with.
+        //
+        // So a single winner is not enough. Every distinct candidate is
+        // kept, and the choice is finished once the rows have been read
+        // and can be asked which manifest they agree with.
         let mut schema_mismatch: Option<u64> = None;
+        self.sb_slots = [None; SB_COPIES];
+        self.sb_order_len = 0;
         for slot in 0..SB_COPIES {
             let Some(chunk) = data.get(slot * SB_COPY_SIZE..(slot + 1) * SB_COPY_SIZE) else {
                 break; // short file: remaining slots were never written
@@ -1640,8 +1733,15 @@ impl Engine {
                     if !Self::sb_slots_for(copy.generation).contains(&(slot as u8)) {
                         continue;
                     }
-                    if best.is_none_or(|(_, b)| copy.generation > b.generation) {
-                        best = Some((slot as u8, copy));
+                    self.sb_slots[slot] = Some(copy);
+                    // Identical copies carry no new information; only
+                    // DISTINCT manifests are candidates.
+                    let seen = self.sb_order[..self.sb_order_len as usize]
+                        .iter()
+                        .any(|&s| self.sb_slots[s as usize] == Some(copy));
+                    if !seen {
+                        self.sb_order[self.sb_order_len as usize] = slot as u8;
+                        self.sb_order_len += 1;
                     }
                 }
                 Err(SbDecodeError::SchemaMismatch { file_schema }) => {
@@ -1650,29 +1750,20 @@ impl Engine {
                 Err(SbDecodeError::Invalid) => {}
             }
         }
+        let n = self.sb_order_len as usize;
+        let slots = self.sb_slots;
+        self.sb_order[..n].sort_unstable_by(|&a, &b| {
+            let (a, b) = (
+                slots[a as usize].expect("ranked"),
+                slots[b as usize].expect("ranked"),
+            );
+            b.generation
+                .cmp(&a.generation)
+                .then(b.row_count.cmp(&a.row_count))
+        });
+        let best = (n > 0).then(|| self.sb_slots[self.sb_order[0] as usize].expect("ranked"));
 
-        // Twin-repair decision, made from THIS read: for the chosen
-        // generation's home pair, any slot that does not already hold a
-        // canonical copy of exactly (generation, row_count) gets rewritten
-        // before the recovery fsync — but the slot the generation was
-        // recovered FROM is valid by construction and is NEVER touched.
-        self.pending_repair = None;
-        if let Some((_, chosen)) = best {
-            let slots = Self::sb_slots_for(chosen.generation);
-            for (pair_idx, &slot) in slots.iter().enumerate() {
-                let healthy = data
-                    .get(slot as usize * SB_COPY_SIZE..(slot as usize + 1) * SB_COPY_SIZE)
-                    .and_then(|chunk| decode_sb(chunk).ok())
-                    .is_some_and(|c| {
-                        c.generation == chosen.generation && c.row_count == chosen.row_count
-                    });
-                if !healthy {
-                    self.pending_repair = Some(pair_idx as u8);
-                }
-            }
-        }
-
-        let Some((_slot, copy)) = best else {
+        let Some(copy) = best else {
             if let Some(file_schema) = schema_mismatch {
                 return self.fail_open(DbError::SchemaMismatch {
                     file_schema,
@@ -1695,23 +1786,8 @@ impl Engine {
         // engine's own capacity is, so a caller can see that it opened a
         // database smaller (or larger) than the one that was written.
         self.file_capacity = copy.capacity;
-        if copy.row_count > self.caps.rows {
-            return self.fail_open(DbError::CapacityBelowData {
-                required: copy.row_count,
-                configured: self.caps.rows,
-            });
-        }
-        // The commit protocol fsyncs row slots before the superblock that
-        // references them, so committed rows must all be on disk.
-        if copy
-            .row_count
-            .checked_mul(ROW_SIZE as u64)
-            .expect("checked at open")
-            > self.opened_rows_len
-        {
-            return self.fail_open(DbError::Corrupt {
-                what: "superblock references rows beyond the rows file",
-            });
+        if let Some(err) = self.manifest_fits(&copy) {
+            return self.fail_open(err);
         }
 
         // Read the committed rows AND everything beyond them, up to the
@@ -1722,6 +1798,7 @@ impl Engine {
         let scan_len = self.opened_rows_len.min(self.caps.rows * ROW_SIZE as u64);
         if scan_len == 0 {
             debug_assert_eq!(copy.row_count, 0, "checked against rows_len above");
+            self.stage_repair(&copy);
             self.stage_recovery_fsyncs(copy.generation, 0)
         } else {
             self.state = State::RecoverReadRows {
@@ -1750,6 +1827,11 @@ impl Engine {
         // truncate it must not perform and fail-stop on the spot — and the
         // evidence of that interrupted commit survives being LOOKED at.
         // An alarm a monitoring probe silently disarms is not an alarm.
+        if self.salvage {
+            // A salvage open changes nothing at all — no truncate, and no
+            // ghost clearing either.
+            self.clear_slots = 0;
+        }
         if self.opened_rows_len > live && !self.salvage {
             self.state = State::RecoverTruncateRows {
                 generation,
@@ -1790,8 +1872,150 @@ impl Engine {
         }
     }
 
-    fn recover_from_rows(&mut self, generation: u64, row_count: u64, data: &[u8]) -> Output {
-        self.replay_rows(false, 0, generation, row_count, data)
+    /// Does this manifest fit — in the arena, and in the rows file?
+    ///
+    /// Both failures mean bytes that WERE fsynced are gone, which is
+    /// outside the design's budget. Neither is a reason to fall back to
+    /// an older manifest: that would answer "some of your data vanished"
+    /// by quietly serving less of it.
+    fn manifest_fits(&self, copy: &crate::layout::SbCopy) -> Option<DbError> {
+        if copy.row_count > self.caps.rows {
+            return Some(DbError::CapacityBelowData {
+                required: copy.row_count,
+                configured: self.caps.rows,
+            });
+        }
+        // The commit protocol fsyncs row slots before the superblock that
+        // references them, so committed rows must all be on disk.
+        if copy
+            .row_count
+            .checked_mul(ROW_SIZE as u64)
+            .expect("checked at open")
+            > self.opened_rows_len
+        {
+            return Some(DbError::Corrupt {
+                what: "superblock references rows beyond the rows file",
+            });
+        }
+        None
+    }
+
+    /// Is this manifest PROVABLY not one this engine wrote for this file?
+    ///
+    /// The span field on a row says how many rows of its own commit are
+    /// still to come, so the last row a real manifest names always has
+    /// span zero: manifests are written at commit boundaries, one per
+    /// commit. A manifest whose last row still promises `span` more rows
+    /// of the same commit names HALF a commit.
+    ///
+    /// That alone is not proof, and the difference matters more than
+    /// anything else in this function. A damaged row can say anything.
+    /// The proof is that the rest of the commit is ACTUALLY THERE: the
+    /// file continues for at least `span` rows past the manifest, which
+    /// is what it would look like if this manifest were a resurrected
+    /// superblock from an earlier incarnation and a later, longer commit
+    /// had since been written over those rows.
+    ///
+    /// Everything else — a last row that will not decode, a stranded
+    /// continuation with nothing after it, a file that simply ends — is
+    /// DAMAGE, is not a ghost, and must never cause a fallback. Answering
+    /// "your newest row is corrupt" by serving the database without it
+    /// would be data loss wearing recovery's clothes.
+    fn is_ghost_manifest(&self, row_count: u64, data: &[u8]) -> bool {
+        if row_count == 0 {
+            return false;
+        }
+        let off = ((row_count - 1) as usize) * ROW_SIZE;
+        let Some(chunk) = data.get(off..off + ROW_SIZE) else {
+            return false;
+        };
+        let Some(last) = decode_row(chunk) else {
+            return false;
+        };
+        if last.span == 0 {
+            return false; // a clean commit boundary, whatever else is wrong
+        }
+        // The rest of the commit has to be present for this to be proof
+        // rather than suspicion.
+        let needed = (row_count + last.span as u64) as usize * ROW_SIZE;
+        needed <= data.len()
+    }
+
+    /// Mark whichever slots of the chosen generation's home pair do not
+    /// already hold it, so recovery rewrites them before its fsync.
+    ///
+    /// The slot a manifest was recovered FROM is valid by construction and
+    /// is never touched.
+    fn stage_repair(&mut self, chosen: &crate::layout::SbCopy) {
+        self.pending_repair = None;
+        for (pair_idx, &slot) in Self::sb_slots_for(chosen.generation).iter().enumerate() {
+            if self.sb_slots[slot as usize] != Some(*chosen) {
+                self.pending_repair = Some(pair_idx as u8);
+            }
+        }
+    }
+
+    fn recover_from_rows(&mut self, _generation: u64, _row_count: u64, data: &[u8]) -> Output {
+        // Finish the election now that the rows can be consulted. Ranked
+        // order is generation then row count, so the first candidate that
+        // both fits and lands on a commit boundary is the most data this
+        // file can honestly be said to hold.
+        let n = self.sb_order_len as usize;
+        let top = self.sb_slots[self.sb_order[0] as usize].expect("ranked");
+        let mut copy = top;
+        let mut ghosts = 0u8;
+        for i in 0..n {
+            let slot = self.sb_order[i];
+            let c = self.sb_slots[slot as usize].expect("ranked");
+            // Candidates at LOWER generations are alternatives too, and
+            // only because "ghost" means PROVEN. A manifest that names
+            // half a commit was not written by this engine for this file,
+            // so its generation is not this file's generation either —
+            // passing over it is not rolling anything back. Whereas a
+            // manifest whose last row merely fails to decode is DAMAGE,
+            // is never called a ghost, and therefore never passed over:
+            // answering "your newest row is corrupt" by serving the
+            // database without it would be data loss wearing recovery's
+            // clothes. The whole safety of this loop rests on that
+            // distinction, which is why `is_ghost_manifest` is written to
+            // prove rather than to guess.
+            if self.manifest_fits(&c).is_none() && !self.is_ghost_manifest(c.row_count, data) {
+                copy = c;
+                break;
+            }
+            if self.is_ghost_manifest(c.row_count, data) {
+                ghosts |= 1u8 << slot;
+            }
+        }
+        self.file_capacity = copy.capacity;
+        if let Some(err) = self.manifest_fits(&copy) {
+            return self.fail_open(err);
+        }
+        // Passing over the top candidate because the rows it names are
+        // not in the file means fsynced rows are gone. That is an
+        // out-of-budget loss, and it is FLAGGED rather than refused: the
+        // database still opens on the newest manifest the file can
+        // support, and `RecoveryReport::rollback_evidence` says
+        // acknowledged commits went missing. Refusing would have been the
+        // other choice, and it is the wrong one — an operator can act on
+        // "some of your data is gone", and cannot act on a database that
+        // will not open.
+        if copy != top && self.manifest_fits(&top).is_some() {
+            self.orphan_rollback = true;
+        }
+        self.stage_repair(&copy);
+        // Ghosts inside the chosen generation's home pair are already
+        // handled: the twin repair writes the right manifest over them.
+        // Ghosts anywhere else have to be zeroed, or the truncation this
+        // recovery is about to perform turns them into what looks like a
+        // manifest whose rows have vanished — and the next open, reading
+        // the same bytes, would reach a worse conclusion than this one.
+        let own_pair = Self::sb_slots_for(copy.generation);
+        for slot in own_pair {
+            ghosts &= !(1u8 << slot);
+        }
+        self.clear_slots = ghosts;
+        self.replay_rows(false, 0, copy.generation, copy.row_count, data)
     }
 
     /// Replay committed rows `base..row_count` out of `data`, which
@@ -1824,9 +2048,12 @@ impl Engine {
     ) -> Output {
         let live = ((row_count - base) as usize) * ROW_SIZE;
         if data.len() < live {
-            return self.fail_open(DbError::Corrupt {
-                what: "short read of committed rows",
-            });
+            return self.fail_replay(
+                refreshing,
+                DbError::Corrupt {
+                    what: "short read of committed rows",
+                },
+            );
         }
         // Verification is per-row, and so is the consequence. A strict open
         // refuses the whole file (detection over availability); a salvage
@@ -1867,9 +2094,12 @@ impl Engine {
                     self.trigram.skip_row(row);
                     continue;
                 }
-                return self.fail_open(DbError::Corrupt {
-                    what: crate::defect::ROW_CHECKSUM,
-                });
+                return self.fail_replay(
+                    refreshing,
+                    DbError::Corrupt {
+                        what: crate::defect::ROW_CHECKSUM,
+                    },
+                );
             };
             let id = slot.id;
             match slot.kind {
@@ -1892,9 +2122,12 @@ impl Engine {
                             skip_until = row + broken;
                             continue;
                         }
-                        return self.fail_open(DbError::Corrupt {
-                            what: crate::defect::TRUNCATED_VALUE,
-                        });
+                        return self.fail_replay(
+                            refreshing,
+                            DbError::Corrupt {
+                                what: crate::defect::TRUNCATED_VALUE,
+                            },
+                        );
                     };
                     let duplicate = slot.kind == RowKind::Record && self.live_row_of(id).is_some();
                     let orphan = slot.kind == RowKind::Update && self.live_row_of(id).is_none();
@@ -1911,13 +2144,16 @@ impl Engine {
                             skip_until = row + rows;
                             continue;
                         }
-                        return self.fail_open(DbError::Corrupt {
-                            what: if duplicate {
-                                crate::defect::DUPLICATE_ID
-                            } else {
-                                crate::defect::ORPHAN_UPDATE
+                        return self.fail_replay(
+                            refreshing,
+                            DbError::Corrupt {
+                                what: if duplicate {
+                                    crate::defect::DUPLICATE_ID
+                                } else {
+                                    crate::defect::ORPHAN_UPDATE
+                                },
                             },
-                        });
+                        );
                     }
                     if let Some(old_row) = self.live_row_of(id) {
                         self.retire(old_row, row_count);
@@ -1949,9 +2185,12 @@ impl Engine {
                         self.trigram.skip_row(row);
                         continue;
                     }
-                    return self.fail_open(DbError::Corrupt {
-                        what: crate::defect::ORPHAN_CHUNK,
-                    });
+                    return self.fail_replay(
+                        refreshing,
+                        DbError::Corrupt {
+                            what: crate::defect::ORPHAN_CHUNK,
+                        },
+                    );
                 }
                 RowKind::Tombstone => {
                     // A deletion of something not live cannot be produced by
@@ -1965,9 +2204,12 @@ impl Engine {
                             self.trigram.skip_row(row);
                             continue;
                         }
-                        return self.fail_open(DbError::Corrupt {
-                            what: crate::defect::ORPHAN_TOMBSTONE,
-                        });
+                        return self.fail_replay(
+                            refreshing,
+                            DbError::Corrupt {
+                                what: crate::defect::ORPHAN_TOMBSTONE,
+                            },
+                        );
                     };
                     let dst = (row as usize) * ROW_SIZE;
                     let src = ((row - base) as usize) * ROW_SIZE;
@@ -1990,7 +2232,10 @@ impl Engine {
         }
         let scan = scan_orphans(&data[live..]);
         self.orphan_valid_rows = scan.valid;
-        self.orphan_rollback = scan.rollback_evidence;
+        // OR, never assign: a manifest passed over for naming rows the
+        // file does not have is rollback evidence in its own right, and
+        // it is decided before this scan runs.
+        self.orphan_rollback |= scan.rollback_evidence;
 
         // Salvage touches NOTHING. A damaged database must not be mutated
         // by the act of rescuing data from it, and a rescue must work on a
@@ -2006,6 +2251,7 @@ impl Engine {
         // twin repair and the fsyncs.
         if self.quarantined > 0 {
             self.pending_repair = None;
+            self.clear_slots = 0;
             return self.finish_open(generation, row_count);
         }
         self.stage_recovery_fsyncs(generation, row_count)
@@ -2054,6 +2300,22 @@ impl Engine {
     fn fail_refresh(&mut self, err: DbError) -> Output {
         self.state = State::Ready;
         Output::RefreshDone { result: Err(err) }
+    }
+
+    /// A replay failure, reported as whatever the caller asked for.
+    ///
+    /// The SAME replay serves an open and a refresh, so its refusals have
+    /// to come back as the terminal of the operation that was issued — an
+    /// `OpenDone` for an open, a `RefreshDone` for a refresh. A refresh
+    /// that answered `OpenDone` would be a protocol violation dressed as
+    /// an error, and the host would have no idea what had happened to the
+    /// database it was reading.
+    fn fail_replay(&mut self, refreshing: bool, err: DbError) -> Output {
+        if refreshing {
+            self.fail_refresh(err)
+        } else {
+            self.fail_open(err)
+        }
     }
 
     fn fail_open(&mut self, err: DbError) -> Output {
@@ -2230,6 +2492,7 @@ impl Engine {
             | State::RecoverReadRows { .. }
             | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverClearSb { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
             State::InsertWriteRow
@@ -2635,21 +2898,21 @@ impl Engine {
                 }
             }
             (
+                State::RecoverClearSb {
+                    generation,
+                    row_count,
+                    ..
+                },
+                FileId::Superblock,
+            ) => self.next_sb_fixup(generation, row_count),
+            (
                 State::RecoverRepairSb {
                     generation,
                     row_count,
                     ..
                 },
                 FileId::Superblock,
-            ) => {
-                self.state = State::RecoverFsyncSb {
-                    generation,
-                    row_count,
-                };
-                Output::Fsync {
-                    file: FileId::Superblock,
-                }
-            }
+            ) => self.next_sb_fixup(generation, row_count),
             (State::UpdateWriteRow, FileId::Rows) => {
                 self.state = State::UpdateFsyncRows;
                 Output::Fsync { file: FileId::Rows }
@@ -2747,13 +3010,7 @@ impl Engine {
                     };
                     Self::sb_copy_write(generation, row_count, self.caps.rows, copy)
                 } else {
-                    self.state = State::RecoverFsyncSb {
-                        generation,
-                        row_count,
-                    };
-                    Output::Fsync {
-                        file: FileId::Superblock,
-                    }
+                    self.next_sb_fixup(generation, row_count)
                 }
             }
             (
@@ -2998,6 +3255,7 @@ impl Engine {
             | State::RecoverReadRows { .. }
             | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverClearSb { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
@@ -3037,6 +3295,7 @@ impl Engine {
             | State::RecoverReadRows { .. }
             | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverClearSb { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
@@ -3083,6 +3342,7 @@ impl Engine {
             | State::RecoverReadRows { .. }
             | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverClearSb { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow
@@ -3214,6 +3474,7 @@ impl Engine {
             | State::RecoverReadRows { .. }
             | State::RecoverTruncateRows { .. }
             | State::RecoverFsyncRows { .. }
+            | State::RecoverClearSb { .. }
             | State::RecoverRepairSb { .. }
             | State::RecoverFsyncSb { .. } => Err(DbError::NotOpen),
             State::InsertWriteRow

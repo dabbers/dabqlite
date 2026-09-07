@@ -1030,3 +1030,37 @@ because the incremental replay and the full one are the same code.
 | A writer that grew past the reader's arenas | pinned | `refresh.rs` | `CapacityTooSmall` naming both numbers, and `grow` catches the reader up on the way through |
 | A salvaged handle | pinned | `refresh.rs` | refused, and STILL DEGRADED afterwards — a refusal that quietly promoted it to healthy would be worse than what it refused |
 | Cost | byte count through a counting backend | `refresh.rs` | a refresh over a 2000-row database reads less than a twentieth of what its open read |
+
+## Resurrected superblocks
+
+Two valid superblock copies of one generation should be impossible: a
+commit writes both from a single encoding, so they are byte-identical.
+They are not impossible, and the soak found out after 443 lifetimes.
+
+A commit at generation `g` whose superblock writes were torn is never
+acknowledged, so the next incarnation legitimately re-uses `g` for a
+DIFFERENT commit. A second torn write over the first one's remains can
+reassemble the earlier image byte for byte, checksum and all — not a
+checksum collision, but a real superblock from a real commit, brought
+back. The generation is then ambiguous and one of the two manifests
+points into the middle of a commit the other one wrote.
+
+The discriminator is the span field: the last row a real manifest names
+always has span zero, because manifests are written at commit boundaries.
+A manifest whose last row still promises `span` more rows of its own
+commit names HALF a commit — and it is a GHOST rather than damage only
+when the rest of that commit is actually present in the file. That
+distinction is the whole safety of the rule: an unreadable last row, a
+stranded continuation with nothing after it, a file that simply ends, are
+all damage, are never called ghosts, and never cause a fallback. Answering
+"your newest row is corrupt" by serving the database without it would be
+data loss wearing recovery's clothes.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Two valid copies of one generation, the smaller naming half a commit | forged | `value_order.rs` (sim) | the manifest the rows agree with wins; every row survives; the inspector reaches the same verdict on the same bytes |
+| A ghost at a HIGHER generation than the manifest recovery chooses | forged | `value_order.rs` (sim) | passed over, then ZEROED — because the truncation that follows would make it look like a manifest whose rows vanished, and the next open would refuse a database this one just read |
+| Two opens in a row over the same bytes | pinned | `value_order.rs` (sim) | reach the same answer: recovery never leaves a state its own next open judges differently |
+| A damaged last row (bit rot at the manifest edge) | exhaustive | `faults.rs` | still refused — damage is not a ghost, and is never routed around |
+| A stranded continuation as the last committed row | pinned | `inspect.rs` | still refused, and the inspector still agrees |
+| A manifest naming rows the file does not have | soak | `lifetime.rs` | opens on the newest manifest the file can support, with `rollback_evidence` set: an operator can act on "some of your data is gone" and cannot act on a database that will not open |

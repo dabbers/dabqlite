@@ -86,6 +86,34 @@ fn routes_before<P: Fn(u64) -> Ordering>(probe: &P, sep: u64) -> bool {
     probe(sep) == Ordering::Greater
 }
 
+/// Descent routing for a RANGE START: does the search bound belong at or
+/// before separator `sep`?
+///
+/// AT OR BEFORE, where [`routes_before`] is strictly before, and the
+/// difference is not a nicety.
+///
+/// `routes_before` sends an exact-match search RIGHT at equality, toward
+/// the single leaf that owns the separator's key. That is correct exactly
+/// when the probe is injective — when at most one stored key can compare
+/// equal to the target — which is true of the `u64` index and false of an
+/// index whose probe compares only part of the key. The value-ordered
+/// index probes by VALUE BYTES while its keys are (value, id, row), so
+/// many stored keys compare equal to a byte bound, spread across both
+/// sides of a separator. Routing right at equality then skips every one
+/// of them in the left subtree — the scan silently returns fewer rows,
+/// with nothing anywhere reporting a problem.
+///
+/// Found by the soak: three live rows held an empty value, a scan bounded
+/// at the empty string returned one of them, and the two that were
+/// separated off to the left were simply gone.
+///
+/// Routing left at equality is correct for BOTH: the leaf-chain walk
+/// filters out anything below the bound anyway, so the only cost is
+/// occasionally starting one leaf early.
+fn routes_at_or_before<P: Fn(u64) -> Ordering>(probe: &P, sep: u64) -> bool {
+    probe(sep) != Ordering::Less
+}
+
 /// The probe for an ordinary numeric key: stored against target.
 fn numeric(target: u64) -> impl Fn(u64) -> Ordering {
     move |stored| stored.cmp(&target)
@@ -297,12 +325,11 @@ impl BTreeIndex {
             let len = n.len as usize;
             let mut child = len;
             for (i, &k) in n.keys[..len].iter().enumerate() {
-                // Same routing predicate as insert: start == separator
-                // descends RIGHT, straight to the leaf that owns the key.
-                // (Routing left would still be correct — the chain walk
-                // filters — just one leaf slower, which is why only the
-                // shared pinned predicate can hold the strictness.)
-                if routes_before(probe, k) {
+                // NOT insert's predicate: a range start descends LEFT at
+                // equality. See `routes_at_or_before` — an index whose
+                // probe is not injective loses rows otherwise, and the
+                // chain walk below filters the extra ones out.
+                if routes_at_or_before(probe, k) {
                     child = i;
                     break;
                 }

@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Eight of these have since been decided by building the thing. They are kept
+Nine of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -489,6 +489,33 @@ part worth reading.
   An assertion stages no row, so a batch of nothing but assertions
   performs no I/O at all.
 
+- **Whether a generation number identifies a commit** — DECIDED, the hard
+  way: it does NOT, and recovery cannot assume it does. A commit whose
+  superblock writes were torn is never acknowledged, so the next
+  incarnation re-uses its generation for a different commit; a second torn
+  write over the first one's remains can reassemble the earlier superblock
+  byte for byte, checksum and all. Two valid copies then claim one
+  generation with different row counts, and electing the wrong one cuts a
+  commit — and possibly a value — in half, so a strict open refuses a
+  database that has nothing wrong with it.
+  Recovery therefore RANKS candidates (generation, then row count, both
+  descending) and finishes the election once the rows can be consulted,
+  choosing the highest-ranked manifest that fits the file and is not a
+  proven ghost. "Proven" is load-bearing: a manifest is a ghost when its
+  last row still promises more of its own commit AND the rest of that
+  commit is present in the file. Damage — an unreadable last row, a
+  stranded continuation, a file that ends — is never a ghost and never
+  causes a fallback, because answering "your newest row is corrupt" by
+  serving the database without it is data loss wearing recovery's clothes.
+  A ghost outside the chosen generation's home pair is then ZEROED, for a
+  reason worth stating on its own: recovery truncates the residue past the
+  manifest it chose, and that truncation turns a ghost into something that
+  looks like a manifest whose rows have vanished. Recovery must not leave
+  a database in a state its own next open judges differently.
+  Found by the soak after 443 lifetimes, fixed in the engine AND in the
+  inspector — a forensics tool that disagrees with recovery about what a
+  file means is worse than no tool — and both are now held to it by
+  forged-superblock tests rather than by luck.
 - **What a reader does about commits made after it opened** — DECIDED: it
   catches up incrementally, and the incremental replay is the recovery
   replay. A reader sees the generation it opened on and nothing after it,

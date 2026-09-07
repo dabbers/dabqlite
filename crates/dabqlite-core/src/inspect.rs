@@ -220,6 +220,31 @@ fn home_pair_slots(generation: u64) -> [u8; 2] {
 /// Inspect a database from its raw file bytes. Pure and total: any input
 /// produces a report, never a panic — garbage files are the expected
 /// case for a forensics tool.
+/// Is a manifest of `row_count` rows PROVABLY not one the engine wrote?
+///
+/// The same rule as `Engine::is_ghost_manifest`, and it has to stay the
+/// same rule: the last row a real manifest names has span zero, and a
+/// manifest that ends mid-commit is a ghost only when the rest of that
+/// commit is actually present in the file. Anything else — an unreadable
+/// last row, a stranded continuation with nothing after it, a file that
+/// ends — is damage, and damage is reported rather than routed around.
+fn ghost_manifest(rows: &[u8], row_count: u64) -> bool {
+    if row_count == 0 {
+        return false;
+    }
+    let off = ((row_count - 1) as usize) * ROW_SIZE;
+    let Some(chunk) = rows.get(off..off + ROW_SIZE) else {
+        return false;
+    };
+    let Some(last) = decode_row(chunk) else {
+        return false;
+    };
+    if last.span == 0 {
+        return false;
+    }
+    (row_count + last.span as u64) as usize * ROW_SIZE <= rows.len()
+}
+
 pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     let mut slots = [SlotState::Missing; SB_COPIES];
     for (slot, out) in slots.iter_mut().enumerate() {
@@ -227,8 +252,16 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     }
 
     // Live-copy election, mirroring recovery: highest generation among
-    // structurally-valid CURRENT-schema copies in their home pair; ties
-    // resolve to the first slot (strict `>` while scanning in slot order).
+    // structurally-valid CURRENT-schema copies in their home pair, and
+    // within one generation the copy naming the MOST rows.
+    //
+    // Two valid copies of one generation are not supposed to exist —
+    // they are written from a single encoding — but a re-used generation
+    // number plus successive torn writes can reassemble an earlier
+    // superblock byte for byte, so they do. Recovery prefers the sibling
+    // that the rows agree with; the inspector reaches the same verdict
+    // the same way, because a forensics tool that disagrees with recovery
+    // about what a file means is worse than no tool.
     let mut live: Option<LiveCopy> = None;
     let mut foreign: Option<u64> = None;
     for (slot, state) in slots.iter().enumerate() {
@@ -249,13 +282,69 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
             if !in_home_pair {
                 continue;
             }
-            if live.is_none_or(|l| generation > l.generation) {
+            let better = live.is_none_or(|l| {
+                generation > l.generation || (generation == l.generation && row_count > l.row_count)
+            });
+            if better {
                 live = Some(LiveCopy {
                     slot: slot as u8,
                     generation,
                     row_count,
                     schema,
                 });
+            }
+        }
+    }
+    // Now that a manifest is in hand, ask the ROWS whether it is one this
+    // engine could have written. A manifest ending mid-commit — the last
+    // row it names still promises more of its own commit — names half a
+    // commit, which the protocol cannot produce, so it is a ghost. Fall
+    // back to a sibling at the SAME generation, never to an older one:
+    // preferring an older manifest over a damaged newer one would be data
+    // loss wearing recovery's clothes.
+    // A candidate that does not FIT the rows file, or that is a proven
+    // ghost, is passed over for the next one down — exactly as recovery
+    // does it. Passing over a ghost costs nothing: it was never this
+    // file's manifest. Passing over one that does not fit means rows that
+    // were fsynced are gone, so it is recorded as rollback evidence
+    // rather than swallowed.
+    let mut lost_to_short_file = false;
+    if let Some(chosen) = live {
+        let fits = |c: u64| c as usize * ROW_SIZE <= rows.len();
+        if !fits(chosen.row_count) || ghost_manifest(rows, chosen.row_count) {
+            let mut best: Option<LiveCopy> = None;
+            for (slot, state) in slots.iter().enumerate() {
+                if let SlotState::Valid {
+                    generation,
+                    row_count,
+                    schema,
+                    in_home_pair,
+                } = *state
+                {
+                    if schema != SCHEMA_HASH
+                        || !in_home_pair
+                        || !fits(row_count)
+                        || ghost_manifest(rows, row_count)
+                    {
+                        continue;
+                    }
+                    let better = best.is_none_or(|b| {
+                        generation > b.generation
+                            || (generation == b.generation && row_count > b.row_count)
+                    });
+                    if better {
+                        best = Some(LiveCopy {
+                            slot: slot as u8,
+                            generation,
+                            row_count,
+                            schema,
+                        });
+                    }
+                }
+            }
+            if let Some(b) = best {
+                lost_to_short_file = !fits(chosen.row_count);
+                live = Some(b);
             }
         }
     }
@@ -389,7 +478,11 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
         off += ROW_SIZE;
         j += 1;
     }
-    let rollback_evidence = disagreed;
+    // Passing over a manifest because the rows it names are not in the
+    // file means fsynced rows are gone — the definition of an
+    // out-of-budget loss, and the thing `rollback_evidence` exists to
+    // say out loud.
+    let rollback_evidence = disagreed || lost_to_short_file;
 
     // The verdict, in the engine's exact decision order.
     let verdict = match live {
