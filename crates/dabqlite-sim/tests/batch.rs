@@ -860,6 +860,69 @@ fn two_complete_commits_past_the_manifest_are_still_reported_as_rollback() {
     );
 }
 
+/// A single orphan claiming a commit LONGER than the format can describe
+/// is evidence too.
+///
+/// The claim rule asks whether the slots past the manifest agree about
+/// where their commit ended. One slot agrees with itself trivially, so
+/// without a bound a lone row claiming a 500-row commit would pass — even
+/// though no commit that long can exist, because the span byte cannot
+/// describe one. Forge exactly that: a valid row whose span says its
+/// commit runs far past anything this engine could have written.
+#[test]
+fn an_orphan_claiming_an_impossible_commit_is_rollback_evidence() {
+    let mut host = fresh();
+    for i in 0..2u64 {
+        host.run(ClientOp::Insert {
+            id: i,
+            value: arr(val(i)),
+        });
+    }
+    let mut disk = std::mem::take(&mut host.disk);
+
+    // A valid row two slots past the manifest, carrying the largest span
+    // the format can encode. Every part of it is individually legal; what
+    // is impossible is the sum. Sitting at index 1 past the manifest with
+    // a span of 127, it claims a commit of 129 slots — one more than any
+    // commit can be — so these slots are not one interrupted commit, and
+    // a rule that only compared slots against each other would let a
+    // single one through unchallenged.
+    let mut row = [0u8; dabqlite_core::ROW_SIZE];
+    dabqlite_core::layout::encode_row(
+        dabqlite_core::layout::RowKind::Record,
+        (dabqlite_core::MAX_COMMIT_ROWS - 1) as u8,
+        VALUE_LEN as u8,
+        false,
+        900,
+        &arr(val(900)),
+        &mut row,
+    );
+    let at = 3 * dabqlite_core::ROW_SIZE as u64;
+    disk.write(FileId::Rows, at, &row);
+    disk.fsync(FileId::Rows);
+
+    // The inspector, from the bytes alone, before anything opens them —
+    // an open truncates the residue, so this is the only moment either
+    // implementation can be asked about the same file.
+    let inspected = dabqlite_core::inspect::inspect(
+        &disk.contents(FileId::Superblock),
+        &disk.contents(FileId::Rows),
+    );
+    assert_eq!(inspected.rows.orphan_valid, 1);
+    assert!(inspected.rollback_evidence);
+
+    let (host, live) = open(disk);
+    assert_eq!(live, 2, "the manifest still names two rows");
+    let report = host.engine.recovery_report();
+    assert_eq!(report.orphan_valid_rows, 1);
+    assert!(
+        report.rollback_evidence,
+        "a lone orphan claiming a commit longer than the format allows is \
+         not an interrupted commit, and staying quiet about it means the \
+         claim rule is only checking slots against each other"
+    );
+}
+
 // ---------------------------------------------------------------------
 // The long game: an oracle
 // ---------------------------------------------------------------------

@@ -373,6 +373,11 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
         if let Some(slot) = decode_row(&rows[off..off + ROW_SIZE]) {
             scan.orphan_valid += 1;
             let claim = j + slot.span as u64 + 1;
+            if claim > crate::layout::MAX_COMMIT_ROWS as u64 {
+                // A commit longer than the format can describe is not one
+                // the engine wrote, however well these slots agree.
+                disagreed = true;
+            }
             match claimed {
                 None => claimed = Some(claim),
                 Some(first) if first == claim => {}

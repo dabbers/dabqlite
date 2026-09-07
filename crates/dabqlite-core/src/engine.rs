@@ -839,6 +839,12 @@ fn scan_orphans(past_manifest: &[u8]) -> OrphanScan {
         };
         valid += 1;
         let claim = j as u64 + slot.span as u64 + 1;
+        if claim > MAX_COMMIT_ROWS as u64 {
+            // A commit longer than the format can describe is not one
+            // this engine wrote, so these slots are not one interrupted
+            // commit however well they agree with each other.
+            disagreed = true;
+        }
         match claimed {
             None => claimed = Some(claim),
             Some(first) if first == claim => {}

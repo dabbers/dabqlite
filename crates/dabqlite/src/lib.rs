@@ -1125,6 +1125,11 @@ impl<S: Storage> Db<S> {
             other => unreachable!("get returned {other:?}"),
         };
         let Some(first) = first else { return Ok(None) };
+        // The common case: the value fits one window, so there is nothing
+        // to assemble and one allocation of exactly the right size.
+        if let Some(whole) = first.whole() {
+            return Ok(Some(Value(whole.to_vec())));
+        }
         let mut bytes = Vec::with_capacity(first.total as usize);
         bytes.extend_from_slice(first.payload());
         let mut next = first.next_offset();
