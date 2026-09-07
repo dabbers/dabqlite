@@ -880,3 +880,75 @@ fn a_snapshot_can_be_restored_onto_a_directory() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(dir.with_extension("compacting")).ok();
 }
+
+/// Readers, at last: any number of them, alongside the writer, taking no
+/// lock and writing nothing.
+///
+/// All three sample applications reported the absence of this as a hard
+/// limitation — a status endpoint, a dashboard, or a second CLI could not
+/// read a database that anything was writing. The honest read-only mode
+/// already existed for damaged databases; this is the same machinery,
+/// named for what it does.
+#[cfg(unix)]
+#[test]
+fn readers_run_alongside_the_writer_and_never_see_a_half_commit() {
+    let dir = scratch("readers");
+    let mut writer = Db::open_with(&dir, 4096).expect("writer");
+    for i in 0..20u64 {
+        writer
+            .put(i, Value::from_bytes(&[b'a'; 40]).unwrap())
+            .unwrap();
+    }
+
+    // Several readers at once, while the writer still holds its lock.
+    let mut readers: Vec<_> = (0..4)
+        .map(|_| Db::read_only(&dir).expect("a reader must not need the lock"))
+        .collect();
+    for r in &mut readers {
+        assert_eq!(r.len(), 20);
+        assert_eq!(r.get(7).unwrap().unwrap().len(), 40);
+        assert!(!r.is_degraded(), "a healthy database is not degraded");
+    }
+
+    // The writer keeps working, in batches and singly, including values
+    // that span several row slots. Each reader sees a COMMITTED state —
+    // the one it opened on — never a partial one.
+    for round in 0..30u64 {
+        writer
+            .batch(&[
+                Op::put(100 + round, Value::from_bytes(&[b'b'; 300]).unwrap()),
+                Op::put(200 + round, Value::from_text("small").unwrap()),
+                Op::remove(round),
+            ])
+            .unwrap();
+        // A reader opened NOW sees a whole number of commits: every id it
+        // can see carries a whole value, never a prefix.
+        let mut fresh = Db::read_only(&dir).expect("reader");
+        for (id, value) in fresh.all().unwrap() {
+            let expect = if id >= 200 {
+                5
+            } else if id >= 100 {
+                300
+            } else {
+                40
+            };
+            assert_eq!(
+                value.len(),
+                expect,
+                "reader saw a torn value for id {id} after round {round}"
+            );
+        }
+    }
+
+    // The readers opened at the start still show the state they opened on:
+    // a snapshot, not a moving target.
+    for r in &mut readers {
+        assert_eq!(r.len(), 20, "a reader's view moved under it");
+    }
+
+    // And none of them disturbed the writer or the files.
+    assert!(writer.contains(129).unwrap());
+    drop(readers);
+    drop(writer);
+    std::fs::remove_dir_all(&dir).ok();
+}

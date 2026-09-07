@@ -755,10 +755,45 @@ impl Db<ReadOnlyDir> {
     /// return [`Error::Degraded`] rather than a confident wrong answer.
     /// Takes no lock and writes nothing, so it is safe on a failing volume.
     pub fn salvage(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
-        Self::salvage_with(path, DEFAULT_ROWS)
+        let path = path.as_ref();
+        Self::salvage_with(path, Self::recorded_rows(path))
     }
 
-    /// As [`Db::salvage`], with a chosen row capacity.
+    /// Open a HEALTHY database read-only, taking no writer lock.
+    ///
+    /// The reader every application built on this store asked for. It sees
+    /// the database as of the moment it opened — a committed generation,
+    /// never a half-written one, because a commit only becomes visible
+    /// when the superblock flips and the previous generation always
+    /// survives in its own pair of slots. Later writes by the writer are
+    /// not visible to it; reopen for a newer view.
+    ///
+    /// Any number of these can run at once, alongside the single writer.
+    /// They write nothing at all — not one byte, not one fsync — so a
+    /// reader cannot slow a writer down or damage anything.
+    ///
+    /// It is the same machinery as [`Db::salvage`], which is the point:
+    /// the honest read-only mode already existed, and a healthy database
+    /// opened this way behaves exactly like a normal one. On a DAMAGED
+    /// database this will report [`Error::Degraded`] for questions the
+    /// quarantine makes unanswerable; call `salvage` when that is what you
+    /// are expecting, so the intent is in the code.
+    pub fn read_only(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        Self::salvage_with(path, Self::recorded_rows(path))
+    }
+
+    /// The capacity this database recorded, or the default if it has not
+    /// recorded one. A reader has to size its arena before it can read the
+    /// superblock, same as a writer.
+    fn recorded_rows(path: &std::path::Path) -> u64 {
+        recorded_capacity(
+            &std::fs::read(path.join(dabqlite_host::SUPERBLOCK_FILE)).unwrap_or_default(),
+        )
+        .unwrap_or(DEFAULT_ROWS)
+    }
+
+    /// As [`Db::salvage`] or [`Db::read_only`], with a chosen row capacity.
     pub fn salvage_with(path: impl AsRef<std::path::Path>, rows: u64) -> Result<Self, Error> {
         let storage = ReadOnlyDir::open_dir(path.as_ref()).map_err(fs_err)?;
         let mut host = Host::new(caps(rows), storage);
