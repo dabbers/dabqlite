@@ -906,6 +906,62 @@ mod tests {
         t.check_invariants();
     }
 
+    /// The descent and chain-walk cycle guards, which nothing that this
+    /// tree can BUILD will ever trip.
+    ///
+    /// They exist for a corrupted or forged pool — the only way a child
+    /// pointer or a leaf link can point backwards — so the only way to
+    /// test them is to forge one. Mutation testing found them undefended:
+    /// the step counters could be neutered and the whole suite still
+    /// passed, which means "this cannot hang" was an assertion nobody had
+    /// ever seen hold.
+    #[test]
+    #[should_panic(expected = "descent cycle")]
+    fn a_child_pointer_that_loops_is_caught_rather_than_hanging() {
+        let mut t = BTreeIndex::new(64);
+        for k in 0..40u64 {
+            t.insert(k, k);
+        }
+        // Point the root's rightmost child at the root.
+        let root = t.root;
+        assert!(!t.node(root).leaf, "the tree must have grown a root");
+        let last = t.node(root).len as usize;
+        t.node_mut(root).children[last] = root;
+        t.max_key();
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf chain cycle")]
+    fn a_leaf_chain_that_loops_is_caught_rather_than_hanging() {
+        let mut t = BTreeIndex::new(64);
+        for k in 0..40u64 {
+            t.insert(k, k);
+        }
+        // Find a leaf by descending left, then link it to itself.
+        let mut id = t.root;
+        while !t.node(id).leaf {
+            id = t.node(id).children[0];
+        }
+        t.node_mut(id).next = id;
+        t.for_each_from(0, |_, _| true);
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf chain cycle")]
+    fn a_descending_walk_over_a_looping_path_is_caught_too() {
+        let mut t = BTreeIndex::new(64);
+        for k in 0..40u64 {
+            t.insert(k, k);
+        }
+        // The descending walk climbs the descent path rather than the
+        // chain, so it needs its own loop: make the root's leftmost
+        // child point back at the root.
+        let root = t.root;
+        assert!(!t.node(root).leaf);
+        t.node_mut(root).children[0] = root;
+        t.for_each_down_from(u64::MAX, |_, _| true);
+    }
+
     /// Hand-build a tree whose ONLY defect is leaves at unequal depth —
     /// occupancy, ordering, bounds, count, and the leaf chain are all
     /// consistent, so only the depth-uniformity check can catch it.

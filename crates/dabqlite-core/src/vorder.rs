@@ -368,6 +368,134 @@ mod tests {
         );
     }
 
+    /// A run whose slots are NOT uniformly full.
+    ///
+    /// The engine never writes one: it chunks a value into `VALUE_LEN`
+    /// pieces, so every slot but the last is full and two runs being
+    /// compared always advance in lockstep. That uniformity makes the
+    /// comparator's partial-consumption path — the one carrying an offset
+    /// INTO a slot from one iteration to the next — unreachable from any
+    /// database this engine produces, and therefore untested by
+    /// everything above.
+    ///
+    /// It is still the code that decides the order, and it is written for
+    /// any run shape, so it is tested for any run shape. Mutation testing
+    /// found this: arithmetic mutants inside `cmp_runs` survived the
+    /// entire suite, not because the tests were weak but because no
+    /// database can reach the lines they changed.
+    fn ragged(id: u64, pieces: &[&[u8]]) -> (Vec<u8>, u64) {
+        let mut arena = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            assert!(piece.len() <= VALUE_LEN);
+            let mut padded = [0u8; VALUE_LEN];
+            padded[..piece.len()].copy_from_slice(piece);
+            let mut out = [0u8; ROW_SIZE];
+            let kind = if i == 0 {
+                RowKind::Record
+            } else {
+                RowKind::Chunk
+            };
+            encode_row(
+                kind,
+                0,
+                piece.len() as u8,
+                i + 1 < pieces.len(),
+                id,
+                &padded,
+                &mut out,
+            );
+            arena.extend_from_slice(&out);
+        }
+        let rows = (arena.len() / ROW_SIZE) as u64;
+        (arena, rows)
+    }
+
+    #[test]
+    fn runs_with_unevenly_sized_slots_still_compare_by_their_bytes() {
+        // Every way of cutting the same eight bytes into slots, compared
+        // against every other way.
+        let cuts: &[&[&[u8]]] = &[
+            &[b"abcdefgh"],
+            &[b"a", b"bcdefgh"],
+            &[b"ab", b"c", b"defgh"],
+            &[b"abc", b"de", b"f", b"gh"],
+            &[b"abcd", b"efgh"],
+            &[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"],
+        ];
+        for (i, a) in cuts.iter().enumerate() {
+            for (j, b) in cuts.iter().enumerate() {
+                let (aa, an) = ragged(1, a);
+                let (bb, bn) = ragged(2, b);
+                // Two arenas cannot be compared against each other, so
+                // both runs go into one.
+                let mut arena = aa;
+                let head_b = an;
+                arena.extend_from_slice(&bb);
+                assert_eq!(
+                    cmp_runs(&arena, an + bn, 0, head_b),
+                    Ordering::Equal,
+                    "cut {i} vs cut {j}: the same bytes, cut differently"
+                );
+                assert_eq!(
+                    cmp_run_bytes(&arena, an + bn, 0, b"abcdefgh"),
+                    Ordering::Equal,
+                    "cut {i} against the bytes it holds"
+                );
+            }
+        }
+        // A difference in EVERY position, against runs cut so that it
+        // lands mid-slot rather than at a seam.
+        let base: &[&[u8]] = &[b"abc", b"de", b"f", b"gh"];
+        for pos in 0..8usize {
+            for delta in [-1i16, 1] {
+                let mut other = b"abcdefgh".to_vec();
+                other[pos] = (other[pos] as i16 + delta) as u8;
+                let (aa, an) = ragged(1, base);
+                let (bb, bn) = ragged(2, &[&other[..5], &other[5..]]);
+                let mut arena = aa;
+                let head_b = an;
+                arena.extend_from_slice(&bb);
+                assert_eq!(
+                    cmp_runs(&arena, an + bn, 0, head_b),
+                    b"abcdefgh".as_slice().cmp(other.as_slice()),
+                    "byte {pos} {delta:+}"
+                );
+                assert_eq!(
+                    cmp_run_bytes(&arena, an + bn, 0, &other),
+                    b"abcdefgh".as_slice().cmp(other.as_slice()),
+                    "byte {pos} {delta:+} as a needle"
+                );
+            }
+        }
+        // Zero-length slots in the middle are legal too, and must be
+        // stepped over rather than mistaken for the end of the run.
+        let (arena, n) = ragged(1, &[b"ab", b"", b"cd", b"", b""]);
+        assert_eq!(cmp_run_bytes(&arena, n, 0, b"abcd"), Ordering::Equal);
+        assert_eq!(cmp_run_bytes(&arena, n, 0, b"abc"), Ordering::Greater);
+        assert_eq!(cmp_run_bytes(&arena, n, 0, b"abcde"), Ordering::Less);
+    }
+
+    /// The reader's step bound is not decoration: a run of same-id
+    /// continuations longer than any commit could be — the shape a forged
+    /// or badly damaged file has — must stop it, not walk the arena.
+    #[test]
+    fn the_run_reader_stops_at_the_longest_commit_the_format_allows() {
+        let pieces: Vec<&[u8]> = core::iter::repeat_n(&b"x"[..], MAX_COMMIT_ROWS + 50).collect();
+        let (arena, n) = ragged(7, &pieces);
+        assert_eq!(n as usize, MAX_COMMIT_ROWS + 50);
+        let mut r = RunReader::new(&arena, n, 0);
+        let mut steps = 0usize;
+        while r.next_slot().is_some() {
+            steps += 1;
+            assert!(steps <= MAX_COMMIT_ROWS, "the reader walked past the bound");
+        }
+        assert_eq!(steps, MAX_COMMIT_ROWS, "and it used the whole bound");
+        // So a comparison against a needle longer than the bound can
+        // reach reports what it CAN see rather than running away.
+        let needle = vec![b'x'; MAX_COMMIT_ROWS + 50];
+        assert_eq!(cmp_run_bytes(&arena, n, 0, &needle), Ordering::Less);
+    }
+
     /// A tombstone holds no value. It must compare as empty rather than
     /// as whatever bytes happen to sit in its slot.
     #[test]
