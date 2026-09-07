@@ -436,6 +436,23 @@ part worth reading.
 
 Still open:
 
+- **Keys that are not `u64`.** Named by all three sample applications as
+  the largest structural gap, and each of them paid the same price: a
+  bookmark store, a job queue and a key/value store all hash their real
+  key onto a `u64`, probe past collisions, keep their own tombstones (a
+  library delete on a chain link loses the key behind it), and cannot
+  compact without re-placing every row. "List everything under
+  `session/`" is a full scan and a sort in all three, because id order is
+  hash order.
+  Two shapes are plausible. A second ordered index over VALUE bytes gives
+  key-ordered range scans for free to any application that puts its key
+  at the front of the record — no schema change, one more derived index
+  with a `BTreeMap<Vec<u8>, u64>` for an oracle, rebuilt at recovery like
+  the others. A byte-keyed table is the bigger answer and a much larger
+  change: it moves the primary key itself, which every index, the row
+  format and the migration path are built on. The first is probably
+  right; it is written down here rather than done because it should be
+  decided against a sample that needs it rather than in the abstract.
 - Size class growth ratio: 2x (simple, ~50% worst-case internal fragmentation) versus
   1.25x (tighter, more free lists).
 - `BLOB_HARD_MAX` exact value.
