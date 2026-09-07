@@ -86,6 +86,14 @@ pub struct RowScan {
     /// impossible for the engine to write, since a chunk is only ever
     /// appended directly after the row it belongs to.
     pub orphan_chunks: u64,
+    /// Continuation slots consumed by values that DID run to their
+    /// promised end — the slots a multi-row value occupies beyond its
+    /// head.
+    pub chunks: u64,
+    /// Values whose continuations do not run to the end the head
+    /// promised: the run is missing, short, damaged, or belongs to
+    /// another id. The whole value is unreadable, not just its tail.
+    pub truncated_values: u64,
     /// Distinct ids seen more than once among committed rows — recovery
     /// refuses the file if nonzero.
     pub duplicate_ids: u64,
@@ -142,6 +150,48 @@ fn inspect_slot(sb: &[u8], slot: usize) -> SlotState {
         },
         Err(_) => SlotState::Invalid,
     }
+}
+
+/// Walk a value's run of slots from its head, restating the format rule
+/// independently of the engine: the head says whether the value
+/// continues, each continuation is a `Chunk` for the same id, and the
+/// last one says the value ends there.
+///
+/// Returns `(slots, intact)` — how many slots the run occupies (so the
+/// scan can step over them either way) and whether it reached the end it
+/// promised. A broken run reports the head plus the continuations that
+/// did arrive, because those are unreadable together with it.
+fn walk_run(
+    rows: &[u8],
+    head_row: u64,
+    committed: u64,
+    head: &crate::layout::RowSlot,
+) -> (u64, bool) {
+    let mut slots = 1u64;
+    let mut more = head.more;
+    while more {
+        if slots as usize > crate::layout::MAX_COMMIT_ROWS {
+            // Longer than any commit can be, so longer than anything this
+            // engine could have written.
+            return (slots, false);
+        }
+        let r = head_row + slots;
+        if r >= committed {
+            // The value promised a continuation the manifest does not
+            // name: truncation, or a superblock that names fewer rows
+            // than the value needs.
+            return (slots, false);
+        }
+        let off = (r as usize) * ROW_SIZE;
+        match rows.get(off..off + ROW_SIZE).and_then(decode_row) {
+            Some(slot) if slot.kind == RowKind::Chunk && slot.id == head.id => {
+                more = slot.more;
+                slots += 1;
+            }
+            _ => return (slots, false),
+        }
+    }
+    (slots, true)
 }
 
 /// The pair rotation rule, restated independently of the engine.
@@ -209,73 +259,108 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     // the ids that are LIVE right now, so a record for a live id is a
     // duplicate, a record for a retired one is the id being reused, and a
     // deletion of something not live is damage.
-    for row in 0..committed {
+    let mut row = 0u64;
+    while row < committed {
         let off = (row as usize) * ROW_SIZE;
-        match rows.get(off..off + ROW_SIZE).and_then(decode_row) {
-            Some(slot) => {
-                let id = slot.id;
-                match slot.kind {
-                    RowKind::Record => {
-                        if seen.insert(id) {
-                            scan.committed_valid += 1;
-                        } else {
-                            scan.duplicate_ids += 1;
-                            if scan.duplicate_samples.len() < SAMPLE_CAP {
-                                scan.duplicate_samples.push(id);
-                            }
-                            first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
-                        }
-                    }
-                    RowKind::Update => {
-                        // A superseding row is legitimate only for an id
-                        // that is live at this point in the commit order.
-                        if seen.contains(&id) {
-                            scan.committed_valid += 1;
-                            scan.superseded += 1;
-                        } else {
-                            scan.orphan_updates += 1;
-                            first_defect.get_or_insert(crate::defect::ORPHAN_UPDATE);
-                        }
-                    }
-                    RowKind::Tombstone => {
-                        if seen.remove(&id) {
-                            scan.committed_valid += 1;
-                            scan.tombstones += 1;
-                        } else {
-                            scan.orphan_tombstones += 1;
-                            first_defect.get_or_insert(crate::defect::ORPHAN_TOMBSTONE);
-                        }
-                    }
-                    RowKind::Chunk => {
-                        // Nothing in this replay can own a continuation
-                        // yet, so every chunk is a stranded one. When
-                        // multi-row values arrive, this arm attaches the
-                        // chunk to the row before it instead.
-                        scan.orphan_chunks += 1;
-                        first_defect.get_or_insert(crate::defect::ORPHAN_CHUNK);
-                    }
-                }
+        let Some(slot) = rows.get(off..off + ROW_SIZE).and_then(decode_row) else {
+            scan.committed_corrupt += 1;
+            if scan.corrupt_offsets.len() < SAMPLE_CAP {
+                scan.corrupt_offsets.push(off as u64);
             }
-            None => {
-                scan.committed_corrupt += 1;
-                if scan.corrupt_offsets.len() < SAMPLE_CAP {
-                    scan.corrupt_offsets.push(off as u64);
+            first_defect.get_or_insert(crate::defect::ROW_CHECKSUM);
+            row += 1;
+            continue;
+        };
+        let id = slot.id;
+        match slot.kind {
+            RowKind::Record | RowKind::Update => {
+                // A value is written whole, in one commit, as a run of
+                // slots: the head plus one continuation per extra
+                // row-width of bytes, each carrying the same id and the
+                // last one saying the value ends there. A run that does
+                // not reach that end is not one this engine wrote, and
+                // the whole value goes rather than its head being served
+                // cut short.
+                let (span, intact) = walk_run(rows, row, committed, &slot);
+                if !intact {
+                    scan.truncated_values += 1;
+                    first_defect.get_or_insert(crate::defect::TRUNCATED_VALUE);
+                    row += span;
+                    continue;
                 }
-                first_defect.get_or_insert(crate::defect::ROW_CHECKSUM);
+                if slot.kind == RowKind::Record {
+                    if seen.insert(id) {
+                        scan.committed_valid += 1;
+                    } else {
+                        scan.duplicate_ids += 1;
+                        if scan.duplicate_samples.len() < SAMPLE_CAP {
+                            scan.duplicate_samples.push(id);
+                        }
+                        first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
+                    }
+                } else if seen.contains(&id) {
+                    // A superseding row is legitimate only for an id
+                    // that is live at this point in the commit order.
+                    scan.committed_valid += 1;
+                    scan.superseded += 1;
+                } else {
+                    scan.orphan_updates += 1;
+                    first_defect.get_or_insert(crate::defect::ORPHAN_UPDATE);
+                }
+                scan.chunks += span - 1;
+                row += span;
+            }
+            RowKind::Tombstone => {
+                // A deletion that claims to continue is as impossible as
+                // one for an id that is not live: a tombstone carries no
+                // value to spill into a second slot.
+                if !slot.more && seen.remove(&id) {
+                    scan.committed_valid += 1;
+                    scan.tombstones += 1;
+                } else {
+                    scan.orphan_tombstones += 1;
+                    first_defect.get_or_insert(crate::defect::ORPHAN_TOMBSTONE);
+                }
+                row += 1;
+            }
+            RowKind::Chunk => {
+                // Reached only when nothing in front of it claimed it:
+                // every well-formed continuation is consumed with its
+                // head, above.
+                scan.orphan_chunks += 1;
+                first_defect.get_or_insert(crate::defect::ORPHAN_CHUNK);
+                row += 1;
             }
         }
     }
     scan.live_records = seen.len() as u64;
+    // Beyond the manifest lies at most ONE unacknowledged commit, and
+    // every slot of it agrees about where that commit ends: a valid row
+    // `j` slots past the manifest carrying span `s` claims a commit of
+    // `j + s + 1` slots. Orphans that disagree cannot have been written
+    // by one commit, so acknowledged work was rolled back. At span 0 this
+    // is exactly the old rule — two orphans in a row disagree — which is
+    // why replacing it lost nothing.
+    let mut claimed: Option<u64> = None;
+    let mut disagreed = false;
     let mut off = live_bytes;
+    let mut j = 0u64;
     while off + ROW_SIZE <= rows.len() {
-        if decode_row(&rows[off..off + ROW_SIZE]).is_some() {
+        if let Some(slot) = decode_row(&rows[off..off + ROW_SIZE]) {
             scan.orphan_valid += 1;
+            let claim = j + slot.span as u64 + 1;
+            match claimed {
+                None => claimed = Some(claim),
+                Some(first) if first == claim => {}
+                Some(_) => disagreed = true,
+            }
         } else if rows[off..off + ROW_SIZE].iter().any(|&b| b != 0) {
             scan.orphan_invalid += 1;
         }
         off += ROW_SIZE;
+        j += 1;
     }
-    let rollback_evidence = scan.orphan_valid >= 2;
+    let rollback_evidence = disagreed;
 
     // The verdict, in the engine's exact decision order.
     let verdict = match live {

@@ -424,6 +424,67 @@ impl SimHost {
         Some(out)
     }
 
+    /// Assemble one scan result: the page carries the value's full length
+    /// and as much of it as fits a row, so anything longer is read the
+    /// proper way rather than served truncated.
+    fn whole(&mut self, r: dabqlite_core::RowRef) -> (u64, Vec<u8>) {
+        match r.value() {
+            Some(v) => (r.id, v.to_vec()),
+            None => (
+                r.id,
+                self.get_bytes(r.id)
+                    .expect("a scanned row is readable by id"),
+            ),
+        }
+    }
+
+    /// [`SimHost::find_all`] for values of ANY length: every match, in row
+    /// order, each value whole.
+    pub fn find_all_bytes(&mut self, needle: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        assert!(needle.len() <= VALUE_LEN);
+        let mut padded = [0u8; VALUE_LEN];
+        padded[..needle.len()].copy_from_slice(needle);
+        let mut refs = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match self.run_input(Input::Find {
+                needle: padded,
+                needle_len: needle.len() as u8,
+                after,
+            }) {
+                Driven::Done(Output::FindDone { result: Ok(p) }) => p,
+                other => panic!("find_all_bytes: {other:?}"),
+            };
+            refs.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        // Pages arrive newest-first; the oracle scans forwards.
+        refs.reverse();
+        refs.into_iter().map(|r| self.whole(r)).collect()
+    }
+
+    /// [`SimHost::range_all`] for values of ANY length: `lo..=hi` in key
+    /// order, each value whole.
+    pub fn range_all_bytes(&mut self, lo: u64, hi: u64) -> Vec<(u64, Vec<u8>)> {
+        let mut refs = Vec::new();
+        let mut cursor = lo;
+        loop {
+            let page = match self.run_input(Input::Range { lo: cursor, hi }) {
+                Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+                other => panic!("range_all_bytes: {other:?}"),
+            };
+            refs.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        refs.into_iter().map(|r| self.whole(r)).collect()
+    }
+
     /// Full paged substring search, concatenated: a test convenience over
     /// the bounded-page protocol (each page is one `Input::Find`).
     /// Every match, in ROW order. Pages arrive newest-first, so this

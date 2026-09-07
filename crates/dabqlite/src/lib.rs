@@ -874,6 +874,10 @@ fn io_err<S: Storage>(e: S::Error) -> Error {
 
 /// The same, for the facade's own filesystem work, where the error is a
 /// real `io::Error` that already carries a kind and a readable message.
+/// Only the directory-backed paths do filesystem work of their own, so
+/// this follows them behind the same gate rather than sitting unused in
+/// a wasm build.
+#[cfg(unix)]
 fn fs_err(e: std::io::Error) -> Error {
     Error::Io {
         kind: e.kind(),

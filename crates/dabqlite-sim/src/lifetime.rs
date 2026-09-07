@@ -15,10 +15,18 @@
 //! The lifetime covers the ENTIRE feature surface, so one soak pass
 //! exercises everything the database can do: lifetimes may START as a
 //! legacy v1 database and migrate under the same fault schedule
-//! (crash/EIO retries until the two-worlds protocol converges); every
-//! cycle verifies point gets, the full ordered scan, substring search
-//! against the insertion-order oracle, negative space, AND the
-//! inspector's independent verdict against the engine's recovery report.
+//! (crash/EIO retries until the two-worlds protocol converges); writes
+//! are single ops and ATOMIC BATCHES, carrying values from empty to four
+//! slots long; every cycle verifies point gets, the full ordered scan,
+//! substring search against the insertion-order oracle, negative space,
+//! AND the inspector's independent verdict against the engine's recovery
+//! report.
+//!
+//! Batches and long values are not a second code path here. Every commit
+//! is modelled as a list of steps landing under one generation flip, and
+//! a single insert is the one-step case — which is exactly what the
+//! engine does, so the harness reconciles a faulted batch of four
+//! multi-slot values by the same rule it reconciles a faulted insert.
 
 use std::collections::BTreeMap;
 
@@ -95,6 +103,12 @@ pub struct LifetimeStats {
     pub deletes: u64,
     /// Committed updates.
     pub updates: u64,
+    /// Commits issued as an ATOMIC BATCH rather than a single op.
+    pub batches: u64,
+    /// Steps inside those batches.
+    pub batch_steps: u64,
+    /// Committed values that did not fit one row slot.
+    pub long_values: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -115,80 +129,223 @@ fn absorb_io(stats: &mut LifetimeStats, host: &SimHost) {
     stats.fsyncs += host.n_fsyncs;
 }
 
-/// A write that may or may not have committed when a fault hit.
+/// A value a lifetime writes.
 ///
-/// All three kinds reconcile identically — one appended slot, one
-/// generation — which is the whole reason deletes and updates needed no
-/// new recovery machinery.
-#[derive(Debug, Clone, Copy)]
-enum InFlight {
-    Insert { id: u64, value: [u8; VALUE_LEN] },
-    Update { id: u64, value: [u8; VALUE_LEN] },
-    Delete { id: u64, old: [u8; VALUE_LEN] },
+/// Half of them fill a row exactly — the shape the fixed-slot single-op
+/// write path produces, and the one the harness has always covered — and
+/// the rest are drawn across the multi-slot range, empty values included:
+/// a zero-length value is still a value and still needs a row to say so.
+fn gen_value(rng: &mut ChaCha8Rng) -> Vec<u8> {
+    let len = if rng.gen_bool(0.5) {
+        VALUE_LEN
+    } else {
+        rng.gen_range(0..=4 * VALUE_LEN)
+    };
+    let mut value = vec![0u8; len];
+    rng.fill_bytes(&mut value);
+    value
 }
 
-impl InFlight {
+/// Row slots a value consumes: one per row-width of bytes, at least one.
+/// The engine's rule (`on_batch`), restated here so the oracle counts
+/// slots independently of the code it is checking.
+fn slots_for(len: usize) -> u64 {
+    (len.div_ceil(VALUE_LEN).max(1)) as u64
+}
+
+/// One write inside a commit.
+///
+/// All three kinds reconcile identically — appended slots, one generation
+/// — which is the whole reason deletes, updates, long values and batches
+/// needed no new recovery machinery.
+#[derive(Debug, Clone)]
+enum Step {
+    Insert { id: u64, value: Vec<u8> },
+    Update { id: u64, value: Vec<u8> },
+    Delete { id: u64 },
+}
+
+impl Step {
+    /// Slots this step appends. A value takes one per row-width; a
+    /// deletion takes the one its tombstone lives in.
+    fn slots(&self) -> u64 {
+        match self {
+            Step::Insert { value, .. } | Step::Update { value, .. } => slots_for(value.len()),
+            Step::Delete { .. } => 1,
+        }
+    }
+
+    fn to_op(&self) -> dabqlite_core::BatchOp<'_> {
+        match self {
+            Step::Insert { id, value } => dabqlite_core::BatchOp::Insert { id: *id, value },
+            Step::Update { id, value } => dabqlite_core::BatchOp::Update { id: *id, value },
+            Step::Delete { id } => dabqlite_core::BatchOp::Delete { id: *id },
+        }
+    }
+
+    /// True when this step can also be issued through the single-op input
+    /// path, which carries a fixed-width value and no batch framing.
+    fn fits_single_op(&self) -> bool {
+        match self {
+            Step::Insert { value, .. } | Step::Update { value, .. } => value.len() == VALUE_LEN,
+            Step::Delete { .. } => true,
+        }
+    }
+
     /// Apply to the model. `log` mirrors ROW order, which is what
     /// substring search returns: an update moves its row to the end.
     fn apply(
         &self,
-        oracle: &mut BTreeMap<u64, [u8; VALUE_LEN]>,
-        log: &mut Vec<(u64, [u8; VALUE_LEN])>,
-        history: &mut Vec<(u64, [u8; VALUE_LEN])>,
+        oracle: &mut BTreeMap<u64, Vec<u8>>,
+        log: &mut Vec<(u64, Vec<u8>)>,
+        history: &mut Vec<(u64, Vec<u8>)>,
     ) {
-        if let InFlight::Insert { id, value } | InFlight::Update { id, value } = *self {
-            history.push((id, value));
+        match self {
+            Step::Insert { id, value } => {
+                history.push((*id, value.clone()));
+                oracle.insert(*id, value.clone());
+                log.push((*id, value.clone()));
+            }
+            Step::Update { id, value } => {
+                history.push((*id, value.clone()));
+                oracle.insert(*id, value.clone());
+                log.retain(|(k, _)| k != id);
+                log.push((*id, value.clone()));
+            }
+            Step::Delete { id } => {
+                oracle.remove(id);
+                log.retain(|(k, _)| k != id);
+            }
         }
-        match *self {
-            InFlight::Insert { id, value } => {
-                oracle.insert(id, value);
-                log.push((id, value));
+    }
+
+    /// Apply to a projection, for planning a batch against the state its
+    /// predecessors in the same commit would leave — exactly the rule the
+    /// engine validates by.
+    fn project(&self, state: &mut BTreeMap<u64, Vec<u8>>) {
+        match self {
+            Step::Insert { id, value } | Step::Update { id, value } => {
+                state.insert(*id, value.clone());
             }
-            InFlight::Update { id, value } => {
-                oracle.insert(id, value);
-                log.retain(|(k, _)| *k != id);
-                log.push((id, value));
+            Step::Delete { id } => {
+                state.remove(id);
             }
-            InFlight::Delete { id, .. } => {
-                oracle.remove(&id);
-                log.retain(|(k, _)| *k != id);
-            }
+        }
+    }
+
+    fn id(&self) -> u64 {
+        match self {
+            Step::Insert { id, .. } | Step::Update { id, .. } | Step::Delete { id } => *id,
+        }
+    }
+}
+
+/// A commit that may or may not have landed when a fault hit: one step or
+/// several, all-or-nothing either way.
+///
+/// A batch is not a special case here. It is the general one: a single
+/// insert is a one-step commit, and the reconciliation below has exactly
+/// one rule because the engine has exactly one commit protocol.
+#[derive(Debug, Clone)]
+struct InFlight {
+    steps: Vec<Step>,
+    /// Every id the commit touches, as it was BEFORE — the exact state a
+    /// commit that did not land must have left behind. Recorded per id
+    /// rather than per step, because a batch may touch one id twice and
+    /// only the state at its edges is observable.
+    before: BTreeMap<u64, Option<Vec<u8>>>,
+    /// The same ids as they must be if the commit DID land.
+    after: BTreeMap<u64, Option<Vec<u8>>>,
+    /// Issued as an atomic batch rather than through the single-op path.
+    batched: bool,
+}
+
+impl InFlight {
+    /// Slots the whole commit appends.
+    fn slots(&self) -> u64 {
+        self.steps.iter().map(Step::slots).sum()
+    }
+
+    fn apply(
+        &self,
+        oracle: &mut BTreeMap<u64, Vec<u8>>,
+        log: &mut Vec<(u64, Vec<u8>)>,
+        history: &mut Vec<(u64, Vec<u8>)>,
+    ) {
+        for step in &self.steps {
+            step.apply(oracle, log, history);
         }
     }
 
     fn assert_committed(&self, host: &mut SimHost, ctx: &str) {
-        match *self {
-            InFlight::Insert { id, value } | InFlight::Update { id, value } => assert_eq!(
-                host.get(id),
-                Some(value),
-                "[{ctx}] in-flight write committed but is not readable"
-            ),
-            InFlight::Delete { id, .. } => assert_eq!(
-                host.get(id),
-                None,
-                "[{ctx}] in-flight delete committed but the row is still there"
-            ),
+        for (&id, want) in &self.after {
+            assert_eq!(
+                host.get_bytes(id).as_deref(),
+                want.as_deref(),
+                "[{ctx}] commit landed but id={id} does not read back as it should"
+            );
         }
     }
 
     fn assert_not_committed(&self, host: &mut SimHost, ctx: &str) {
-        match *self {
-            InFlight::Insert { id, .. } => {
-                assert_eq!(host.get(id), None, "[{ctx}] uncommitted insert is visible")
-            }
-            // An uncommitted update or delete must leave the OLD value
-            // exactly as it was — a half-applied write is the failure this
-            // whole design exists to prevent.
-            InFlight::Update { id, .. } => assert!(
-                host.get(id).is_some(),
-                "[{ctx}] uncommitted update lost the row"
-            ),
-            InFlight::Delete { id, old } => assert_eq!(
-                host.get(id),
-                Some(old),
-                "[{ctx}] uncommitted delete removed or altered the row"
-            ),
+        // A half-applied commit is the failure this whole design exists to
+        // prevent: every id the commit touched must be EXACTLY as it was,
+        // not merely present.
+        for (&id, want) in &self.before {
+            assert_eq!(
+                host.get_bytes(id).as_deref(),
+                want.as_deref(),
+                "[{ctx}] commit did not land but id={id} changed anyway"
+            );
         }
+    }
+}
+
+/// What one commit attempt did — read identically off the single-op and
+/// the batch paths, because the outcomes ARE identical: a commit lands
+/// whole, is refused before any I/O, or is left unresolved by a fault.
+#[derive(Debug, Clone, Copy)]
+enum Landed {
+    /// Durably committed. `rows` is the slot count the batch path
+    /// reports; the single-op path does not carry one.
+    Committed {
+        rows: Option<u64>,
+    },
+    /// Refused at the capacity wall, before any I/O.
+    Full,
+    /// Fail-stop: the commit is unresolved until recovery says.
+    IoFailed,
+    /// The machine died mid-commit: likewise unresolved.
+    Crashed,
+    Unexpected,
+}
+
+fn classify(driven: Driven) -> Landed {
+    let out = match driven {
+        Driven::Crashed => return Landed::Crashed,
+        Driven::Done(out) => out,
+    };
+    let error = match out {
+        Output::InsertDone { result: Ok(()), .. }
+        | Output::UpdateDone { result: Ok(()), .. }
+        | Output::DeleteDone { result: Ok(()), .. } => return Landed::Committed { rows: None },
+        Output::BatchDone {
+            rows,
+            result: Ok(()),
+        } => return Landed::Committed { rows: Some(rows) },
+        Output::InsertDone { result: Err(e), .. }
+        | Output::UpdateDone { result: Err(e), .. }
+        | Output::DeleteDone { result: Err(e), .. }
+        | Output::BatchDone {
+            result: Err(dabqlite_core::BatchReject { error: e, .. }),
+            ..
+        } => e,
+        _ => return Landed::Unexpected,
+    };
+    match error {
+        DbError::Full { .. } => Landed::Full,
+        DbError::IoFailed { .. } => Landed::IoFailed,
+        _ => Landed::Unexpected,
     }
 }
 
@@ -200,8 +357,8 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
     // The oracle: everything certainly committed (§7.2 technique 3),
     // plus the same facts in INSERTION order — the substring index answers
     // in row order, so the log is its exact oracle.
-    let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
-    let mut log: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
+    let mut oracle: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut log: Vec<(u64, Vec<u8>)> = Vec::new();
     // Slots consumed on disk. Distinct from `oracle.len()` as soon as
     // anything is deleted or updated, because every write appends.
     let mut slots: u64;
@@ -209,7 +366,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
     // value the current oracle no longer holds — quarantining a tombstone
     // loses a deletion — but it must never serve one that was never
     // written at all.
-    let mut history: Vec<(u64, [u8; VALUE_LEN])> = Vec::new();
+    let mut history: Vec<(u64, Vec<u8>)> = Vec::new();
 
     // Some lifetimes begin as a LEGACY v1 database: migrate it first,
     // under the same fault schedule as everything else. The two-worlds
@@ -270,10 +427,10 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             );
         }
         for &(id, v1) in &v1_ops {
-            let mut value = [0u8; VALUE_LEN];
+            let mut value = vec![0u8; VALUE_LEN];
             value[..V1_VALUE_LEN].copy_from_slice(&v1);
-            oracle.insert(id, value);
-            log.push((id, value));
+            oracle.insert(id, value.clone());
+            log.push((id, value.clone()));
             history.push((id, value));
         }
     }
@@ -291,13 +448,13 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         let ctx = format!("seed={seed} cycle={cycle}");
         stats.cycles = cycle + 1;
 
-        // Plan this cycle: some inserts, ended by a machine crash, an I/O
+        // Plan this cycle: some commits, ended by a machine crash, an I/O
         // failure (fail-stop, dirty cache survives into the restart), or a
         // clean restart. All three restart paths matter.
-        let inserts = rng.gen_range(1..=cfg.max_inserts_per_cycle);
-        // ~5 I/O ops per insert; sometimes the boundary lands past the end,
+        let commits = rng.gen_range(1..=cfg.max_inserts_per_cycle);
+        // ~5 I/O ops per commit; sometimes the boundary lands past the end,
         // meaning this cycle completes without incident.
-        let fault_delta = rng.gen_range(1..=(inserts as u64) * 5 + 3);
+        let fault_delta = rng.gen_range(1..=(commits as u64) * 5 + 3);
         let io_fail_cycle = rng.gen_bool(cfg.io_fail_p);
         if io_fail_cycle {
             host.fail_after = Some(host.io_count + fault_delta);
@@ -308,97 +465,135 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         let mut in_flight: Option<InFlight> = None;
         let mut crashed = false;
         let mut io_failed = false;
-        for _ in 0..inserts {
-            // Every write kind takes one slot and one generation, so all
-            // three reconcile identically after a fault: the operation is
-            // committed or it is not.
-            let roll = rng.gen_range(0..100u32);
-            let existing = (!oracle.is_empty()).then(|| {
-                *oracle
-                    .keys()
-                    .nth(rng.gen_range(0..oracle.len()))
-                    .expect("non-empty")
-            });
-            let op = match (existing, roll) {
-                (Some(id), r) if r < 15 => {
-                    let old = oracle[&id];
-                    InFlight::Delete { id, old }
-                }
-                (Some(id), r) if r < 30 => {
-                    let mut value = [0u8; VALUE_LEN];
-                    rng.fill_bytes(&mut value);
-                    InFlight::Update { id, value }
-                }
-                _ => {
-                    let id: u64 = rng.gen();
-                    let mut value = [0u8; VALUE_LEN];
-                    rng.fill_bytes(&mut value);
-                    InFlight::Insert { id, value }
-                }
+        for _ in 0..commits {
+            // Plan ONE commit: usually a single write, sometimes a batch
+            // of several. Batch ops are validated against the state their
+            // predecessors in the same commit would leave, so the plan is
+            // built against a projection of the oracle — the same rule,
+            // arrived at independently.
+            let n_steps = if rng.gen_bool(0.3) {
+                rng.gen_range(2..=4usize)
+            } else {
+                1
             };
-            let driven = match op {
-                InFlight::Insert { id, value } => host.run(ClientOp::Insert { id, value }),
-                InFlight::Update { id, value } => host.run(ClientOp::Update { id, value }),
-                InFlight::Delete { id, .. } => host.run(ClientOp::Delete { id }),
-            };
-            match driven {
-                Driven::Done(
-                    Output::InsertDone { result: Ok(()), .. }
-                    | Output::UpdateDone { result: Ok(()), .. }
-                    | Output::DeleteDone { result: Ok(()), .. },
-                ) => {
-                    op.apply(&mut oracle, &mut log, &mut history);
-                    slots += 1;
-                    stats.commits += 1;
-                    match op {
-                        InFlight::Delete { .. } => stats.deletes += 1,
-                        InFlight::Update { .. } => stats.updates += 1,
-                        InFlight::Insert { .. } => {}
-                    }
-                }
-                Driven::Done(
-                    Output::InsertDone {
-                        result: Err(dabqlite_core::DbError::Full { .. }),
-                        ..
-                    }
-                    | Output::UpdateDone {
-                        result: Err(dabqlite_core::DbError::Full { .. }),
-                        ..
-                    }
-                    | Output::DeleteDone {
-                        result: Err(dabqlite_core::DbError::Full { .. }),
-                        ..
+            let mut projected = oracle.clone();
+            let mut steps: Vec<Step> = Vec::new();
+            let mut before: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+            for _ in 0..n_steps {
+                let roll = rng.gen_range(0..100u32);
+                let existing = (!projected.is_empty()).then(|| {
+                    *projected
+                        .keys()
+                        .nth(rng.gen_range(0..projected.len()))
+                        .expect("non-empty")
+                });
+                let step = match (existing, roll) {
+                    (Some(id), r) if r < 15 => Step::Delete { id },
+                    (Some(id), r) if r < 30 => Step::Update {
+                        id,
+                        value: gen_value(&mut rng),
                     },
-                ) => {
-                    // Legitimate at capacity — which counts SLOTS, not
-                    // live rows: deletes and updates consume them too.
-                    assert_eq!(slots, cfg.caps.rows, "[{ctx}] Full below capacity");
+                    _ => {
+                        let id: u64 = rng.gen();
+                        // A 64-bit id colliding inside one batch is not a
+                        // case worth generating; skipping keeps every
+                        // planned batch legal by construction.
+                        if projected.contains_key(&id) {
+                            continue;
+                        }
+                        Step::Insert {
+                            id,
+                            value: gen_value(&mut rng),
+                        }
+                    }
+                };
+                before
+                    .entry(step.id())
+                    .or_insert_with(|| oracle.get(&step.id()).cloned());
+                step.project(&mut projected);
+                steps.push(step);
+            }
+            if steps.is_empty() {
+                continue;
+            }
+            let after: BTreeMap<u64, Option<Vec<u8>>> = before
+                .keys()
+                .map(|&id| (id, projected.get(&id).cloned()))
+                .collect();
+            // One step whose value fills a row exactly can go through the
+            // single-op input path as well as the batch one; both are real
+            // ways to reach the same commit protocol, so both are driven.
+            let batched = steps.len() > 1 || !steps[0].fits_single_op() || rng.gen_bool(0.5);
+            let op = InFlight {
+                steps,
+                before,
+                after,
+                batched,
+            };
+            let need = op.slots();
+
+            let driven = if batched {
+                let ops: Vec<dabqlite_core::BatchOp> = op.steps.iter().map(Step::to_op).collect();
+                host.batch(&ops)
+            } else {
+                match &op.steps[0] {
+                    Step::Insert { id, value } => host.run(ClientOp::Insert {
+                        id: *id,
+                        value: <[u8; VALUE_LEN]>::try_from(&value[..]).expect("row-width value"),
+                    }),
+                    Step::Update { id, value } => host.run(ClientOp::Update {
+                        id: *id,
+                        value: <[u8; VALUE_LEN]>::try_from(&value[..]).expect("row-width value"),
+                    }),
+                    Step::Delete { id } => host.run(ClientOp::Delete { id: *id }),
+                }
+            };
+            match classify(driven) {
+                Landed::Committed { rows } => {
+                    if let Some(rows) = rows {
+                        assert_eq!(rows, need, "[{ctx}] batch committed the wrong slot count");
+                    }
+                    op.apply(&mut oracle, &mut log, &mut history);
+                    slots += need;
+                    stats.commits += 1;
+                    if op.batched {
+                        stats.batches += 1;
+                        stats.batch_steps += op.steps.len() as u64;
+                    }
+                    for step in &op.steps {
+                        match step {
+                            Step::Delete { .. } => stats.deletes += 1,
+                            Step::Update { .. } => stats.updates += 1,
+                            Step::Insert { .. } => {}
+                        }
+                        if step.slots() > 1 {
+                            stats.long_values += 1;
+                        }
+                    }
+                }
+                Landed::Full => {
+                    // Legitimate only when the commit genuinely does not
+                    // fit — and capacity counts SLOTS, not live rows:
+                    // deletes, updates and every row of a long value
+                    // consume them too.
+                    assert!(
+                        slots + need > cfg.caps.rows,
+                        "[{ctx}] Full with room for {need} more slots at {slots}/{}",
+                        cfg.caps.rows
+                    );
                     stats.full_rejections += 1;
                 }
-                Driven::Done(
-                    Output::InsertDone {
-                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
-                        ..
-                    }
-                    | Output::UpdateDone {
-                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
-                        ..
-                    }
-                    | Output::DeleteDone {
-                        result: Err(dabqlite_core::DbError::IoFailed { .. }),
-                        ..
-                    },
-                ) => {
+                Landed::IoFailed => {
                     in_flight = Some(op);
                     io_failed = true;
                     break;
                 }
-                Driven::Done(other) => panic!("[{ctx}] unexpected write result: {other:?}"),
-                Driven::Crashed => {
+                Landed::Crashed => {
                     in_flight = Some(op);
                     crashed = true;
                     break;
                 }
+                Landed::Unexpected => panic!("[{ctx}] unexpected write result: {driven:?}"),
             }
         }
 
@@ -423,27 +618,38 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             host = recover(&ctx, cfg, disk, &mut rng, &mut stats);
         }
 
-        // Resolve the in-flight write — insert, update or delete alike:
-        // it committed or it did not, atomically, and the SLOT count says
-        // which.
+        // Resolve the in-flight commit — one insert or a batch of four
+        // multi-slot values, it makes no difference: it committed or it
+        // did not, atomically, and the SLOT count says which. There is no
+        // third answer to look for, which is the point.
         let (used, _) = host.engine.usage();
-        if used == slots + 1 {
-            let op = in_flight.unwrap_or_else(|| panic!("[{ctx}] extra slot with none in flight"));
+        let staged = in_flight.as_ref().map_or(0, InFlight::slots);
+        if used == slots + staged && staged > 0 {
+            let op = in_flight
+                .clone()
+                .unwrap_or_else(|| panic!("[{ctx}] extra slot with none in flight"));
             op.apply(&mut oracle, &mut log, &mut history);
-            slots += 1;
+            slots += staged;
             op.assert_committed(&mut host, &ctx);
             stats.in_flight_committed += 1;
         } else {
             assert_eq!(used, slots, "[{ctx}] recovered slot count diverged");
-            if let Some(op) = in_flight {
+            if let Some(op) = &in_flight {
                 op.assert_not_committed(&mut host, &ctx);
                 stats.in_flight_lost += 1;
             }
         }
 
         // Full-database verification against the oracle, every cycle.
-        for (&id, &value) in &oracle {
-            assert_eq!(host.get(id), Some(value), "[{ctx}] committed id={id} lost");
+        // `get_bytes` reassembles a value from the bounded windows the
+        // protocol hands back, so a four-slot value is checked byte for
+        // byte exactly like a one-slot one.
+        for (&id, value) in &oracle {
+            assert_eq!(
+                host.get_bytes(id).as_deref(),
+                Some(value.as_slice()),
+                "[{ctx}] committed id={id} lost"
+            );
         }
         // Ordered-scan verification: a full paged range scan must equal the
         // oracle exactly, in key order — the rebuilt B+tree is checked
@@ -460,18 +666,21 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                     Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
                     other => panic!("[{ctx}] range scan failed: {other:?}"),
                 };
-                for item in &page.items[..page.count as usize] {
-                    let (k, v) = (
-                        item.id,
-                        <[u8; VALUE_LEN]>::try_from(
-                            item.value().expect("lifetime values fit one slot"),
-                        )
-                        .expect("full-width value"),
-                    );
-                    let (&ok, &ov) = oracle_iter
+                let refs: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+                for item in refs {
+                    // A page carries a head and a length; anything longer
+                    // than a row is read the proper way rather than
+                    // compared against a prefix.
+                    let v = match item.value() {
+                        Some(v) => v.to_vec(),
+                        None => host
+                            .get_bytes(item.id)
+                            .expect("a scanned row is readable by id"),
+                    };
+                    let (&ok, ov) = oracle_iter
                         .next()
-                        .unwrap_or_else(|| panic!("[{ctx}] scan has extra key {k}"));
-                    assert_eq!((k, v), (ok, ov), "[{ctx}] ordered scan diverged");
+                        .unwrap_or_else(|| panic!("[{ctx}] scan has extra key {}", item.id));
+                    assert_eq!((item.id, &v), (ok, ov), "[{ctx}] ordered scan diverged");
                     scanned += 1;
                 }
                 match page.next {
@@ -489,7 +698,11 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         for _ in 0..4 {
             let absent: u64 = rng.gen();
             if !oracle.contains_key(&absent) {
-                assert_eq!(host.get(absent), None, "[{ctx}] phantom row id={absent}");
+                assert_eq!(
+                    host.get_bytes(absent),
+                    None,
+                    "[{ctx}] phantom row id={absent}"
+                );
             }
         }
         // Substring-search verification: the rebuilt trigram index against
@@ -500,10 +713,26 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             debug_assert_eq!(log.len(), oracle.len(), "[{ctx}] log/oracle drift");
             let mut needles: Vec<Vec<u8>> = Vec::new();
             if !log.is_empty() {
-                let (_, v) = log[rng.gen_range(0..log.len())];
-                let off = rng.gen_range(0..=VALUE_LEN - 3);
-                needles.push(v[off..off + 3].to_vec());
-                needles.push(v.to_vec());
+                // A value shorter than a trigram indexes nothing and can
+                // seed no needle, so pick from the ones that can: start
+                // at random and take the first that is long enough.
+                let start = rng.gen_range(0..log.len());
+                let pick = (0..log.len())
+                    .map(|k| (start + k) % log.len())
+                    .find(|&k| log[k].1.len() >= 3);
+                if let Some(k) = pick {
+                    let v = &log[k].1;
+                    let off = rng.gen_range(0..=v.len() - 3);
+                    needles.push(v[off..off + 3].to_vec());
+                    // The longest needle the protocol carries, taken from
+                    // a random window of a random value: on a multi-slot
+                    // value that window usually STRADDLES a row boundary,
+                    // which is the match an index that only looked at head
+                    // slots would quietly miss.
+                    let wide = v.len().min(VALUE_LEN);
+                    let off = rng.gen_range(0..=v.len() - wide);
+                    needles.push(v[off..off + wide].to_vec());
+                }
             }
             let mut noise = vec![0u8; rng.gen_range(3..=4)];
             rng.fill_bytes(&mut noise);
@@ -512,15 +741,15 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 needles.push(Vec::new());
             }
             for needle in &needles {
-                let want: Vec<(u64, [u8; VALUE_LEN])> = log
+                let want: Vec<(u64, Vec<u8>)> = log
                     .iter()
                     .filter(|(_, v)| {
                         needle.is_empty() || v.windows(needle.len()).any(|w| w == &needle[..])
                     })
-                    .copied()
+                    .cloned()
                     .collect();
                 assert_eq!(
-                    host.find_all(needle),
+                    host.find_all_bytes(needle),
                     want,
                     "[{ctx}] substring search diverged for {needle:?}"
                 );
@@ -606,7 +835,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             // so the row it removed reappears. That is the documented
             // cost of containment on a database that has churned, and it
             // is bounded by the damage rather than open-ended.
-            let survivors = rescue.range_all(0, u64::MAX);
+            let survivors = rescue.range_all_bytes(0, u64::MAX);
             assert_eq!(
                 survivors.len() as u64,
                 salvaged,

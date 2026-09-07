@@ -12,11 +12,13 @@ use dabqlite_core::generated::records_v1;
 use dabqlite_core::inspect::{inspect, SlotState, Verdict};
 use dabqlite_core::migration::{V1_ROW_SIZE, V1_SCHEMA_HASH};
 use dabqlite_core::{
-    crc32::crc32, Capacities, DbError, FileId, Output, SB_COPY_SIZE, SCHEMA_HASH, VALUE_LEN,
+    crc32::crc32, BatchOp, Capacities, DbError, FileId, Output, ROW_SIZE, SB_COPY_SIZE,
+    SCHEMA_HASH, VALUE_LEN,
 };
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost};
+use rand::{Rng, RngCore};
 
 const CAPS: Capacities = Capacities { rows: 16 };
 
@@ -34,11 +36,15 @@ fn build_db(seed: u64, n: u64) -> SimDisk {
 /// and demand the verdict predicted the outcome — including the orphan
 /// and rollback-evidence accounting when the open succeeds.
 fn assert_agreement(disk: SimDisk, ctx: &str) {
+    assert_agreement_caps(CAPS, disk, ctx);
+}
+
+fn assert_agreement_caps(caps: Capacities, disk: SimDisk, ctx: &str) {
     let report = inspect(
         &disk.contents(FileId::Superblock),
         &disk.contents(FileId::Rows),
     );
-    let mut host = SimHost::new(CAPS, disk, None);
+    let mut host = SimHost::new(caps, disk, None);
     let actual = match host.open() {
         Driven::Done(Output::OpenDone { result }) => result,
         other => panic!("[{ctx}] open did not finish: {other:?}"),
@@ -52,10 +58,28 @@ fn assert_agreement(disk: SimDisk, ctx: &str) {
         }),
         Verdict::Corrupt { what } => Err(DbError::Corrupt { what }),
     };
-    assert_eq!(
-        predicted, actual,
-        "[{ctx}] inspector and engine disagree: {report:?}"
-    );
+    // The verdict's row count is the MANIFEST — how many slots recovery
+    // adopts — while `OpenDone` reports how many rows are LIVE
+    // afterwards. Those are the same number only until something is
+    // deleted, updated, or written across several slots, so check both
+    // against their own counterpart rather than conflating them.
+    match (predicted, actual) {
+        (Ok(rows), Ok(live)) => {
+            assert_eq!(
+                rows,
+                host.engine.usage().0,
+                "[{ctx}] recovered slot count diverged: {report:?}"
+            );
+            assert_eq!(
+                report.rows.live_records, live,
+                "[{ctx}] inspector and engine disagree about what is LIVE: {report:?}"
+            );
+        }
+        (predicted, actual) => assert_eq!(
+            predicted, actual,
+            "[{ctx}] inspector and engine disagree: {report:?}"
+        ),
+    }
     if matches!(report.verdict, Verdict::Recovers { .. }) {
         let rr = host.engine.recovery_report();
         assert_eq!(
@@ -69,6 +93,173 @@ fn assert_agreement(disk: SimDisk, ctx: &str) {
         assert_eq!(report.rows.committed_corrupt, 0, "[{ctx}]");
         assert_eq!(report.rows.duplicate_ids, 0, "[{ctx}]");
     }
+}
+
+/// A database written the way the newest paths write it: atomic batches
+/// carrying values that span several row slots, with updates and
+/// deletions mixed in so the commit replay has every row kind in it.
+///
+/// The inspector reaches its verdict from the bytes alone, so a value's
+/// RUN — head plus continuations, ending where the head said it would —
+/// is a rule it has to know independently. It did not, once: it counted
+/// every continuation as a stranded chunk and called every long-value
+/// database corrupt, and nothing caught it until the soak started
+/// writing them.
+fn build_varlen_db(seed: u64, caps: Capacities) -> SimDisk {
+    let mut rng = crash_rng(0x5641_524C, seed); // "VARL"
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    let mut values: Vec<(u64, Vec<u8>)> = Vec::new();
+    for i in 0..3u64 {
+        let batch: Vec<(u64, Vec<u8>)> = (0..2u64)
+            .map(|k| {
+                let len = rng.gen_range(0..=3 * VALUE_LEN);
+                let mut v = vec![0u8; len];
+                rng.fill_bytes(&mut v);
+                (i * 2 + k, v)
+            })
+            .collect();
+        let ops: Vec<BatchOp> = batch
+            .iter()
+            .map(|(id, v)| BatchOp::Insert { id: *id, value: v })
+            .collect();
+        assert!(
+            matches!(
+                host.batch(&ops),
+                Driven::Done(Output::BatchDone { result: Ok(()), .. })
+            ),
+            "seed={seed} batch {i} refused"
+        );
+        values.extend(batch);
+    }
+    // One batch that updates a long value and deletes another, so the
+    // replay contains an Update run and a Tombstone as well as Records.
+    let mut fresh = vec![0u8; 2 * VALUE_LEN + 5];
+    rng.fill_bytes(&mut fresh);
+    assert!(matches!(
+        host.batch(&[
+            BatchOp::Update {
+                id: values[0].0,
+                value: &fresh,
+            },
+            BatchOp::Delete { id: values[1].0 },
+        ]),
+        Driven::Done(Output::BatchDone { result: Ok(()), .. })
+    ));
+    std::mem::take(&mut host.disk)
+}
+
+#[test]
+fn agreement_on_long_values_and_batches() {
+    let caps = Capacities { rows: 64 };
+    for seed in 0..6u64 {
+        assert_agreement_caps(
+            caps,
+            build_varlen_db(seed, caps),
+            &format!("varlen seed={seed}"),
+        );
+    }
+}
+
+#[test]
+fn agreement_on_long_values_at_every_crash_boundary() {
+    // A batch of multi-slot values is ONE commit spanning many I/O ops,
+    // so its crash boundaries are exactly where a naive reader would
+    // mistake a partial run for a whole one. Both implementations have
+    // to reach the same verdict at every one of them.
+    let caps = Capacities { rows: 64 };
+    for seed in 0..3u64 {
+        for boundary in 0..14u64 {
+            for settle in 0..2u64 {
+                let disk = build_varlen_db(seed, caps);
+                let mut host = SimHost::new(caps, disk, None);
+                host.open();
+                host.crash_after = Some(host.io_count + boundary);
+                let value = vec![0xA7; 2 * VALUE_LEN + 3];
+                let driven = host.batch(&[
+                    BatchOp::Insert {
+                        id: 900 + seed,
+                        value: &value,
+                    },
+                    BatchOp::Insert {
+                        id: 950 + seed,
+                        value: &value,
+                    },
+                ]);
+                let mut disk = std::mem::take(&mut host.disk);
+                if matches!(driven, Driven::Crashed) {
+                    disk.crash(&mut crash_rng(
+                        0x4C4F_4E47,
+                        seed * 100 + boundary * 4 + settle,
+                    ));
+                }
+                assert_agreement_caps(caps, disk, &format!("seed={seed} b={boundary} s={settle}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn agreement_when_a_continuation_is_damaged_or_stranded() {
+    let caps = Capacities { rows: 64 };
+    // Find a continuation slot: a chunk row is one that follows a head
+    // which said the value continues. Row 1 of a database whose first
+    // value is long is the simplest such slot, so build until one is.
+    let (disk, chunk_row) = (0..8u64)
+        .find_map(|seed| {
+            let disk = build_varlen_db(seed, caps);
+            let rows = disk.contents(FileId::Rows);
+            (1..rows.len() / ROW_SIZE)
+                .find(|&r| {
+                    dabqlite_core::layout::decode_row(&rows[r * ROW_SIZE..(r + 1) * ROW_SIZE])
+                        .is_some_and(|s| s.kind == dabqlite_core::layout::RowKind::Chunk)
+                })
+                .map(|r| (disk, r as u64))
+        })
+        .expect("some seed writes a multi-slot value");
+
+    // Damaged: the head promised a continuation and what follows is not
+    // a readable one, so the WHOLE value is unreadable — not just its
+    // tail, and not the file.
+    let mut damaged = disk.clone();
+    damaged.corrupt(FileId::Rows, chunk_row * ROW_SIZE as u64 + 3, 0x40);
+    let report = inspect(
+        &damaged.contents(FileId::Superblock),
+        &damaged.contents(FileId::Rows),
+    );
+    assert_eq!(
+        report.verdict,
+        Verdict::Corrupt {
+            what: dabqlite_core::defect::TRUNCATED_VALUE
+        },
+        "a value whose continuation is unreadable is not a readable value"
+    );
+    assert_eq!(report.rows.truncated_values, 1);
+    assert_agreement_caps(caps, damaged, "damaged continuation");
+
+    // Stranded: the same bytes copied verbatim over a LATER row (a
+    // checksum covers the row, not its position, so this is exactly what
+    // a misdirected write produces). Nothing in front of it claims it.
+    let rows = disk.contents(FileId::Rows);
+    let bytes = rows[(chunk_row as usize) * ROW_SIZE..(chunk_row as usize + 1) * ROW_SIZE].to_vec();
+    let last = (rows.len() / ROW_SIZE - 1) as u64;
+    assert!(last > chunk_row, "need a later row to strand the copy in");
+    let mut stranded = disk.clone();
+    stranded.write(FileId::Rows, last * ROW_SIZE as u64, &bytes);
+    stranded.fsync(FileId::Rows);
+    let report = inspect(
+        &stranded.contents(FileId::Superblock),
+        &stranded.contents(FileId::Rows),
+    );
+    assert_eq!(
+        report.verdict,
+        Verdict::Corrupt {
+            what: dabqlite_core::defect::ORPHAN_CHUNK
+        },
+        "a continuation with nothing to continue is damage, not a row"
+    );
+    assert_eq!(report.rows.orphan_chunks, 1);
+    assert_agreement_caps(caps, stranded, "stranded continuation");
 }
 
 #[test]

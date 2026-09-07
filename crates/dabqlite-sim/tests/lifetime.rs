@@ -78,6 +78,43 @@ fn every_lifetime_exercises_deletes_and_updates() {
     );
 }
 
+/// Batches and multi-slot values must actually happen in the soak, or
+/// the "every feature in one lifetime pass" claim quietly stops covering
+/// the two newest ways to write. A batch of four values spanning four
+/// slots each is still ONE commit; if the harness only ever issued
+/// one-slot single ops, nothing here would prove that.
+#[test]
+fn every_lifetime_exercises_batches_and_long_values() {
+    let cfg = LifetimeConfig::default();
+    let (mut batches, mut steps, mut long, mut commits) = (0u64, 0u64, 0u64, 0u64);
+    for seed in 0..16u64 {
+        let stats = run_lifetime(seed, &cfg);
+        batches += stats.batches;
+        steps += stats.batch_steps;
+        long += stats.long_values;
+        commits += stats.commits;
+    }
+    assert!(
+        batches > 40,
+        "only {batches} batched commits across the sweep"
+    );
+    assert!(
+        steps > batches,
+        "{steps} steps across {batches} batches: multi-op batches are not \
+         being generated"
+    );
+    assert!(
+        long > 40,
+        "only {long} multi-slot values committed; the long-value path is \
+         under-exercised"
+    );
+    assert!(
+        batches < commits,
+        "single-op writes should still happen: they are a different input \
+         path to the same commit protocol"
+    );
+}
+
 /// Corruption containment is part of the surface too: every cycle damages
 /// a committed row on a COPY of the disk and proves salvage keeps the
 /// rest reachable. A floor keeps that from silently switching itself off.

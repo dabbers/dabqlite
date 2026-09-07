@@ -124,6 +124,19 @@ fn print_report(dir: &Path, report: &InspectReport) {
         report.rows.tombstones
     );
     println!("  superseded by update {}", report.rows.superseded);
+    if report.rows.chunks > 0 {
+        println!(
+            "  value continuations {}  (slots held by values too long for one row)",
+            report.rows.chunks
+        );
+    }
+    if report.rows.truncated_values > 0 {
+        println!(
+            "  TRUNCATED VALUES   {}  (a value's continuations do not run to the end \
+             its head promised; the whole value is unreadable, not just its tail)",
+            report.rows.truncated_values
+        );
+    }
     if report.rows.orphan_tombstones > 0
         || report.rows.orphan_updates > 0
         || report.rows.orphan_chunks > 0
