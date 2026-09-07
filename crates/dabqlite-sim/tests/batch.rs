@@ -518,7 +518,8 @@ fn a_batch_that_overruns_capacity_is_refused_naming_the_op_that_does_not_fit() {
             2,
             DbError::Full {
                 entity: "records",
-                capacity: 6
+                capacity: 6,
+                dead: 0,
             }
         ))
     );

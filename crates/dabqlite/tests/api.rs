@@ -185,14 +185,42 @@ fn a_full_database_says_so_instead_of_failing_obscurely() {
     }
     assert_eq!(
         db.insert(4, Value::from_text("x").unwrap()),
-        Err(Error::Full { capacity: 4 })
+        Err(Error::Full {
+            capacity: 4,
+            dead: 0
+        })
     );
-    // The message tells you what to do about it.
-    let msg = Error::Full { capacity: 4 }.to_string();
-    assert!(msg.contains("full") && msg.contains('4'), "{msg}");
+    // With every slot live, the only way on is a bigger database, and the
+    // message says exactly that rather than suggesting a rebuild that
+    // would reclaim nothing.
+    let msg = db
+        .insert(4, Value::from_text("x").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("larger capacity"), "{msg}");
+    assert!(!msg.contains("compact"), "nothing to compact here: {msg}");
     // Everything is still readable at the wall.
     assert_eq!(db.len(), 4);
     assert_eq!(db.all().unwrap().len(), 4);
+
+    // Now make some of it dead weight, and the message changes to the
+    // thing that would actually help. A compaction needs no free slot, so
+    // it is available exactly when the database is full.
+    let mut db = Db::in_memory_with(4).expect("open");
+    db.insert(1, Value::from_text("a").unwrap()).unwrap();
+    db.put(1, Value::from_text("b").unwrap()).unwrap();
+    db.put(1, Value::from_text("c").unwrap()).unwrap();
+    db.put(1, Value::from_text("d").unwrap()).unwrap();
+    let err = db.insert(2, Value::from_text("x").unwrap()).unwrap_err();
+    match err {
+        Error::Full { capacity: 4, dead } => {
+            assert_eq!(dead, 3, "three superseded records are dead weight");
+            let msg = err.to_string();
+            assert!(msg.contains("compact"), "{msg}");
+            assert!(msg.contains("no free slot"), "{msg}");
+        }
+        other => panic!("expected Full, got {other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -253,7 +281,14 @@ fn errors_are_all_displayable_and_say_something_useful() {
     let cases: Vec<Error> = vec![
         Error::NotFound { id: 5 },
         Error::AlreadyExists { id: 5 },
-        Error::Full { capacity: 10 },
+        Error::Full {
+            capacity: 10,
+            dead: 0,
+        },
+        Error::Full {
+            capacity: 10,
+            dead: 4,
+        },
         Error::ValueTooLong { len: 20, max: 16 },
         Error::Degraded { quarantined: 2 },
         Error::Corrupt { what: "test" },
@@ -262,7 +297,8 @@ fn errors_are_all_displayable_and_say_something_useful() {
             binary: 2,
         },
         Error::Io {
-            detail: "disk".into(),
+            kind: std::io::ErrorKind::StorageFull,
+            detail: "no space left on device".into(),
         },
         Error::CapacityTooSmall {
             required: 20,
@@ -283,6 +319,20 @@ fn errors_are_all_displayable_and_say_something_useful() {
     // Every variant must appear above. This match exists to break the
     // build when a new one is added: a variant with no case here is a
     // variant whose message nobody ever read.
+    const ALL_VARIANTS: &[&str] = &[
+        "NotFound",
+        "AlreadyExists",
+        "Full",
+        "CapacityTooSmall",
+        "Locked",
+        "ValueTooLong",
+        "Degraded",
+        "Corrupt",
+        "SchemaMismatch",
+        "Io",
+        "BatchTooLong",
+        "BatchRejected",
+    ];
     fn covered(e: &Error) -> &'static str {
         match e {
             Error::NotFound { .. } => "NotFound",
@@ -299,14 +349,15 @@ fn errors_are_all_displayable_and_say_something_useful() {
             Error::BatchRejected { .. } => "BatchRejected",
         }
     }
+    // Every variant must appear at least once. `covered` breaks the build
+    // when a variant is added; this catches the case where it was added
+    // there but no example was added here.
+    let mut all: Vec<&'static str> = ALL_VARIANTS.to_vec();
+    all.sort_unstable();
     let mut seen: Vec<&'static str> = cases.iter().map(covered).collect();
     seen.sort_unstable();
     seen.dedup();
-    assert_eq!(
-        seen.len(),
-        cases.len(),
-        "the case list has duplicates, so some variant is untested"
-    );
+    assert_eq!(seen, all, "some error variant has no example in this test");
 
     for e in cases {
         let msg = e.to_string();
@@ -762,4 +813,70 @@ fn a_snapshot_carries_the_capacity_it_was_written_with() {
         "a reloaded snapshot got a different ceiling than the one saved"
     );
     assert_eq!(reloaded.get(1).unwrap().unwrap().text(), "one");
+}
+
+/// A snapshot can go back onto disk, atomically.
+///
+/// `snapshot()` had no inverse: a snapshot IS the two files, but putting
+/// them back safely meant writing your own temp-file-and-rename, and every
+/// sample application that saved one did exactly that.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_can_be_restored_onto_a_directory() {
+    let dir = scratch("restore");
+    let source = {
+        let mut db = Db::in_memory_with(200).expect("open");
+        for i in 0..30u64 {
+            db.put(i, Value::from_bytes(&vec![b'v'; 40 + i as usize]).unwrap())
+                .unwrap();
+        }
+        db.remove(3).unwrap();
+        db.snapshot().unwrap()
+    };
+
+    // Onto a directory that does not exist yet.
+    {
+        let mut db = Db::restore(&dir, &source).expect("restore");
+        assert_eq!(db.len(), 29);
+        assert_eq!(db.get(3).unwrap(), None);
+        assert_eq!(db.get(7).unwrap().unwrap().len(), 47);
+        assert_eq!(db.stats().capacity, 200, "the capacity came with it");
+        // Restoring rebuilds, so the dead slot the delete left is gone.
+        assert_eq!(db.stats().dead, 0);
+    }
+
+    // And over a directory that already holds a different database.
+    {
+        let mut existing = Db::open(&dir).expect("reopen");
+        existing
+            .put(999, Value::from_text("later").unwrap())
+            .unwrap();
+        assert!(existing.contains(999).unwrap());
+    }
+    {
+        let mut db = Db::restore(&dir, &source).expect("restore over");
+        assert_eq!(
+            db.get(999).unwrap(),
+            None,
+            "the old contents should be gone"
+        );
+        assert_eq!(db.len(), 29);
+    }
+
+    // It refuses while another writer holds the target, rather than
+    // pulling the directory out from under them.
+    {
+        let _held = Db::open(&dir).expect("hold the lock");
+        match Db::restore(&dir, &source) {
+            Err(Error::Locked { .. }) => {}
+            other => panic!("expected Locked, got {other:?}"),
+        }
+    }
+    // And the database it refused to overwrite is untouched.
+    {
+        let db = Db::open(&dir).expect("still there");
+        assert_eq!(db.len(), 29);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(dir.with_extension("compacting")).ok();
 }

@@ -262,6 +262,10 @@ impl Storage for PosixStorage {
         self.file(file).sync_all()
     }
 
+    fn classify(err: &io::Error) -> io::ErrorKind {
+        err.kind()
+    }
+
     fn truncate(&mut self, file: FileId, len: u64) -> Result<(), io::Error> {
         // Only ever shrinks: `set_len` would zero-extend a shorter file,
         // and growing the rows file behind the engine's back is not

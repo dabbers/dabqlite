@@ -274,9 +274,15 @@ pub enum Error {
     NotFound { id: u64 },
     /// A row with this id already exists. Use [`Db::put`] to overwrite.
     AlreadyExists { id: u64 },
-    /// The database is at its declared row capacity. Reopen with a larger
-    /// one, or rebuild to reclaim the slots deletes and updates consumed.
-    Full { capacity: u64 },
+    /// The database is at its declared row capacity.
+    ///
+    /// `dead` is how many of those slots hold nothing useful — records
+    /// that were superseded or deleted, and the tombstones that retired
+    /// them. If it is nonzero, [`Db::compact`] gets them back, and it
+    /// needs no free slot to do it. If it is zero the database is
+    /// genuinely full of live rows, and the only way on is to reopen with
+    /// a larger capacity.
+    Full { capacity: u64, dead: u64 },
     /// The capacity asked for at open is smaller than the data already on
     /// disk. Reopen with at least `required`.
     ///
@@ -300,7 +306,18 @@ pub enum Error {
     /// The files were written by a different schema version.
     SchemaMismatch { file_schema: u64, binary: u64 },
     /// Storage failed. The database has fail-stopped; reopen it.
-    Io { detail: String },
+    ///
+    /// `kind` is the classification a caller can branch on without
+    /// reading English: `StorageFull` means run a compaction or make
+    /// room, `PermissionDenied` means fix the mount, and the rest mean
+    /// the volume is in trouble. Before it existed the only way to tell
+    /// ENOSPC from EACCES from EIO was to substring-match a
+    /// `Debug`-rendered `io::Error`, which is the antipattern
+    /// [`Error::Locked`] was introduced to remove.
+    Io {
+        kind: std::io::ErrorKind,
+        detail: String,
+    },
     /// The batch needs more row slots than one commit can carry. NOT the
     /// same as [`Error::Full`], which is the database being out of room:
     /// a batch can be too long while the database is nearly empty.
@@ -322,18 +339,23 @@ impl core::fmt::Display for Error {
         match self {
             Error::NotFound { id } => write!(f, "no row with id {id}"),
             Error::AlreadyExists { id } => write!(f, "row {id} already exists"),
-            Error::Full { capacity } => write!(
+            Error::Full { capacity, dead: 0 } => write!(
                 f,
-                "database is full at its declared capacity of {capacity} rows"
+                "database is full at its declared capacity of {capacity} rows, and \
+                 every slot holds live data; reopen it with a larger capacity"
+            ),
+            Error::Full { capacity, dead } => write!(
+                f,
+                "database is full at its declared capacity of {capacity} rows, but \
+                 {dead} of them are dead weight; Db::compact() reclaims them and \
+                 needs no free slot to do it"
             ),
             Error::CapacityTooSmall { required, asked } => write!(
                 f,
                 "opened with room for {asked} rows, but {required} are already \
                  stored; reopen with at least {required}"
             ),
-            Error::Locked { detail } => {
-                write!(f, "database is open by another writer: {detail}")
-            }
+            Error::Locked { detail } => write!(f, "database is open by another writer: {detail}"),
             Error::ValueTooLong { len, max } => {
                 write!(f, "value is {len} bytes; the row holds {max}")
             }
@@ -351,7 +373,7 @@ impl core::fmt::Display for Error {
                 "files were written by schema 0x{file_schema:016X}, this build is \
                  0x{binary:016X}"
             ),
-            Error::Io { detail } => write!(f, "storage failed: {detail}"),
+            Error::Io { kind, detail } => write!(f, "storage failed ({kind:?}): {detail}"),
             Error::BatchTooLong { rows, max } => write!(
                 f,
                 "this batch needs {rows} row slots and one commit holds {max}; \
@@ -383,7 +405,7 @@ impl From<DbError> for Error {
         match e {
             DbError::NotFound { id } => Error::NotFound { id },
             DbError::DuplicateId { id } => Error::AlreadyExists { id },
-            DbError::Full { capacity, .. } => Error::Full { capacity },
+            DbError::Full { capacity, dead, .. } => Error::Full { capacity, dead },
             DbError::Degraded { quarantined } => Error::Degraded { quarantined },
             DbError::Corrupt { what } => Error::Corrupt { what },
             DbError::SchemaMismatch {
@@ -408,13 +430,20 @@ impl From<DbError> for Error {
                 len: len as usize,
                 max: max as usize,
             },
+            // The engine reports WHICH file failed, not why — the host
+            // knows why, and keeps it in `Host::last_error`. Callers who
+            // need the reason read it there; this is the shape the engine
+            // can honestly produce.
             DbError::IoFailed { file } => Error::Io {
-                detail: format!("{file:?}"),
+                kind: std::io::ErrorKind::Other,
+                detail: format!("the {file:?} file failed"),
             },
             DbError::Busy => Error::Io {
+                kind: std::io::ErrorKind::WouldBlock,
                 detail: "an operation is already in flight".into(),
             },
             DbError::NotOpen => Error::Io {
+                kind: std::io::ErrorKind::Other,
                 detail: "database is not open".into(),
             },
         }
@@ -553,6 +582,54 @@ impl Db<MemoryStorage> {
         Self::load_with(snapshot, rows)
     }
 
+    /// Write a snapshot into a directory as a real database, atomically.
+    ///
+    /// The inverse of [`Db::snapshot`], which had none: a snapshot IS the
+    /// two files, but there was no way to put them back on disk safely,
+    /// so every application that saved one wrote its own
+    /// temp-file-and-rename. This builds the database in a sibling
+    /// directory, fsyncs it, and swaps it in with the same crash-safe
+    /// rename sequence [`Db::compact`] uses — so a crash leaves either the
+    /// old contents or the new ones, never a mixture.
+    ///
+    /// Refuses to overwrite a database another writer holds open.
+    #[cfg(unix)]
+    pub fn restore(
+        path: impl AsRef<std::path::Path>,
+        snapshot: &Snapshot,
+    ) -> Result<Db<PosixStorage>, Error> {
+        let path = path.as_ref();
+        let staging = sibling(path, COMPACT_STAGING);
+        let retired = sibling(path, COMPACT_RETIRED);
+        let rows = recorded_capacity(&snapshot.superblock).unwrap_or(DEFAULT_ROWS);
+
+        // Refuse before touching anything if someone is using the target.
+        if path.exists() {
+            let probe = Db::<PosixStorage>::open_with(path, rows)?;
+            drop(probe);
+        }
+
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&retired);
+        {
+            let mut source = Db::load_with(snapshot, rows)?;
+            let live = source.all()?;
+            let mut fresh = Db::<PosixStorage>::open_with(&staging, rows)?;
+            fresh.refill(live)?;
+        }
+        sync_dir(&staging)?;
+
+        if path.exists() {
+            std::fs::rename(path, &retired).map_err(fs_err)?;
+        }
+        std::fs::rename(&staging, path).map_err(fs_err)?;
+        if let Some(parent) = path.parent() {
+            let _ = sync_dir(parent);
+        }
+        let _ = std::fs::remove_dir_all(&retired);
+        Db::open_with(path, rows)
+    }
+
     /// As [`Db::load`], with a chosen row capacity.
     pub fn load_with(snapshot: &Snapshot, rows: u64) -> Result<Self, Error> {
         let storage = MemoryStorage::from_images(
@@ -600,7 +677,7 @@ impl Db<PosixStorage> {
                     detail: e.to_string(),
                 }
             } else {
-                io_err(e)
+                fs_err(e)
             }
         })?;
         let mut db = Self::start(Host::new(caps(rows), storage))?;
@@ -624,6 +701,7 @@ impl Db<PosixStorage> {
     /// not a rebuild, and says so.
     pub fn compact(&mut self) -> Result<(), Error> {
         let (path, rows) = self.origin.clone().ok_or_else(|| Error::Io {
+            kind: std::io::ErrorKind::Unsupported,
             detail: "this database was not opened from a path".into(),
         })?;
         let staging = sibling(&path, COMPACT_STAGING);
@@ -647,8 +725,8 @@ impl Db<PosixStorage> {
         // The swap. Each step is a rename, and the reopen below resolves
         // every point a crash can land between them.
         let swap = (|| -> Result<(), Error> {
-            std::fs::rename(&path, &retired).map_err(io_err)?;
-            std::fs::rename(&staging, &path).map_err(io_err)?;
+            std::fs::rename(&path, &retired).map_err(fs_err)?;
+            std::fs::rename(&staging, &path).map_err(fs_err)?;
             if let Some(parent) = path.parent() {
                 let _ = sync_dir(parent);
             }
@@ -682,9 +760,9 @@ impl Db<ReadOnlyDir> {
 
     /// As [`Db::salvage`], with a chosen row capacity.
     pub fn salvage_with(path: impl AsRef<std::path::Path>, rows: u64) -> Result<Self, Error> {
-        let storage = ReadOnlyDir::open_dir(path.as_ref()).map_err(io_err)?;
+        let storage = ReadOnlyDir::open_dir(path.as_ref()).map_err(fs_err)?;
         let mut host = Host::new(caps(rows), storage);
-        match host.open_salvage().map_err(io_err)? {
+        match host.open_salvage().map_err(io_err::<ReadOnlyDir>)? {
             Output::OpenDone { result: Ok(_) } => Ok(Db {
                 host: Some(host),
                 origin: None,
@@ -711,7 +789,7 @@ fn sibling(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 fn sync_dir(path: &std::path::Path) -> Result<(), Error> {
     std::fs::File::open(path)
         .and_then(|d| d.sync_all())
-        .map_err(io_err)
+        .map_err(fs_err)
 }
 
 /// Resolve a compaction that a crash interrupted.
@@ -735,13 +813,13 @@ fn finish_interrupted_compaction(path: &std::path::Path) -> Result<(), Error> {
     let staging = sibling(path, COMPACT_STAGING);
     if retired.exists() {
         if path.exists() {
-            std::fs::remove_dir_all(&retired).map_err(io_err)?;
+            std::fs::remove_dir_all(&retired).map_err(fs_err)?;
         } else {
-            std::fs::rename(&retired, path).map_err(io_err)?;
+            std::fs::rename(&retired, path).map_err(fs_err)?;
         }
     }
     if staging.exists() {
-        std::fs::remove_dir_all(&staging).map_err(io_err)?;
+        std::fs::remove_dir_all(&staging).map_err(fs_err)?;
     }
     Ok(())
 }
@@ -750,9 +828,21 @@ fn caps(rows: u64) -> Capacities {
     Capacities { rows: rows.max(1) }
 }
 
-fn io_err<E: core::fmt::Debug>(e: E) -> Error {
+/// Turn a backend error into the caller's, asking the backend how to
+/// classify it (see `Storage::classify`).
+fn io_err<S: Storage>(e: S::Error) -> Error {
     Error::Io {
+        kind: S::classify(&e),
         detail: format!("{e:?}"),
+    }
+}
+
+/// The same, for the facade's own filesystem work, where the error is a
+/// real `io::Error` that already carries a kind and a readable message.
+fn fs_err(e: std::io::Error) -> Error {
+    Error::Io {
+        kind: e.kind(),
+        detail: e.to_string(),
     }
 }
 
@@ -760,7 +850,7 @@ const _: () = assert!(VALUE_LEN == CORE_VALUE_LEN);
 
 impl<S: Storage> Db<S> {
     fn start(mut host: Host<S>) -> Result<Self, Error> {
-        match host.open().map_err(io_err)? {
+        match host.open().map_err(io_err::<S>)? {
             Output::OpenDone { result: Ok(_) } => Ok(Db {
                 host: Some(host),
                 #[cfg(unix)]
@@ -1075,8 +1165,8 @@ impl<S: Storage> Db<S> {
     pub fn snapshot(&mut self) -> Result<Snapshot, Error> {
         use dabqlite_core::FileId;
         let mut read_all = |file| -> Result<Vec<u8>, Error> {
-            let len = self.hm().storage.len(file).map_err(io_err)?;
-            self.hm().storage.read(file, 0, len).map_err(io_err)
+            let len = self.hm().storage.len(file).map_err(io_err::<S>)?;
+            self.hm().storage.read(file, 0, len).map_err(io_err::<S>)
         };
         Ok(Snapshot {
             superblock: read_all(FileId::Superblock)?,

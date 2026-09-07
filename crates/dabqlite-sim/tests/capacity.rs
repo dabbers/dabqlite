@@ -45,7 +45,8 @@ fn fill_to_the_wall_and_over_it() {
         insert(&mut host, CAPS.rows),
         Err(DbError::Full {
             entity: "records",
-            capacity: CAPS.rows
+            capacity: CAPS.rows,
+            dead: 0,
         })
     );
 
@@ -67,7 +68,8 @@ fn fill_to_the_wall_and_over_it() {
         insert(&mut reopened, CAPS.rows),
         Err(DbError::Full {
             entity: "records",
-            capacity: CAPS.rows
+            capacity: CAPS.rows,
+            dead: 0,
         })
     );
 }
@@ -128,7 +130,8 @@ fn crash_at_every_boundary_of_the_last_slot() {
                 insert(&mut recovered, CAPS.rows),
                 Err(DbError::Full {
                     entity: "records",
-                    capacity: CAPS.rows
+                    capacity: CAPS.rows,
+                    dead: 0,
                 })
             );
         }
@@ -156,7 +159,8 @@ fn full_rejection_performs_zero_io_and_changes_nothing() {
             insert(&mut host, CAPS.rows + attempt),
             Err(DbError::Full {
                 entity: "records",
-                capacity: CAPS.rows
+                capacity: CAPS.rows,
+                dead: 0,
             })
         );
     }
@@ -220,7 +224,8 @@ fn eio_at_the_wall_leaves_the_wall_exact() {
             insert(&mut second, CAPS.rows),
             Err(DbError::Full {
                 entity: "records",
-                capacity: CAPS.rows
+                capacity: CAPS.rows,
+                dead: 0,
             }),
             "[{ctx}]"
         );
@@ -265,7 +270,8 @@ fn reopen_capacity_boundaries_are_exact() {
         insert(&mut exact, 99),
         Err(DbError::Full {
             entity: "records",
-            capacity: CAPS.rows
+            capacity: CAPS.rows,
+            dead: 0,
         })
     );
 
@@ -304,7 +310,8 @@ fn reopen_capacity_boundaries_are_exact() {
         insert(&mut grown, 101),
         Err(DbError::Full {
             entity: "records",
-            capacity: CAPS.rows + 1
+            capacity: CAPS.rows + 1,
+            dead: 0,
         })
     );
 }
@@ -400,7 +407,8 @@ fn reopening_under_a_lower_limit_over_live_data() {
         insert(&mut h12, 12),
         Err(DbError::Full {
             entity: "records",
-            capacity: 12
+            capacity: 12,
+            dead: 0,
         })
     );
     // Everything readable, ordered scan exact, at the shrunken wall.
@@ -435,7 +443,8 @@ fn reopening_under_a_lower_limit_over_live_data() {
         insert(&mut h10, 99),
         Err(DbError::Full {
             entity: "records",
-            capacity: 10
+            capacity: 10,
+            dead: 0,
         })
     );
 
@@ -493,7 +502,8 @@ fn reopening_under_a_lower_limit_over_live_data() {
             insert(&mut rec, 11),
             Err(DbError::Full {
                 entity: "records",
-                capacity: 11
+                capacity: 11,
+                dead: 0,
             }),
             "[{ctx}]"
         );

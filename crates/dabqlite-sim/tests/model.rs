@@ -43,6 +43,7 @@ fn engine_matches_oracle_on_random_op_sequences() {
                     Err(DbError::Full {
                         entity: "records",
                         capacity: CAPS.rows,
+                        dead: 0,
                     })
                 } else {
                     oracle.insert(id, value);

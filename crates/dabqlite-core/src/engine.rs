@@ -74,7 +74,17 @@ pub enum DbError {
     /// The zone is at its declared capacity. Raise `Capacities::rows` at
     /// `open()` to make room; `usage()` reports fill level so hosts can
     /// alarm before hitting this.
-    Full { entity: &'static str, capacity: u64 },
+    ///
+    /// `dead` is how many of those slots hold nothing useful — superseded
+    /// records, deleted ones, and the tombstones that retired them. A
+    /// rebuild reclaims exactly those, and needs no free slot to do it, so
+    /// the number is the difference between "run a compaction" and "this
+    /// database really is full".
+    Full {
+        entity: &'static str,
+        capacity: u64,
+        dead: u64,
+    },
     /// A row with this id already exists.
     DuplicateId { id: u64 },
     /// No row with this id exists, so there is nothing to delete. Deleting
@@ -1616,6 +1626,7 @@ impl Engine {
                 result: Err(DbError::Full {
                     entity: "records",
                     capacity: self.caps.rows,
+                    dead: self.dead_slots(),
                 }),
             };
         }
@@ -1656,6 +1667,7 @@ impl Engine {
                 result: Err(DbError::Full {
                     entity: "records",
                     capacity: self.caps.rows,
+                    dead: self.dead_slots(),
                 }),
             };
         }
@@ -1699,6 +1711,7 @@ impl Engine {
                 result: Err(DbError::Full {
                     entity: "records",
                     capacity: self.caps.rows,
+                    dead: self.dead_slots(),
                 }),
             };
         }
@@ -1868,6 +1881,7 @@ impl Engine {
                     DbError::Full {
                         entity: "records",
                         capacity: self.caps.rows,
+                        dead: self.dead_slots(),
                     },
                 );
             }
@@ -3115,7 +3129,8 @@ mod tests {
                 id: 3,
                 result: Err(DbError::Full {
                     entity: "records",
-                    capacity: 2
+                    capacity: 2,
+                    dead: 0
                 })
             }
         );

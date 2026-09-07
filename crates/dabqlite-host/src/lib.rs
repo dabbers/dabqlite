@@ -77,6 +77,20 @@ pub trait Storage {
     /// natively (`truncate`), so it costs no portability; the alternative,
     /// zeroing the region with ordinary writes, is unbounded work at open.
     fn truncate(&mut self, file: FileId, len: u64) -> Result<(), Self::Error>;
+
+    /// How a caller should classify one of this backend's failures.
+    ///
+    /// The engine reports WHICH file failed, never why — it has no
+    /// vocabulary for a reason. The backend does, and this is where it
+    /// says so, so an application can tell "the volume is full" (make
+    /// room) from "permission denied" (fix the mount) from a failing disk
+    /// without substring-matching a `Debug` rendering.
+    ///
+    /// The default is `Other`, which is the honest answer for a backend
+    /// whose errors carry no classification of their own.
+    fn classify(_err: &Self::Error) -> std::io::ErrorKind {
+        std::io::ErrorKind::Other
+    }
 }
 
 /// Drives an [`Engine`] against any [`Storage`]. One request in flight at a

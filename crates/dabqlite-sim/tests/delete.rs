@@ -459,7 +459,9 @@ fn a_full_database_refuses_a_delete_without_touching_anything() {
 
     match host.run_input(Input::Delete { id: 2 }) {
         Driven::Done(Output::DeleteDone {
-            result: Err(DbError::Full { entity, capacity }),
+            result: Err(DbError::Full {
+                entity, capacity, ..
+            }),
             ..
         }) => {
             assert_eq!(entity, "records");

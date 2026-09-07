@@ -562,7 +562,8 @@ fn a_long_value_that_would_not_fit_is_refused_before_any_io() {
         put(&mut host, 2, payload(2, VALUE_LEN * 9)),
         Err(DbError::Full {
             entity: "records",
-            capacity: 8
+            capacity: 8,
+            dead: 0,
         })
     );
     assert_eq!(host.io_count, io_before, "a refused value performed I/O");
