@@ -364,6 +364,7 @@ impl SimHost {
                     | Input::GetFrom { .. }
                     | Input::Range { .. }
                     | Input::RangeRev { .. }
+                    | Input::RangeByValue { .. }
                     | Input::Find { .. }
             ),
             "run_input takes client operations, not I/O completions"
@@ -487,6 +488,39 @@ impl SimHost {
             refs.extend_from_slice(&page.items[..page.count as usize]);
             match page.next {
                 Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        refs.into_iter().map(|r| self.whole(r)).collect()
+    }
+
+    /// Every live row in VALUE order, `lo..=hi` byte-lexicographic, one
+    /// `Input::RangeByValue` per page. An empty `hi` is "no upper bound".
+    pub fn value_all(&mut self, lo: &[u8], hi: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        self.value_all_dir(lo, hi, false)
+    }
+
+    /// The same, greatest value first.
+    pub fn value_all_rev(&mut self, lo: &[u8], hi: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        self.value_all_dir(lo, hi, true)
+    }
+
+    fn value_all_dir(&mut self, lo: &[u8], hi: &[u8], descending: bool) -> Vec<(u64, Vec<u8>)> {
+        let mut refs = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match self.run_input(Input::RangeByValue {
+                lo,
+                hi,
+                after,
+                descending,
+            }) {
+                Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+                other => panic!("value_all: {other:?}"),
+            };
+            refs.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => after = Some(n),
                 None => break,
             }
         }

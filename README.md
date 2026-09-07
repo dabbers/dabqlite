@@ -45,8 +45,11 @@ let mut reader = Db::read_only("./mydb")?;
 
 **Status: steps 1–8 of the [build order](docs/DESIGN.md#9-build-order), plus
 the OPFS backend (step 2).** One table with insert, update, delete and get;
-ordered range scans in both directions; substring search that can be
-anchored to either end or both; values of any length up to 2 KiB; atomic
+ordered range scans in both directions; scans in VALUE order, so an
+application whose real key is a byte string gets key-ordered ranges and
+prefix scans off an index instead of a scan and a sort; substring search
+that can be anchored to either end or both; values of any length up to 2
+KiB; atomic
 multi-write batches, with compare-and-set inside them; lock-free readers
 alongside the single writer, and reads that take `&self`; a declared memory
 ceiling recorded in the database itself; three interchangeable backends

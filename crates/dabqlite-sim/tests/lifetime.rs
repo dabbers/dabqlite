@@ -40,11 +40,13 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     // or the soak's coverage claim is hollow. Floors, not hopes.
     let cfg = LifetimeConfig::default();
     let mut find_checks = 0;
+    let mut value_checks = 0;
     let mut inspections = 0;
     let mut cycles = 0;
     for seed in 0..16u64 {
         let stats = run_lifetime(seed, &cfg);
         find_checks += stats.find_checks;
+        value_checks += stats.value_checks;
         inspections += stats.inspections;
         cycles += stats.cycles as u64;
     }
@@ -55,6 +57,14 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     assert!(
         find_checks >= cycles * 3,
         "only {find_checks} substring checks across {cycles} cycles"
+    );
+    // The value-ordered scan runs every cycle too, and its BOUNDED form
+    // (a bound taken from a real value, so the descent is exercised)
+    // needs a non-empty database — which is most cycles but not the ones
+    // that open onto nothing.
+    assert!(
+        value_checks * 4 >= cycles * 3,
+        "only {value_checks} bounded value-ordered scans across {cycles} cycles"
     );
 }
 

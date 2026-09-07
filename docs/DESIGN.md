@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Five of these have since been decided by building the thing. They are kept
+Six of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -439,6 +439,40 @@ part worth reading.
   general rule the episode teaches: a limit that exists for a FORMAT
   reason must not be spent as if it were a limit that exists for a
   CAPACITY reason.
+- **Keys that are not `u64`** — DECIDED, and the smaller of the two
+  answers turned out to be the right one. All three sample applications
+  named this as the largest structural gap and each paid the same price:
+  a bookmark store, a job queue and a key/value store all hash their real
+  key onto a `u64`, probe past collisions, keep their own tombstones (a
+  library delete on a chain link loses the key behind it), and cannot
+  compact without re-placing every row. "List everything under
+  `session/`" was a full scan and a sort in all three, because id order
+  is hash order.
+  Two shapes were plausible. A **byte-keyed table** moves the primary key
+  itself, which every index, the row format and the migration path are
+  built on — a much larger change, still not taken. A **second ordered
+  index over VALUE bytes** gives key-ordered range scans to any
+  application that puts its key at the front of the record, with no
+  schema change and no second table, and that is what shipped:
+  `range_by_value`, its descending and paging forms, and `prefix`.
+  The implementation is smaller than the description. The index stores no
+  bytes: a value already lives in the row arena, so it holds the head ROW
+  of each record and compares by dereferencing, walking two runs slot by
+  slot and stopping at the first differing byte. And it is the SAME
+  B+tree the primary key uses — every search in that tree compares one
+  fixed target against the stored keys it meets, so the target became a
+  *probe* closure ("how does this stored key order against what I am
+  looking for?"), which is `stored.cmp(&target)` for the `u64` index and
+  a dereference for this one. Nothing structural changed, so the pool
+  bound, the invariant checker and the existing mutation surface cover
+  both.
+  The order is value bytes, then id, then row. The id breaks a tie
+  between records holding the same bytes, and it is the tie-break rather
+  than the row because it is the only one a caller can predict: rows are
+  renumbered by a compaction. The row is last and no two live entries
+  reach it; it exists because the index is append-only like the trigram
+  postings, so writing the same value to the same id twice leaves both
+  rows in the tree.
 - **Which hard index ships in v1** — DECIDED: trigram, for the reason §4.6
   gives. Its oracle is exact, and every other index in this project is held
   to equality against an oracle.
@@ -457,23 +491,6 @@ part worth reading.
 
 Still open:
 
-- **Keys that are not `u64`.** Named by all three sample applications as
-  the largest structural gap, and each of them paid the same price: a
-  bookmark store, a job queue and a key/value store all hash their real
-  key onto a `u64`, probe past collisions, keep their own tombstones (a
-  library delete on a chain link loses the key behind it), and cannot
-  compact without re-placing every row. "List everything under
-  `session/`" is a full scan and a sort in all three, because id order is
-  hash order.
-  Two shapes are plausible. A second ordered index over VALUE bytes gives
-  key-ordered range scans for free to any application that puts its key
-  at the front of the record — no schema change, one more derived index
-  with a `BTreeMap<Vec<u8>, u64>` for an oracle, rebuilt at recovery like
-  the others. A byte-keyed table is the bigger answer and a much larger
-  change: it moves the primary key itself, which every index, the row
-  format and the migration path are built on. The first is probably
-  right; it is written down here rather than done because it should be
-  decided against a sample that needs it rather than in the abstract.
 - Size class growth ratio: 2x (simple, ~50% worst-case internal fragmentation) versus
   1.25x (tighter, more free lists).
 - `BLOB_HARD_MAX` exact value.

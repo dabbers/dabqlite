@@ -987,3 +987,26 @@ engine.)
 - **No IndexedDB fallback yet**, so Safari incognito (which has no OPFS
   at all) is unsupported rather than degraded — design §8.1 calls for
   one.
+
+## The ordered index over VALUE bytes
+
+An application whose real key is a byte string puts that key at the front
+of the record and scans in value order. The index keeps no bytes of its
+own and nothing on disk — it holds the head ROW of each record and
+compares by dereferencing into the arena — so a crash cannot damage it
+directly. What a crash CAN do is leave the rows in a different state from
+the one the writer thought it left them in, and the index must then
+describe THAT state exactly: no entry for a row recovery discarded, none
+missing for a row it kept.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Random traffic × every bound, ascending and descending | 6 seeds × 80 steps × 30 bounds | `value_order.rs` (sim) | equal to a `BTreeSet<(value, id)>` oracle, which is the definition of the order rather than a second implementation of it |
+| Inserts, updates, deletes, reopens × every bound | 8 seeds × 200 rounds | `value_order.rs` (facade) | same oracle, through the public API, including values that cross slot seams and identical values under different ids |
+| Crash at **every boundary** of a commit | 4 seeds × 6 boundaries | `value_order.rs` (sim) | the rebuilt order equals the oracle for the RECOVERED database, in both directions, and the database is still writable in that order afterwards |
+| Crash inside a LONG value's run | 8 boundaries | `value_order.rs` (sim) | no entry survives for a run recovery discarded — and a value that DID land compares by its whole bytes, not by the head slot recovery could have been left holding |
+| A quarantined row, salvage mode | pinned | `value_order.rs` (sim) | exactly that row is missing, every other row is exact, and the page says `incomplete` — a scan that silently omitted it would be indistinguishable from data loss |
+| Every soak cycle, after every recovery | ~10k checks per 200 lifetimes | `lifetime.rs` | the same rows in a completely different order: a recovery that got the rows right and the ORDER wrong shows up here and nowhere else |
+| Paging | pinned | `value_order.rs` (both) | a page is bounded, the cursor advances, and paging returns exactly what scanning returns — in both directions |
+| A bound longer than any value can be | pinned | `value_order.rs` (facade) | refused by name, not answered with an empty page that looks like a result |
+| The prefix upper bound at the top of the byte range | pinned | `value_order.rs` (facade) | an all-`0xff` prefix has no upper bound, which the naive "append `0xff`" version gets silently wrong |

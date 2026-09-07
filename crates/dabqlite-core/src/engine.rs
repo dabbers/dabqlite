@@ -1227,6 +1227,18 @@ impl Engine {
             // inserted: at least the live ones, at most one per slot.
             debug_assert!(self.live_count <= self.ordered.len());
             debug_assert!(self.ordered.len() <= self.row_count);
+            // The value-ordered tree counts differently and the
+            // difference is the point: one entry per RECORD ROW ever
+            // written, not per id, because it is append-only and a
+            // superseded record keeps its entry. So it is at least as
+            // large as the id-keyed tree and never larger than the slots.
+            debug_assert!(self.ordered.len() <= self.by_value.len());
+            debug_assert!(self.by_value.len() <= self.row_count);
+            debug_assert_eq!(
+                self.by_value.len(),
+                self.live_count + self.retired,
+                "the value index holds exactly the record rows: live plus superseded"
+            );
             // Slots are records, deletions and continuations, exactly.
             debug_assert_eq!(
                 self.live_count + self.retired + self.tombstones + self.chunks,

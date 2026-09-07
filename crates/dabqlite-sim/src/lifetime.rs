@@ -111,6 +111,8 @@ pub struct LifetimeStats {
     pub long_values: u64,
     /// Compare-and-set guards that held, letting their commit through.
     pub assertions: u64,
+    /// Bounded value-ordered scans verified against the oracle.
+    pub value_checks: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -757,6 +759,49 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 want,
                 "[{ctx}] descending scan diverged"
             );
+        }
+        // The SAME rows in a completely different order: the
+        // value-ordered index is a second tree over the same rebuilt
+        // state, so a recovery that got the rows right but the order
+        // wrong shows up here and nowhere else. Both directions, and a
+        // bound taken from a real value so the descent is exercised
+        // rather than always starting at an end.
+        {
+            let want: Vec<(u64, Vec<u8>)> = {
+                let mut v: Vec<(u64, Vec<u8>)> =
+                    oracle.iter().map(|(&k, v)| (k, v.clone())).collect();
+                v.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+                v
+            };
+            assert_eq!(
+                host.value_all(b"", b""),
+                want,
+                "[{ctx}] value-ordered scan diverged"
+            );
+            let mut rev = want.clone();
+            rev.reverse();
+            assert_eq!(
+                host.value_all_rev(b"", b""),
+                rev,
+                "[{ctx}] descending value scan diverged"
+            );
+            if !want.is_empty() {
+                let pick = rng.gen_range(0..want.len());
+                let bound = &want[pick].1;
+                let cut = rng.gen_range(0..=bound.len());
+                let lo = &bound[..cut];
+                let expect: Vec<(u64, Vec<u8>)> = want
+                    .iter()
+                    .filter(|(_, v)| v.as_slice() >= lo)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    host.value_all(lo, b""),
+                    expect,
+                    "[{ctx}] value scan from {lo:?} diverged"
+                );
+                stats.value_checks += 1;
+            }
         }
         // Negative space: ids never inserted must be absent.
         for _ in 0..4 {
