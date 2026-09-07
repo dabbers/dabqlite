@@ -217,6 +217,48 @@ impl RowRef {
     }
 }
 
+/// How a substring search compares its needle against a value.
+///
+/// The index accelerates all four identically — any value that starts
+/// with, ends with, or equals a needle also CONTAINS it, so the same
+/// candidate chain is a superset in every mode — and verification against
+/// the real bytes decides which. So anchoring costs nothing and removes
+/// the need for the tricks applications were writing without it: a
+/// bookmark store wrapping every tag in delimiters so that `find` could
+/// not match a longer tag, and a URL store unable to tell a host from a
+/// query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Match {
+    /// The needle appears anywhere in the value. An empty needle matches
+    /// every row.
+    #[default]
+    Contains,
+    /// The value begins with the needle.
+    Prefix,
+    /// The value ends with the needle.
+    Suffix,
+    /// The value IS the needle, byte for byte.
+    Exact,
+}
+
+impl Match {
+    /// Does `value` satisfy this match against `needle`?
+    ///
+    /// The one place the four modes are defined, so the engine and any
+    /// oracle written against it are comparing the same thing.
+    pub fn holds(self, value: &[u8], needle: &[u8]) -> bool {
+        match self {
+            // `windows(0)` panics, and "contains nothing" is true anyway.
+            Match::Contains => {
+                needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
+            }
+            Match::Prefix => value.starts_with(needle),
+            Match::Suffix => value.ends_with(needle),
+            Match::Exact => value == needle,
+        }
+    }
+}
+
 /// One operation inside an atomic batch (`Input::Batch`).
 ///
 /// The same three writes the engine offers singly. What a batch changes is
@@ -426,6 +468,9 @@ pub enum Input<'a> {
     /// matches everything.
     Find {
         needle: &'a [u8],
+        /// How the needle is compared — anywhere in the value by default,
+        /// or anchored to one or both ends.
+        mode: Match,
         after: Option<FindCursor>,
     },
 }
@@ -1190,7 +1235,11 @@ impl Engine {
             Input::GetFrom { id, offset } => self.read_window(id, offset),
             Input::Range { lo, hi } => self.on_range(lo, hi, false),
             Input::RangeRev { lo, hi } => self.on_range(lo, hi, true),
-            Input::Find { needle, after } => self.on_find(needle, after),
+            Input::Find {
+                needle,
+                mode,
+                after,
+            } => self.on_find(needle, mode, after),
         }
     }
 
@@ -2599,7 +2648,7 @@ impl Engine {
         Output::RangeDone { result }
     }
 
-    fn on_find(&mut self, needle: &[u8], after: Option<FindCursor>) -> Output {
+    fn on_find(&mut self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> Output {
         if needle.len() > MAX_VALUE_LEN {
             // Longer than any value can be, so it cannot match anything.
             // Saying so is more useful than an empty page that looks like
@@ -2612,7 +2661,7 @@ impl Engine {
             };
         }
         let result = match self.state {
-            State::Ready | State::Degraded => Ok(self.find_page(needle, after)),
+            State::Ready | State::Degraded => Ok(self.find_page(needle, mode, after)),
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -2649,7 +2698,7 @@ impl Engine {
     /// bytes, so results are exact regardless of index state — the index
     /// can only make this slower, never wrong. Committed state only:
     /// like the btree, the trigram index is updated at the commit point.
-    fn find_page(&self, needle: &[u8], after: Option<FindCursor>) -> FindPage {
+    fn find_page(&self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
         let (n, next) = self.trigram.find_page(
             needle,
@@ -2666,7 +2715,7 @@ impl Engine {
                 let off = (row as usize) * ROW_SIZE;
                 match decode_row(&self.arena[off..off + ROW_SIZE]) {
                     Some(slot) if slot.record().is_some() => {
-                        if needle.is_empty() {
+                        if needle.is_empty() && mode == Match::Contains {
                             return true;
                         }
                         // Match against the WHOLE value, not the head slot: a
@@ -2675,7 +2724,7 @@ impl Engine {
                         let (rows, _) = self.value_extent(row);
                         let mut value = [0u8; MAX_VALUE_LEN];
                         let len = self.assemble_from_arena(row, rows, &mut value);
-                        value[..len].windows(needle.len()).any(|w| w == needle)
+                        mode.holds(&value[..len], needle)
                     }
                     // A tombstone or a continuation indexes nothing and
                     // matches nothing.

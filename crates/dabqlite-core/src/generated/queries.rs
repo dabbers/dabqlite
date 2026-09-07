@@ -35,6 +35,10 @@ pub fn list_records(lo: u64, hi: u64) -> crate::engine::Input<'static> {
 /// longer than one row, so a needle may be too. The engine refuses
 /// one longer than any value could be.
 pub fn find_records<'a>(needle: &'a [u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'a> {
-    crate::engine::Input::Find { needle, after }
+    crate::engine::Input::Find {
+        needle,
+        mode: crate::engine::Match::Contains,
+        after,
+    }
 }
 

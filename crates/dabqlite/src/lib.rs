@@ -54,7 +54,7 @@
 use dabqlite_core::{BatchOp, Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
 use dabqlite_host::Host;
 
-pub use dabqlite_core::{DbError as EngineError, FindCursor, RecoveryReport, VALUE_LEN};
+pub use dabqlite_core::{DbError as EngineError, FindCursor, Match, RecoveryReport, VALUE_LEN};
 
 // The backends, re-exported so that `Db<S>` can actually be WRITTEN DOWN by
 // a caller. Without these a database could only ever be a local binding
@@ -1298,10 +1298,39 @@ impl<S: Storage> Db<S> {
     /// and the order a search box wants; see [`Db::find_page`] to stop
     /// early rather than collecting every match.
     pub fn find(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+        self.find_matching(needle, Match::Contains)
+    }
+
+    /// Every row whose value STARTS with `needle`, newest first.
+    ///
+    /// Anchoring costs nothing — the index narrows the same candidates
+    /// either way — and it is the difference between finding a host and
+    /// finding a query parameter that happens to contain one.
+    pub fn find_prefix(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+        self.find_matching(needle, Match::Prefix)
+    }
+
+    /// Every row whose value ENDS with `needle`, newest first.
+    pub fn find_suffix(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+        self.find_matching(needle, Match::Suffix)
+    }
+
+    /// Every row whose value IS `needle`, byte for byte.
+    ///
+    /// Without this, "find the rows tagged exactly `rust`" was only
+    /// expressible by storing delimiters around every tag so that a
+    /// substring search could not reach `rustaceans` — a trick each
+    /// application had to invent, with its own ceiling.
+    pub fn find_exact(&mut self, needle: &[u8]) -> Result<Vec<Row>, Error> {
+        self.find_matching(needle, Match::Exact)
+    }
+
+    /// Every match in any [`Match`] mode, newest first.
+    pub fn find_matching(&mut self, needle: &[u8], mode: Match) -> Result<Vec<Row>, Error> {
         let mut out = Vec::new();
         let mut cursor = None;
         loop {
-            let (page, next) = self.find_page(needle, cursor)?;
+            let (page, next) = self.find_page_matching(needle, mode, cursor)?;
             out.extend(page);
             match next {
                 Some(c) => cursor = Some(c),
@@ -1321,6 +1350,16 @@ impl<S: Storage> Db<S> {
         needle: &[u8],
         after: Option<FindCursor>,
     ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
+        self.find_page_matching(needle, Match::Contains, after)
+    }
+
+    /// One bounded page in any [`Match`] mode.
+    pub fn find_page_matching(
+        &mut self,
+        needle: &[u8],
+        mode: Match,
+        after: Option<FindCursor>,
+    ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
         use dabqlite_core::Input;
         if needle.len() > MAX_VALUE_LEN {
             // The only ceiling left is the one no value can exceed
@@ -1332,7 +1371,11 @@ impl<S: Storage> Db<S> {
                 max: MAX_VALUE_LEN,
             });
         }
-        let page = match self.hm().run(Input::Find { needle, after }) {
+        let page = match self.hm().run(Input::Find {
+            needle,
+            mode,
+            after,
+        }) {
             Output::FindDone { result: Ok(p) } => p,
             Output::FindDone { result: Err(e) } => return Err(e.into()),
             other => unreachable!("find returned {other:?}"),

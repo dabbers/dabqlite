@@ -754,19 +754,27 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 needles.push(Vec::new());
             }
             for needle in &needles {
-                let want: Vec<(u64, Vec<u8>)> = log
-                    .iter()
-                    .filter(|(_, v)| {
-                        needle.is_empty() || v.windows(needle.len()).any(|w| w == &needle[..])
-                    })
-                    .cloned()
-                    .collect();
-                assert_eq!(
-                    host.find_all_bytes(needle),
-                    want,
-                    "[{ctx}] substring search diverged for {needle:?}"
-                );
-                stats.find_checks += 1;
+                // Every match mode, against the same log: anchoring is
+                // verification rather than indexing, so all four ride the
+                // same rebuilt index and all four must be exact.
+                for mode in [
+                    dabqlite_core::Match::Contains,
+                    dabqlite_core::Match::Prefix,
+                    dabqlite_core::Match::Suffix,
+                    dabqlite_core::Match::Exact,
+                ] {
+                    let want: Vec<(u64, Vec<u8>)> = log
+                        .iter()
+                        .filter(|(_, v)| mode.holds(v, needle))
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        host.find_all_matching(needle, mode),
+                        want,
+                        "[{ctx}] {mode:?} search diverged for {needle:?}"
+                    );
+                    stats.find_checks += 1;
+                }
             }
         }
         // Inspector agreement: the independent second implementation of

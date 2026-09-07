@@ -489,7 +489,11 @@ fn find_ids(host: &mut SimHost, needle: &[u8]) -> Vec<u64> {
     let mut out = Vec::new();
     let mut after = None;
     loop {
-        let page = match host.run_input(Input::Find { needle, after }) {
+        let page = match host.run_input(Input::Find {
+            needle,
+            mode: dabqlite_core::Match::Contains,
+            after,
+        }) {
             Driven::Done(Output::FindDone { result: Ok(p) }) => p,
             other => panic!("find: {other:?}"),
         };

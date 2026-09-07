@@ -1399,7 +1399,11 @@ pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) 
                      /// longer than one row, so a needle may be too. The engine refuses\n\
                      /// one longer than any value could be.\n\
                      pub fn {}<'a>(needle: &'a [u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'a> {{\n\
-                     \x20   crate::engine::Input::Find {{ needle, after }}\n\
+                     \x20   crate::engine::Input::Find {{\n\
+                     \x20       needle,\n\
+                     \x20       mode: crate::engine::Match::Contains,\n\
+                     \x20       after,\n\
+                     \x20   }}\n\
                      }}\n\n",
                     q.name, schema.table, tc.name, q.name
                 ));

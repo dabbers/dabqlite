@@ -24,7 +24,11 @@ fn oracle(ops: &[(u64, [u8; VALUE_LEN])], needle: &[u8]) -> Vec<(u64, [u8; VALUE
 }
 
 fn find_input<'a>(needle: &'a [u8], after: Option<dabqlite_core::FindCursor>) -> Input<'a> {
-    Input::Find { needle, after }
+    Input::Find {
+        needle,
+        mode: dabqlite_core::Match::Contains,
+        after,
+    }
 }
 
 #[test]
@@ -287,6 +291,123 @@ fn paging_long_values_neither_repeats_nor_skips() {
         cost <= 3 * N,
         "paging {N} long-value matches cost {cost} verifications"
     );
+}
+
+/// The anchored modes against the same free oracle, over the same random
+/// workloads: prefix, suffix and exact, at every needle length, including
+/// needles too short to have a trigram and the empty one.
+///
+/// Anchoring is verification, not indexing: any value that starts with,
+/// ends with, or equals a needle also contains it, so the candidate chain
+/// is a superset in every mode and only the comparison changes. These
+/// tests exist to hold that claim to exactness rather than to reasoning.
+#[test]
+fn every_match_mode_matches_its_oracle() {
+    use dabqlite_core::Match;
+    for seed in 0..6u64 {
+        let caps = Capacities { rows: 128 };
+        let mut host = SimHost::new(caps, SimDisk::new(), None);
+        host.open();
+        let mut stored: Vec<(u64, Vec<u8>)> = Vec::new();
+        for i in 0..20u64 {
+            // A mixture of one-slot and multi-slot values, with shared
+            // prefixes and suffixes so the modes actually differ.
+            let mut v = Vec::new();
+            v.extend_from_slice(if i % 3 == 0 { b"https://" } else { b"ftp://x." });
+            v.extend_from_slice(format!("host{}", i % 4).as_bytes());
+            if i % 2 == 0 {
+                v.extend_from_slice(&[b'p'; 40]);
+            }
+            v.extend_from_slice(if i % 5 == 0 { b".org" } else { b".com" });
+            v.push(b'a' + (seed as u8 % 4));
+            assert!(matches!(
+                host.batch(&[BatchOp::Insert { id: i, value: &v }]),
+                Driven::Done(Output::BatchDone { result: Ok(()), .. })
+            ));
+            stored.push((i, v));
+        }
+
+        let mut needles: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"h".to_vec(),
+            b"ht".to_vec(),
+            b"https://".to_vec(),
+            b"ftp://x.host1".to_vec(),
+            b".com".to_vec(),
+            b"m".to_vec(),
+            b"host2".to_vec(),
+            b"nothing".to_vec(),
+        ];
+        // Whole values, so Exact has something to hit.
+        needles.push(stored[(seed as usize) % stored.len()].1.clone());
+        needles.push(stored[0].1[..stored[0].1.len() - 1].to_vec());
+
+        for needle in &needles {
+            for mode in [Match::Contains, Match::Prefix, Match::Suffix, Match::Exact] {
+                let want: Vec<(u64, Vec<u8>)> = stored
+                    .iter()
+                    .filter(|(_, v)| mode.holds(v, needle))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    host.find_all_matching(needle, mode),
+                    want,
+                    "seed={seed} mode={mode:?} needle={needle:?}"
+                );
+            }
+        }
+
+        // Anchoring is not a filter applied afterwards: a prefix match is
+        // a SUBSET of a contains match, and exact a subset of both.
+        for needle in &needles {
+            let contains = host.find_all_matching(needle, Match::Contains);
+            for mode in [Match::Prefix, Match::Suffix, Match::Exact] {
+                for hit in host.find_all_matching(needle, mode) {
+                    assert!(
+                        contains.contains(&hit),
+                        "seed={seed} mode={mode:?} found a row a substring search does not"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The trick applications had to invent without anchoring, and what it
+/// costs them: a bookmark store wrapped every tag in delimiters so that a
+/// substring search for a tag could not reach a longer one.
+#[test]
+fn exact_match_replaces_the_delimiter_trick() {
+    use dabqlite_core::Match;
+    let mut host = SimHost::new(CAPS, SimDisk::new(), None);
+    host.open();
+    for (i, tag) in [&b"rust"[..], b"rustaceans", b"trust", b"rust "]
+        .iter()
+        .enumerate()
+    {
+        assert!(matches!(
+            host.batch(&[BatchOp::Insert {
+                id: i as u64,
+                value: tag
+            }]),
+            Driven::Done(Output::BatchDone { result: Ok(()), .. })
+        ));
+    }
+    let ids = |v: Vec<(u64, Vec<u8>)>| v.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(host.find_all_matching(b"rust", Match::Contains)),
+        vec![0, 1, 2, 3],
+        "a substring search reaches all four, which is the problem"
+    );
+    assert_eq!(
+        ids(host.find_all_matching(b"rust", Match::Prefix)),
+        vec![0, 1, 3]
+    );
+    assert_eq!(
+        ids(host.find_all_matching(b"rust", Match::Suffix)),
+        vec![0, 2]
+    );
+    assert_eq!(ids(host.find_all_matching(b"rust", Match::Exact)), vec![0]);
 }
 
 #[test]

@@ -200,6 +200,7 @@ fn scans_in_salvage_mode_declare_themselves_incomplete() {
     let needle = ops[0].1[..3].to_vec();
     match host.run_input(Input::Find {
         needle: &needle,
+        mode: dabqlite_core::Match::Contains,
         after: None,
     }) {
         Driven::Done(Output::FindDone { result: Ok(page) }) => {

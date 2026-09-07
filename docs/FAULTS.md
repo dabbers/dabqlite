@@ -521,6 +521,7 @@ arbitrarily corrupted index can only make queries slower, never wrong.
 | Scenario | Mode | Suite | Guarantee |
 |---|---|---|---|
 | Exact oracle equality | random workloads × needles of EVERY length 0..=16 (prefixes, infixes, suffixes of stored values; seeded noise), and every offset of multi-slot values against needles up to a row wide | `trigram_find.rs` | results == naive scan, exactly, in insertion order |
+| Anchored matching (prefix / suffix / exact) | seeded workloads × every needle length, plus every soak cycle | `trigram_find.rs`, `lifetime.rs` | exact against the same naive oracle in all four modes; every anchored hit is also a substring hit, so anchoring narrows and never invents |
 | Index reachability for long values | one long value among 400 short ones; a needle matching only its third slot | `trigram_find.rs` | answered from the chain, not by scanning every row — a long value must not turn the index off for the database |
 | Rebuilt-at-recovery correctness | crash at every insert boundary × settle seeds | same | the rebuilt index answers over exactly the recovered prefix — all-or-nothing, like every index |
 | Committed state only | targeted | same | a never-committed value is never findable, even with its row sitting in the arena as an orphan |

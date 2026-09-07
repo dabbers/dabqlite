@@ -174,6 +174,7 @@ fn steady_state_performs_zero_heap_allocations() {
         &mut rows,
         Input::Find {
             needle: &needle[..3],
+            mode: dabqlite_core::Match::Contains,
             after: None,
         },
     ) {

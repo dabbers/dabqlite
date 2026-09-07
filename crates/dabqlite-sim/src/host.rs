@@ -442,10 +442,23 @@ impl SimHost {
     /// [`SimHost::find_all`] for values of ANY length: every match, in row
     /// order, each value whole.
     pub fn find_all_bytes(&mut self, needle: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        self.find_all_matching(needle, dabqlite_core::Match::Contains)
+    }
+
+    /// The same, in any match mode.
+    pub fn find_all_matching(
+        &mut self,
+        needle: &[u8],
+        mode: dabqlite_core::Match,
+    ) -> Vec<(u64, Vec<u8>)> {
         let mut refs = Vec::new();
         let mut after = None;
         loop {
-            let page = match self.run_input(Input::Find { needle, after }) {
+            let page = match self.run_input(Input::Find {
+                needle,
+                mode,
+                after,
+            }) {
                 Driven::Done(Output::FindDone { result: Ok(p) }) => p,
                 other => panic!("find_all_bytes: {other:?}"),
             };
@@ -489,7 +502,11 @@ impl SimHost {
         let mut out = Vec::new();
         let mut after = None;
         loop {
-            let page = match self.run_input(Input::Find { needle, after }) {
+            let page = match self.run_input(Input::Find {
+                needle,
+                mode: dabqlite_core::Match::Contains,
+                after,
+            }) {
                 Driven::Done(Output::FindDone { result: Ok(p) }) => p,
                 other => panic!("find_all: {other:?}"),
             };

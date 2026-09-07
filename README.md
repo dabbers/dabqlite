@@ -19,6 +19,7 @@ db.batch(&[
 ])?;
 
 let hits = db.find_text("ell")?;              // exact substring search
+let hosts = db.find_prefix(b"https://")?;     // ...or anchored: prefix/suffix/exact
 let newest = db.last(20)?;                    // 20 highest ids, 20 rows of work
 let blob = db.snapshot()?.to_bytes();         // move it anywhere
 Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;

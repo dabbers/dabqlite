@@ -67,6 +67,7 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
         find_records(b"hello", Some(dabqlite_core::FindCursor::below(4))),
         Input::Find {
             needle: b"hello",
+            mode: dabqlite_core::Match::Contains,
             after: Some(dabqlite_core::FindCursor::below(4)),
         }
     );
@@ -74,6 +75,7 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
         find_records(b"", None),
         Input::Find {
             needle: b"",
+            mode: dabqlite_core::Match::Contains,
             after: None,
         }
     );
@@ -82,6 +84,7 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
         find_records(&long, None),
         Input::Find {
             needle: &long,
+            mode: dabqlite_core::Match::Contains,
             after: None,
         },
         "a needle longer than a row is a needle, not an error"

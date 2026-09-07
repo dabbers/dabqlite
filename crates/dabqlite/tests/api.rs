@@ -5,7 +5,7 @@
 //! test here needs a helper that feels like plumbing, that is a signal the
 //! library is missing something, not that the test needs more code.
 
-use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
+use dabqlite::{Db, Error, Match, Op, Snapshot, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-api-{}-{tag}", std::process::id()));
@@ -939,6 +939,63 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
         "a clean reopen after a batch must not report lost data"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Anchored search: a host is not a query parameter, and a tag is not a
+/// longer tag that contains it.
+#[test]
+fn a_search_can_be_anchored_to_either_end_or_both() {
+    let mut db = Db::in_memory_with(256).expect("open");
+    let urls = [
+        "https://example.com/page",
+        "https://other.test/?ref=example.com",
+        "http://example.com.evil.test/",
+        "example.com",
+    ];
+    for (i, u) in urls.iter().enumerate() {
+        db.insert(i as u64, Value::from_text(u).unwrap()).unwrap();
+    }
+    let ids = |rows: Vec<(u64, Value)>| {
+        let mut v: Vec<u64> = rows.into_iter().map(|(id, _)| id).collect();
+        v.sort_unstable();
+        v
+    };
+
+    // The substring search reaches all four, which is exactly the problem
+    // an unanchored search has.
+    assert_eq!(ids(db.find_text("example.com").unwrap()), vec![0, 1, 2, 3]);
+    assert_eq!(
+        ids(db.find_prefix(b"https://example.com").unwrap()),
+        vec![0]
+    );
+    assert_eq!(ids(db.find_suffix(b"/page").unwrap()), vec![0]);
+    assert_eq!(ids(db.find_exact(b"example.com").unwrap()), vec![3]);
+
+    // Needles too short to have a trigram are anchored too, and so is the
+    // empty one: every value starts and ends with nothing, and only an
+    // empty value equals it.
+    db.insert(9, Value::empty()).unwrap();
+    assert_eq!(ids(db.find_prefix(b"h").unwrap()), vec![0, 1, 2]);
+    assert_eq!(ids(db.find_suffix(b"/").unwrap()), vec![2]);
+    assert_eq!(ids(db.find_prefix(b"").unwrap()).len(), 5);
+    assert_eq!(ids(db.find_exact(b"").unwrap()), vec![9]);
+
+    // Paging works in any mode, and the modes agree with `find_matching`.
+    let (page, _) = db
+        .find_page_matching(b"https://", Match::Prefix, None)
+        .expect("page");
+    assert_eq!(page.len(), 2);
+    assert_eq!(
+        ids(db.find_matching(b"https://", Match::Prefix).unwrap()),
+        vec![0, 1]
+    );
+
+    // Anchored search works across a slot boundary like everything else.
+    let long = format!("prefix-{}-suffix", "x".repeat(200));
+    db.insert(20, Value::from_text(&long).unwrap()).unwrap();
+    assert_eq!(ids(db.find_prefix(b"prefix-xxx").unwrap()), vec![20]);
+    assert_eq!(ids(db.find_suffix(b"xxx-suffix").unwrap()), vec![20]);
+    assert_eq!(ids(db.find_exact(long.as_bytes()).unwrap()), vec![20]);
 }
 
 /// "The n newest" — the query every sample application wrote, and the
