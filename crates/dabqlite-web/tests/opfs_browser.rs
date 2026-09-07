@@ -115,7 +115,7 @@ async fn real_opfs_bytes_match_the_model_exactly() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value, "id={id}"),
+            } => assert_eq!(v.payload(), value, "id={id}"),
             other => panic!("get {id}: {other:?}"),
         }
     }
@@ -259,7 +259,7 @@ async fn the_in_memory_store_and_opfs_are_interchangeable() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value),
+            } => assert_eq!(v.payload(), value),
             other => panic!("in-memory get {id}: {other:?}"),
         }
     }
@@ -289,7 +289,7 @@ async fn the_in_memory_store_and_opfs_are_interchangeable() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value, "id={id}"),
+            } => assert_eq!(v.payload(), value, "id={id}"),
             other => panic!("persisted get {id}: {other:?}"),
         }
     }
@@ -316,7 +316,7 @@ async fn the_in_memory_store_and_opfs_are_interchangeable() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value, "id={id}"),
+            } => assert_eq!(v.payload(), value, "id={id}"),
             other => panic!("round-tripped get {id}: {other:?}"),
         }
     }
@@ -324,7 +324,7 @@ async fn the_in_memory_store_and_opfs_are_interchangeable() {
         Output::GetDone {
             result: Ok(Some(v)),
             ..
-        } => assert_eq!(v, [0xA5; VALUE_LEN]),
+        } => assert_eq!(v.payload(), [0xA5; VALUE_LEN]),
         other => panic!("the OPFS-side commit did not survive the trip: {other:?}"),
     }
 }
@@ -368,7 +368,10 @@ async fn salvage_contains_damage_on_real_opfs() {
     let storage = opfs::open_dir(dir).await.expect("reopen salvage");
     let mut rescue = Host::new(CAPS, storage);
     match rescue.open_salvage().expect("probe") {
-        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64),
+        // One row short: the quarantined one is not served, and salvage
+        // reports what it can actually give you rather than what the
+        // manifest claims.
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64 - 1),
         other => panic!("salvage open: {other:?}"),
     }
     assert_eq!(rescue.engine.quarantined(), 1);
@@ -380,9 +383,82 @@ async fn salvage_contains_damage_on_real_opfs() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value, "id={id}"),
+            } => assert_eq!(v.payload(), value, "id={id}"),
             other => panic!("survivor {id}: {other:?}"),
         }
     }
     rescue.storage.close();
+}
+
+/// Recovery shortens the rows file to the manifest, and it has to do that
+/// through a real `FileSystemSyncAccessHandle.truncate` — the one storage
+/// operation the engine performs that is neither a read, a write, nor a
+/// flush, and therefore the one most likely to be a fiction of the model.
+///
+/// Without it, residue from commits that were never acknowledged piles up
+/// across restarts until two of different widths look like one
+/// acknowledged commit that was rolled back, and a healthy database
+/// reports permanent data loss. That is worth proving in the browser, not
+/// only in the simulator.
+#[wasm_bindgen_test]
+async fn recovery_truncates_residue_on_real_opfs() {
+    let dir = "dabqlite-truncate";
+    let _ = opfs::remove_dir(dir).await;
+    let ops = workload();
+
+    let storage = opfs::open_dir(dir).await.expect("open");
+    let mut host = Host::new(CAPS, storage);
+    run_workload(&mut host, &ops);
+    let committed = whole_file(&mut host.storage, FileId::Rows).len();
+
+    // Leave residue past the manifest, exactly as an interrupted commit
+    // would: valid-looking bytes the superblock does not reference.
+    let junk = [0x7Eu8; ROW_SIZE * 5];
+    host.storage
+        .write(FileId::Rows, committed as u64, &junk)
+        .expect("append residue");
+    host.storage.sync(FileId::Rows).expect("flush");
+    let grown = whole_file(&mut host.storage, FileId::Rows).len();
+    assert_eq!(
+        grown,
+        committed + junk.len(),
+        "the setup did not grow the file"
+    );
+    host.storage.close();
+
+    // Reopen: recovery must shorten the file back to the manifest.
+    let storage = opfs::open_dir(dir).await.expect("reopen");
+    let mut reopened = Host::new(CAPS, storage);
+    match reopened.open().expect("size probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64),
+        other => panic!("recovery: {other:?}"),
+    }
+    assert_eq!(
+        whole_file(&mut reopened.storage, FileId::Rows).len(),
+        committed,
+        "real OPFS truncate did not shorten the rows file"
+    );
+    // And every row is still exactly right.
+    for &(id, value) in &ops {
+        match reopened.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v.payload(), value, "id={id}"),
+            other => panic!("get {id}: {other:?}"),
+        }
+    }
+    reopened.storage.close();
+
+    // A second reopen finds nothing to clear and stays quiet.
+    let storage = opfs::open_dir(dir).await.expect("reopen again");
+    let mut again = Host::new(CAPS, storage);
+    match again.open().expect("size probe") {
+        Output::OpenDone { result: Ok(_) } => {}
+        other => panic!("recovery: {other:?}"),
+    }
+    let report = again.engine.recovery_report();
+    assert_eq!(report.orphan_valid_rows, 0);
+    assert!(!report.rollback_evidence);
+    again.storage.close();
 }
