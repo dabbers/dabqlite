@@ -4,22 +4,43 @@ An embeddable, schema-compiled record store with a declared memory ceiling, a
 deterministic core, and a web-native execution model.
 
 ```rust
-use dabqlite::{Db, Value};
+use dabqlite::{Db, Op, Value};
 
-let mut db = Db::open("./mydb")?;          // or Db::in_memory()
-db.put(1, Value::from_text("hello")?)?;    // insert or replace, atomically
-db.update(1, Value::from_text("hi")?)?;
-db.remove(1)?;
-let hits = db.find_text("ell")?;           // exact substring search
-let blob = db.snapshot()?.to_bytes();      // move it anywhere
+let mut db = Db::open("./mydb")?;             // or Db::in_memory()
+db.put(1, Value::from_text("hello")?)?;       // insert or replace, atomically
+db.put(2, Value::from_bytes(&payload)?)?;     // any length up to MAX_VALUE_LEN
+
+// Several writes, ONE commit. All of it lands or none of it does, across a
+// crash — and it costs the same two fsyncs a single write does.
+db.batch(&[
+    Op::put(3, Value::from_text("ready")?),
+    Op::delete(1),
+    Op::remove(99),                           // no-op if it is not there
+])?;
+
+let hits = db.find_text("ell")?;              // exact substring search
+let blob = db.snapshot()?.to_bytes();         // move it anywhere
+Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;
+
+// Any number of readers, alongside the writer, taking no lock.
+let mut reader = Db::read_only("./mydb")?;
 ```
 
 **Status: steps 1–8 of the [build order](docs/DESIGN.md#9-build-order), plus
 the OPFS backend (step 2).** One table with insert, update, delete, get,
-ordered range scans and substring search; a declared memory ceiling; three
-interchangeable backends (POSIX files, in-memory, browser OPFS) proven to
-write byte-identical databases; an offline migration path; corruption
-containment with repair-by-rebuild; and an inspector CLI.
+ordered range scans and substring search; values of any length up to 2 KiB;
+atomic multi-write batches; lock-free readers alongside the single writer; a
+declared memory ceiling recorded in the database itself; three interchangeable
+backends (POSIX files, in-memory, browser OPFS) proven to write byte-identical
+databases; an offline migration path; corruption containment with
+repair-by-rebuild; and an inspector CLI.
+
+Three sample applications — a key-value store, a job queue and a bookmark
+manager — are built against it in `examples/`, and their reviews drive what
+gets fixed. Two real bugs came out of that loop: a crash sequence that made a
+healthy database report permanent data loss, and a writer lock that leaked
+into forked children 55% of the time. Both are fixed, both have regression
+tests, and both are described in the commits that fixed them.
 
 The [§7.3 crash-recovery property](docs/DESIGN.md#73-the-test-that-means-the-harness-works)
 passes: crash at every I/O boundary, recover, and the state is exactly
@@ -61,6 +82,21 @@ guarantees lives in [docs/FAULTS.md](docs/FAULTS.md):
   mid-I/O get `Busy` (v1 serializes everything).
 - **Capacity walls**: fill to N-1 / N / N+1, crash at the boundary of the
   last slot, recover — the wall holds and the error names the fix.
+- **Atomic batches**: crash and I/O failure at every boundary of a batch, at
+  six lengths up to the format maximum, settled three ways — every operation
+  must agree on whether the batch landed. Every reason a batch can be refused
+  is checked for performing literally zero I/O.
+- **Values spanning several row slots**: round trips at every length boundary
+  including values that end in zeros; crash at every boundary of a long write
+  — the value is whole or absent, never a prefix; a damaged continuation
+  quarantines its own value and nothing else, and its head refuses to be
+  served alone.
+- **Residue**: an open leaves nothing past the manifest, so a crash loop
+  cannot manufacture the appearance of lost acknowledged data. The sequence
+  that used to (a wide torn commit then a narrow one) is a regression test.
+- **The writer lock**: pinned from both sides — too strict (reopening a
+  closed database while spawning children) and too lax (a second handle in
+  the same process, and threads racing without leaking the claim).
 - **Allocator invariants** (§7.5): no two live blocks overlap, byte
   accounting is exact, a full alloc-then-free cycle leaks zero.
 - **Harness self-checks**: coverage floors on every interesting path, and a

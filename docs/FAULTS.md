@@ -233,6 +233,80 @@ accounted for without being indexed.
 | Delete at the capacity wall | targeted | `delete.rs` | refused (a tombstone needs a slot), naming the ceiling, nothing applied |
 | Deletes and updates under the **full fault schedule** | every cycle of every lifetime, floor-asserted | `lifetime.rs`, `vopr` | reconciled by the same all-or-nothing rule as inserts; oracle-exact after every recovery |
 
+## Batches: several writes, one commit, one crash argument
+
+A batch is not a second commit protocol. It is the existing one with more
+rows before the fsync: append `n` rows, fsync once, write both superblock
+copies, fsync once. The superblock flip is still the only atomicity
+point, so a batch lands whole or not at all for exactly the reason a
+single insert does — and its fsync count does not grow with its length.
+
+Validation happens in full before any byte is written, against the state
+each operation would see if its predecessors had already applied. So a
+refused batch is not partial work to unwind; it performed no I/O at all.
+
+The one thing batches DID need was a way for recovery to tell an
+interrupted batch from an acknowledged commit that storage rolled back.
+Each row carries a SPAN — how many further rows were written in the same
+commit — so a row found `j` slots past the manifest carrying span `s`
+claims to be row `j` of a commit of `j + s + 1` rows. Every surviving row
+of one interrupted commit makes the same claim; two stranded single-row
+commits claim 1 and 2 and disagree. Agreement is what an interrupted
+commit looks like, and nothing else produces it.
+
+That argument only holds if the region past the manifest belongs to at
+most one commit, which is why an open TRUNCATES it. Without that, residue
+from several incarnations piles up, and a wide interrupted commit
+followed by a narrow one leaves rows claiming two different sizes — a
+false alarm, on a database that lost nothing, permanent because nothing
+ever cleared the residue. A job queue found exactly that with real
+SIGKILLs: 61 of 90 restarts raised it, 59 worker starts refused, and the
+workload's own checksum agreed every time that nothing was missing.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Crash at **every boundary** of a batch × 6 lengths (1..=`MAX_COMMIT_ROWS`) × settle seeds | exhaustive | `batch.rs` | every operation agrees on whether the batch landed; no neighbour moves; the database is writable afterwards |
+| I/O failure at every boundary of a batch × 3 lengths | exhaustive | `batch.rs` | clean fail-stop, nothing applied, restart resolves all-or-nothing |
+| Every reason a batch can be refused | pinned, 6 causes | `batch.rs` | refused whole, naming the operation, with **zero I/O**, database unchanged and still usable |
+| A fail-stop mid-batch | targeted | `batch.rs` | no staged effect survives to be applied twice by the next batch |
+| An interrupted batch at every length | exhaustive | `batch.rs` | never reported as lost acknowledged data |
+| Two complete commits stranded past the manifest | targeted | `batch.rs` | still reported as rollback evidence |
+| A wide torn commit followed by a narrow one | targeted, 3 settles | `batch.rs` | no false alarm, and none on any later open |
+| An open leaves nothing past the manifest | pinned | `batch.rs` | `orphan_valid_rows` always describes THIS incarnation |
+| Batches interleaved with single writes, over 9 value lengths | seeded × restarts | `batch.rs` | matches a `BTreeMap` exactly, every step and every restart |
+| Cost model | pinned | `batch.rs` | a batch of `n` costs exactly 2 fsyncs and `n+2` writes; the same writes singly cost `2n` fsyncs |
+
+## Values longer than one row slot
+
+A value too long for one slot is a run of slots — a head plus
+continuations — written inside ONE commit. That is the whole design: a
+long value is atomic because it IS one commit, so every guarantee that
+held for a 16-byte value holds unchanged for a 2000-byte one, and a crash
+can never leave a prefix.
+
+Two bytes in the row make it work, both inside the checksum. LEN says how
+many bytes of the slot are really the value, which also means a value that
+ends in a zero survives a round trip. Its high bit says whether the value
+CONTINUES, and that bit is there for correctness rather than convenience:
+without it, a row that fails its checksum immediately after a value is
+ambiguous — it might be that value's next chunk, or an unrelated later
+row — so recovery would have to choose between serving a possibly
+truncated value and making every corrupt row cost its predecessor too.
+With it, a damaged continuation takes down exactly the value it belonged
+to, and a damaged stranger costs only itself.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Round trip at every length boundary, empty to the ceiling | exhaustive over boundaries | `long_values.rs` | byte for byte, in memory and after a restart; values ending in zeros keep them |
+| Crash at **every boundary** of a long write × 3 lengths × settle seeds | exhaustive | `long_values.rs` | the value is whole or absent — **never a prefix** — and neighbours are untouched |
+| I/O failure at every boundary of a long write | exhaustive | `long_values.rs` | same, after a fail-stop and restart |
+| A damaged continuation, at every position in a value | exhaustive | `long_values.rs` | strict open refuses by name; salvage quarantines exactly that value's rows; its head refuses to be served alone; every neighbour is still exact |
+| A damaged row after a SHORT value | pinned | `long_values.rs` | costs exactly one row — the complement that makes the CONTINUES bit worth its byte |
+| A head promising a continuation the file does not have | pinned | `long_values.rs` | refused as `TRUNCATED_VALUE`, never served short |
+| A substring straddling a slot seam | pinned, before and after restart | `long_values.rs`, `trigram.rs` | found like any other; scans do not go quietly incomplete |
+| A scan page holding a long value | pinned | `long_values.rs` | carries the value's LENGTH, and refuses to hand back a prefix |
+| A value or batch that does not fit | pinned | `long_values.rs` | refused before any I/O, naming the operation that did not fit |
+
 ### Dead weight, and the vacuum for it
 
 Every write appends, so deletes and updates leave dead slots: the retired
@@ -550,6 +624,33 @@ Honesty notes:
   not built yet — also listed below.
 
 ## Single-writer enforcement (design §2: one writer, always)
+
+A lock can be wrong in two directions, and both are failures. Too LAX and
+the engine's premise is gone silently. Too STRICT and an application
+cannot reopen its own closed database — which is broken whether or not a
+byte was lost.
+
+The obvious implementation is too strict in a way that is easy to miss.
+`flock` belongs to the open file description, `fork` duplicates it, and
+`O_CLOEXEC` only closes the copy at `exec` — so any program that spawns a
+subprocess hands its writer lock to a child that has never heard of the
+database. Measured here against a database whose only handle had already
+been CLOSED: 891 of 1500 reopens refused, from 39 spawns of `/bin/true`.
+
+The lock is therefore a POSIX record lock, which is not inherited across
+`fork`, plus a process-local registry of held directories — because
+record locks are owned by the process, so the kernel would happily hand
+one process two. The registry also makes the record-lock footgun
+unreachable: closing any descriptor to a file drops that process's locks
+on it, and the registry refuses the second open that would do so.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Reopening a CLOSED database while spawning children, 1500 attempts | measured | `writer_lock.rs` | zero refusals (was 891) |
+| A second handle in the same process | pinned | `writer_lock.rs` | refused, and available again once the first closes |
+| Four threads racing for one database, 800 attempts | stress | `writer_lock.rs` | someone always wins, and the claim is free at the end |
+| Lock-free readers alongside a live writer, through 30 commits | targeted | `api.rs` | every value a reader sees is whole; a reader's view is the generation it opened on |
+
 
 | Scenario | Mode | Suite | Guarantee |
 |---|---|---|---|
