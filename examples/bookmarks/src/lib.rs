@@ -426,8 +426,10 @@ impl<'e> Store<'e> {
         self.write_tags(id, &b.tags, 0)?;
         self.write_meta(id, &b)?;
         self.next_id += 1;
+        // The id sequence has nowhere to live but a row, and rewriting that
+        // row retires a slot every time. So it is flushed once per session
+        // rather than once per add — batching the library cannot do for us.
         self.header_dirty = true;
-        self.flush_header()?;
         Ok(id)
     }
 
@@ -510,15 +512,17 @@ impl<'e> Store<'e> {
 
         let gather = |field: u64, len: usize| -> Result<String, StoreError> {
             let mut buf: Vec<u8> = Vec::with_capacity(len);
-            let mut expect = 0u64;
-            for (k, v) in rows.iter().filter(|(k, _)| field_of(*k) == field) {
-                if ord_of(*k) != expect {
+            for (expect, (k, v)) in rows
+                .iter()
+                .filter(|(k, _)| field_of(*k) == field)
+                .enumerate()
+            {
+                if ord_of(*k) != expect as u64 {
                     return Err(StoreError::Damaged {
                         entity,
                         what: format!("missing chunk {expect} of field {field}"),
                     });
                 }
-                expect += 1;
                 buf.extend_from_slice(&v.raw());
             }
             if buf.len() < len {

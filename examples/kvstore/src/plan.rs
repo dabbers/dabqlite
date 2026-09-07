@@ -307,6 +307,44 @@ pub fn census(rows: &Rows, now: u64) -> Result<RecordCensus, KvError> {
     Ok(c)
 }
 
+/// A tolerant [`scan`] for salvage: records this layout cannot read are
+/// skipped and counted instead of failing the whole listing.
+pub fn scan_recovered(rows: &Rows, now: u64) -> (Vec<Entry>, u64) {
+    let mut out = Vec::new();
+    let mut lost = 0u64;
+    for (&id, raw) in rows.iter() {
+        if chunk_of(id) != 0 {
+            continue;
+        }
+        let Ok(header) = Header::decode(raw) else {
+            lost += 1;
+            continue;
+        };
+        if !header.is_live() {
+            continue;
+        }
+        let rec = record_of(id);
+        match read_payload(rows, rec, &header) {
+            Ok(mut payload) => {
+                let value = payload.split_off(header.key_len);
+                match String::from_utf8(payload) {
+                    Ok(key) => out.push(Entry {
+                        key,
+                        value,
+                        expires_at: header.expires_at,
+                        record: rec,
+                    }),
+                    Err(_) => lost += 1,
+                }
+            }
+            Err(_) => lost += 1,
+        }
+    }
+    out.retain(|e| e.expires_at == 0 || e.expires_at > now);
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    (out, lost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,39 +411,64 @@ mod tests {
         assert_eq!(lookup(&rows, "k", 0).unwrap().unwrap().value, b"replacement");
     }
 
+    /// Write a record for `key` at a chosen record number, so a probe
+    /// chain can be built without brute-forcing a 56-bit hash collision.
+    fn plant(rows: &mut Rows, rec: u64, key: &str, value: &[u8]) {
+        let mut payload = key.as_bytes().to_vec();
+        payload.extend_from_slice(value);
+        for (i, chunk) in crate::codec::split(&payload).into_iter().enumerate() {
+            rows.insert(
+                row_id(rec, crate::codec::BANK_A_START + i as u64),
+                chunk,
+            );
+        }
+        rows.insert(
+            header_id(rec),
+            Header::new(key.len(), value.len(), 0, crate::codec::BANK_A_START).encode(),
+        );
+    }
+
     #[test]
-    fn deleting_leaves_the_probe_chain_intact_for_colliding_keys() {
-        // Force a collision by planting a record on a key's home slot.
+    fn a_taken_home_record_is_probed_past_and_tombstones_keep_the_chain() {
         let mut rows = Rows::new();
-        set(&mut rows, "alpha", "1");
         let home = home_record(b"alpha");
-        // A synthetic neighbour occupying the same home record.
-        let mut victim = String::new();
-        for n in 0..100_000u32 {
-            let cand = format!("k{n}");
-            if home_record(cand.as_bytes()) == home {
-                victim = cand;
-                break;
-            }
+        plant(&mut rows, home, "occupier", b"x");
+        set(&mut rows, "alpha", "1");
+
+        match locate(&rows, b"alpha").unwrap() {
+            Slot::Occupied { rec, .. } => assert_eq!(rec, crate::codec::probe(home, 1)),
+            other => panic!("expected alpha one past its home record, got {other:?}"),
         }
-        assert!(!victim.is_empty(), "no colliding key found");
-        set(&mut rows, &victim, "2");
-        let first = locate(&rows, b"alpha").unwrap();
-        let second = locate(&rows, victim.as_bytes()).unwrap();
-        match (first, second) {
-            (Slot::Occupied { rec: a, .. }, Slot::Occupied { rec: b, .. }) => {
-                assert_ne!(a, b, "colliding keys must land on different records")
-            }
-            _ => panic!("both keys should be present"),
+        assert_eq!(lookup(&rows, "alpha", 0).unwrap().unwrap().value, b"1");
+
+        // Retiring the record that sits in front of it must not hide it:
+        // the tombstone has to stay as a chain link.
+        rows.insert(header_id(home), Header::tombstone().encode());
+        assert_eq!(lookup(&rows, "alpha", 0).unwrap().unwrap().value, b"1");
+    }
+
+    #[test]
+    fn a_tombstoned_record_is_reused_by_the_next_key_that_lands_on_it() {
+        let mut rows = Rows::new();
+        set(&mut rows, "k", "first");
+        let rec = match locate(&rows, b"k").unwrap() {
+            Slot::Occupied { rec, .. } => rec,
+            other => panic!("{other:?}"),
+        };
+        let ops = plan_delete(&rows, "k", 0).unwrap().unwrap();
+        apply(&mut rows, ops);
+        assert!(lookup(&rows, "k", 0).unwrap().is_none());
+        match locate(&rows, b"k").unwrap() {
+            Slot::Vacant { rec: free } => assert_eq!(free, rec, "the freed slot must be reused"),
+            other => panic!("{other:?}"),
         }
-        // Delete the one that sits first in the probe chain; the other must
-        // still be findable through the tombstone.
-        apply(&mut rows, plan_delete(&rows, "alpha", 0).unwrap().unwrap());
-        assert!(lookup(&rows, "alpha", 0).unwrap().is_none());
-        assert_eq!(lookup(&rows, &victim, 0).unwrap().unwrap().value, b"2");
-        // ...and the freed slot is reused rather than leaked.
-        set(&mut rows, "alpha", "3");
-        assert_eq!(lookup(&rows, "alpha", 0).unwrap().unwrap().value, b"3");
+        set(&mut rows, "k", "second");
+        assert_eq!(lookup(&rows, "k", 0).unwrap().unwrap().value, b"second");
+        assert_eq!(
+            rows.keys().filter(|id| chunk_of(**id) == 0).count(),
+            1,
+            "reuse must not leak a second header"
+        );
     }
 
     #[test]
@@ -416,7 +479,8 @@ mod tests {
         set(&mut rows, "c", "3");
         let plan = plan_set(&rows, "d", b"4", 100, 0).unwrap();
         apply(&mut rows, plan.ops);
-        apply(&mut rows, plan_delete(&rows, "b", 0).unwrap().unwrap());
+        let ops = plan_delete(&rows, "b", 0).unwrap().unwrap();
+        apply(&mut rows, ops);
 
         let at_50: Vec<_> = scan(&rows, 50).unwrap().into_iter().map(|e| e.key).collect();
         assert_eq!(at_50, vec!["a", "c", "d"]);
@@ -454,42 +518,4 @@ mod tests {
         let err = plan_set(&rows, "k", &huge, 0, 0).unwrap_err();
         assert!(matches!(err, KvError::ValueTooLong { .. }), "{err:?}");
     }
-}
-
-/// A tolerant [`scan`] for salvage: records this layout cannot read are
-/// skipped and counted instead of failing the whole listing.
-pub fn scan_recovered(rows: &Rows, now: u64) -> (Vec<Entry>, u64) {
-    let mut out = Vec::new();
-    let mut lost = 0u64;
-    for (&id, raw) in rows.iter() {
-        if chunk_of(id) != 0 {
-            continue;
-        }
-        let Ok(header) = Header::decode(raw) else {
-            lost += 1;
-            continue;
-        };
-        if !header.is_live() {
-            continue;
-        }
-        let rec = record_of(id);
-        match read_payload(rows, rec, &header) {
-            Ok(mut payload) => {
-                let value = payload.split_off(header.key_len);
-                match String::from_utf8(payload) {
-                    Ok(key) => out.push(Entry {
-                        key,
-                        value,
-                        expires_at: header.expires_at,
-                        record: rec,
-                    }),
-                    Err(_) => lost += 1,
-                }
-            }
-            Err(_) => lost += 1,
-        }
-    }
-    out.retain(|e| e.expires_at == 0 || e.expires_at > now);
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    (out, lost)
 }

@@ -172,6 +172,11 @@ pub fn write_capacity(dir: &Path, rows: u64) -> Result<(), KvError> {
 }
 
 /// Seconds since the Unix epoch.
+///
+/// The repository's clippy config disallows `SystemTime::now` because the
+/// database core must stay deterministic; an application on top of it is
+/// exactly where a clock belongs.
+#[allow(clippy::disallowed_methods)]
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -182,9 +187,13 @@ pub fn now_secs() -> u64 {
 /// Turn a library error from `open` into something a user can act on.
 pub fn open_error(dir: &Path, e: dabqlite::Error) -> KvError {
     match e {
-        dabqlite::Error::Io { ref detail } if detail.contains("WouldBlock") => KvError::Locked {
+        dabqlite::Error::Locked { detail } => KvError::Locked {
             dir: dir.to_path_buf(),
-            detail: detail.clone(),
+            detail,
+        },
+        dabqlite::Error::CapacityTooSmall { required, asked } => KvError::CapacityTooSmall {
+            asked,
+            required,
         },
         dabqlite::Error::Corrupt { what } => KvError::Damaged {
             dir: dir.to_path_buf(),

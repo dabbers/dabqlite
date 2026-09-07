@@ -55,6 +55,31 @@ fn open(disk: SimDisk) -> (SimHost, u64) {
     (host, n)
 }
 
+fn open_strict(disk: SimDisk) -> (SimHost, Result<u64, DbError>) {
+    let mut host = SimHost::new(CAPS, disk, None);
+    let r = match host.open() {
+        Driven::Done(Output::OpenDone { result }) => result,
+        other => panic!("open: {other:?}"),
+    };
+    (host, r)
+}
+
+fn open_salvage(disk: SimDisk) -> (SimHost, u64) {
+    let mut host = SimHost::new(CAPS, disk, None);
+    let n = match host.open_salvage() {
+        Driven::Done(Output::OpenDone { result: Ok(n) }) => n,
+        other => panic!("salvage open: {other:?}"),
+    };
+    (host, n)
+}
+
+fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, DbError> {
+    match host.run_input(dabqlite_core::Input::Get { id }) {
+        Driven::Done(Output::GetDone { result, .. }) => result,
+        other => panic!("get: {other:?}"),
+    }
+}
+
 #[test]
 fn a_deleted_row_is_gone_and_stays_gone_across_restarts() {
     for seed in 0..6u64 {
@@ -548,4 +573,93 @@ fn updates_are_atomic_visible_everywhere_and_durable() {
         Driven::Done(Output::InsertDone { result: Ok(()), .. })
     ));
     assert_eq!(host.get(id), Some(old));
+}
+
+/// Damage the RECORD that a deletion retired, and the deletion itself
+/// becomes an orphan: it refers to a row that is no longer live at that
+/// point in the replay. Both slots must be quarantined — the damaged
+/// record AND the deletion left dangling by it.
+///
+/// (Found by mutation testing: `quarantined += 1` in this branch could be
+/// removed without a single test noticing, which meant salvage could
+/// under-report exactly how much of a churned database it could not read.)
+#[test]
+fn a_deletion_orphaned_by_a_damaged_record_is_itself_quarantined() {
+    use dabqlite_core::ROW_SIZE;
+    let n = 6usize;
+    let (base, ops) = build(31, n);
+    let (victim, _) = ops[2];
+
+    let mut host = SimHost::new(CAPS, base, None);
+    host.open();
+    assert_eq!(delete(&mut host, victim), Ok(()));
+    let mut disk = std::mem::take(&mut host.disk);
+    // Row 2 is the victim's record; the tombstone is the last slot.
+    disk.corrupt(FileId::Rows, (2 * ROW_SIZE + 6) as u64, 0x20);
+
+    // Strict open refuses, naming the row defect it hits first.
+    let (_, strict) = open_strict(disk.clone());
+    assert!(
+        matches!(strict, Err(DbError::Corrupt { .. })),
+        "strict open must refuse: {strict:?}"
+    );
+
+    let (mut host, salvaged) = open_salvage(disk);
+    assert_eq!(
+        host.engine.quarantined(),
+        2,
+        "the damaged record AND the deletion it orphaned must both be quarantined"
+    );
+    // Five survivors. The quarantined record IS the row that was deleted,
+    // so the orphaned deletion has nothing left to remove: the other five
+    // records are live, and the deleted row is absent either way.
+    assert_eq!(salvaged, 5);
+    for (row, &(id, value)) in ops.iter().enumerate() {
+        if row == 2 {
+            continue;
+        }
+        assert_eq!(get_result(&mut host, id), Ok(Some(value)), "row {row}");
+    }
+}
+
+/// The same for an update: damage the record it superseded, and the
+/// update is left referring to a row that was never live.
+#[test]
+fn an_update_orphaned_by_a_damaged_record_is_itself_quarantined() {
+    use dabqlite_core::ROW_SIZE;
+    let n = 6usize;
+    let (base, ops) = build(43, n);
+    let (target, _) = ops[1];
+
+    let mut host = SimHost::new(CAPS, base, None);
+    host.open();
+    assert_eq!(update(&mut host, target, [0x5E; VALUE_LEN]), Ok(()));
+    let mut disk = std::mem::take(&mut host.disk);
+    // Row 1 is the superseded record; the update is the last slot.
+    disk.corrupt(FileId::Rows, (ROW_SIZE + 9) as u64, 0x11);
+
+    let (_, strict) = open_strict(disk.clone());
+    assert!(
+        matches!(strict, Err(DbError::Corrupt { .. })),
+        "strict open must refuse: {strict:?}"
+    );
+
+    let (mut host, salvaged) = open_salvage(disk);
+    assert_eq!(
+        host.engine.quarantined(),
+        2,
+        "the damaged record AND the update it orphaned must both be quarantined"
+    );
+    // The updated row is unreadable; the other five survive.
+    assert_eq!(salvaged, 5);
+    assert_eq!(
+        get_result(&mut host, target),
+        Err(DbError::Degraded { quarantined: 2 })
+    );
+    for (row, &(id, value)) in ops.iter().enumerate() {
+        if row == 1 {
+            continue;
+        }
+        assert_eq!(get_result(&mut host, id), Ok(Some(value)), "row {row}");
+    }
 }

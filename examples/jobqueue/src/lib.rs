@@ -21,7 +21,8 @@
 //!   to carve ids out of the user key space to hold it.
 //! * **A monotonic commit watermark** — because we cannot update two rows
 //!   atomically, "mark this job committed AND bump the aggregate" has to
-//!   be made idempotent by hand. See [`step`].
+//!   be made idempotent by hand: the aggregate is a monotonic watermark, not a
+//!   counter, so re-running a commit is a no-op.
 //! * **A directory-swap compaction protocol** — because `compact_to_memory`
 //!   returns an in-memory database and there is no way to put a snapshot
 //!   back onto disk, compacting a file-backed database means rebuilding it
@@ -99,14 +100,14 @@ impl JobRow {
 }
 
 /// A meta row: two `u64`s, which is exactly what 16 bytes holds.
-fn encode_meta(a: u64, b: u64) -> Value {
+pub fn encode_meta(a: u64, b: u64) -> Value {
     let mut out = [0u8; VALUE_LEN];
     out[0..8].copy_from_slice(&a.to_le_bytes());
     out[8..16].copy_from_slice(&b.to_le_bytes());
     Value::from(out)
 }
 
-fn decode_meta(v: Value) -> (u64, u64) {
+pub fn decode_meta(v: Value) -> (u64, u64) {
     let b = v.raw();
     (
         u64::from_le_bytes(b[0..8].try_into().expect("fixed width")),
@@ -443,8 +444,8 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
     // The head of the queue: the lowest-id job row. `range_page` gives a
     // bounded page, which is the only way to ask "what is the first row
     // at or after k" without collecting the whole range.
-    let head = |db: &mut _| -> Result<Option<(u64, JobRow)>, QueueError> {
-        let (page, _) = Db::range_page(db, FIRST_JOB_ID, MAX_JOB_ID)?;
+    let head = |db: &mut _, from: u64| -> Result<Option<(u64, JobRow)>, QueueError> {
+        let (page, _) = Db::range_page(db, from, MAX_JOB_ID)?;
         Ok(page.first().map(|&(id, v)| (id, JobRow::decode(v))))
     };
 
@@ -500,9 +501,13 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
         }
 
         let (enqueue_next, _) = read_meta(&mut db, ROW_ENQUEUE_WATERMARK)?;
-        let live_jobs = db.stats().live.saturating_sub(2);
+        let (committed_now, _) = read_meta(&mut db, ROW_COMMIT_WATERMARK)?;
+        // Queue depth is derived from the two watermarks, not from
+        // `stats().live`: when rows are retained rather than reaped,
+        // `live` counts finished work too and the queue would wedge.
+        let in_flight = (enqueue_next - FIRST_JOB_ID).saturating_sub(committed_now);
 
-        let progressed = if enqueue_next <= cfg.jobs && live_jobs < cfg.window {
+        let progressed = if enqueue_next <= cfg.jobs && in_flight < cfg.window {
             // ---- ENQUEUE ----------------------------------------------
             //
             // Two writes that cannot be one: insert the job, then advance
@@ -530,7 +535,22 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
             true
         } else {
             // ---- DRAIN ------------------------------------------------
-            match head(&mut db)? {
+            //
+            // There is no secondary index and no "where state = ?", so the
+            // head of the queue has to be found positionally. It works
+            // only because ids are handed out in FIFO order and the commit
+            // watermark says where the live region starts. When rows are
+            // reaped we must still scan from the bottom, to pick up a row
+            // whose commit landed but whose delete did not; when they are
+            // kept, we have to scan from `committed + 1` or the retired
+            // rows themselves become the head forever.
+            let (committed_so_far, _) = read_meta(&mut db, ROW_COMMIT_WATERMARK)?;
+            let scan_from = if cfg.reap {
+                FIRST_JOB_ID
+            } else {
+                committed_so_far + 1
+            };
+            match head(&mut db, scan_from)? {
                 None => false,
                 Some((id, job)) => match job.state {
                     PENDING => {
@@ -598,23 +618,9 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
                             journal.record(&format!("K {id}"))?;
                             rep.committed += 1;
                         }
-                        if cfg.reap {
-                            if db.remove(id)? {
-                                journal.record(&format!("R {id}"))?;
-                                rep.reaped += 1;
-                            }
-                        } else {
-                            // Not reaping: park the row out of the queue's
-                            // way. There is no secondary index and no
-                            // "where state = ?", so the ONLY way to keep
-                            // the head-of-queue scan cheap is to move the
-                            // row to a different id -- which dabqlite
-                            // cannot do either (no rename), so we delete
-                            // and re-insert, at two more slots.
-                            let archived = MAX_JOB_ID - id;
-                            db.remove(id)?;
-                            db.put(archived, JobRow { state: DONE, ..job }.encode())?;
-                            journal.record(&format!("A {id}"))?;
+                        if cfg.reap && db.remove(id)? {
+                            journal.record(&format!("R {id}"))?;
+                            rep.reaped += 1;
                         }
                         true
                     }
@@ -698,6 +704,11 @@ pub struct Inspection {
 #[derive(Debug, Default, Clone)]
 pub struct Audit {
     pub runs: usize,
+    /// Opens that found a checksum-valid row past the manifest. Exactly
+    /// one is the normal artifact of an insert that was in flight when the
+    /// process died — so this is direct evidence that a SIGKILL landed
+    /// *inside* dabqlite's commit path, not tidily between operations.
+    pub opens_with_orphan_rows: usize,
     pub compactions_started: usize,
     pub compactions_finished: usize,
     /// Jobs whose insert was acknowledged, in order.
@@ -724,14 +735,27 @@ pub fn audit(journal: &Path) -> io::Result<Audit> {
     let mut text = String::new();
     File::open(journal)?.read_to_string(&mut text)?;
     let mut a = Audit::default();
-    let mut seen_enqueue = std::collections::HashSet::new();
-    let mut seen_commit = std::collections::HashSet::new();
+    // BTreeSet, not HashSet: the repository's clippy config bans the
+    // default hasher so that nothing an audit reports can depend on
+    // iteration order. Membership is all we need here anyway.
+    let mut seen_enqueue = std::collections::BTreeSet::new();
+    let mut seen_commit = std::collections::BTreeSet::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
         let (tag, arg) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
         let id = arg.parse::<u64>().ok();
         match (tag, id) {
-            ("S", _) => a.runs += 1,
+            ("S", _) => {
+                a.runs += 1;
+                if line
+                    .split_whitespace()
+                    .find_map(|f| f.strip_prefix("orphans="))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|n| n > 0)
+                {
+                    a.opens_with_orphan_rows += 1;
+                }
+            }
             ("X", _) => {
                 if arg == "begin" {
                     a.compactions_started += 1

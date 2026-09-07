@@ -43,12 +43,28 @@
 //! them and tells you when it does not fit rather than truncating.
 
 use dabqlite_core::{Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
-use dabqlite_host::{Host, MemoryStorage, Storage};
-
-#[cfg(unix)]
-use dabqlite_host::{PosixStorage, ReadOnlyDir};
+use dabqlite_host::Host;
 
 pub use dabqlite_core::{DbError as EngineError, RecoveryReport, VALUE_LEN};
+
+// The backends, re-exported so that `Db<S>` can actually be WRITTEN DOWN by
+// a caller. Without these a database could only ever be a local binding
+// whose type was inferred — never a struct field, a function parameter, a
+// return type, or a trait impl. Three independent sample projects each hit
+// this within minutes and each had to invent its own type erasure to work
+// around it.
+pub use dabqlite_host::{MemoryStorage, Storage};
+#[cfg(unix)]
+pub use dabqlite_host::{PosixStorage, ReadOnlyDir};
+
+/// A database backed by real files. The type you put in a struct.
+#[cfg(unix)]
+pub type FileDb = Db<PosixStorage>;
+/// A database held entirely in memory.
+pub type MemDb = Db<MemoryStorage>;
+/// A damaged database opened read-only for rescue (see [`Db::salvage`]).
+#[cfg(unix)]
+pub type SalvageDb = Db<ReadOnlyDir>;
 
 /// Rows a database can hold when you do not say otherwise.
 ///
@@ -82,10 +98,20 @@ impl Value {
         Ok(Value(v))
     }
 
-    /// The bytes up to the first zero pad — what [`Value::from_bytes`] was
-    /// given, assuming it did not itself end in zeros.
+    /// The bytes with the zero padding trimmed from the END.
+    ///
+    /// Interior zeros are preserved: `from_bytes(b"ab\0cd").as_bytes()`
+    /// is `b"ab\0cd"`, not `b"ab"`. (It used to stop at the first zero
+    /// anywhere, which silently truncated any binary payload — every
+    /// sample project built against this crate hit it, and two of them
+    /// abandoned `as_bytes` entirely in favour of [`Value::raw`].)
+    ///
+    /// A value whose own last byte is zero is still indistinguishable
+    /// from padding — that is inherent to a fixed-width slot, not a bug
+    /// to be fixed here. Binary payloads that can end in zero should
+    /// carry their own length, or use [`Value::raw`].
     pub fn as_bytes(&self) -> &[u8] {
-        let end = self.0.iter().position(|&b| b == 0).unwrap_or(VALUE_LEN);
+        let end = self.0.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         &self.0[..end]
     }
 
@@ -122,6 +148,18 @@ pub enum Error {
     /// The database is at its declared row capacity. Reopen with a larger
     /// one, or rebuild to reclaim the slots deletes and updates consumed.
     Full { capacity: u64 },
+    /// The capacity asked for at open is smaller than the data already on
+    /// disk. Reopen with at least `required`.
+    ///
+    /// Distinct from [`Error::Full`] on purpose: these are opposite
+    /// situations, and conflating them produced a message that stated the
+    /// reverse of the truth ("full at its declared capacity of 50" when
+    /// you asked for 10 and there were 50).
+    CapacityTooSmall { required: u64, asked: u64 },
+    /// Another process holds the single-writer lock. Retryable, and
+    /// deliberately NOT an [`Error::Io`]: contention is a normal
+    /// condition, a failing disk is not.
+    Locked { detail: String },
     /// The value is longer than a row can hold.
     ValueTooLong { len: usize, max: usize },
     /// The database is open in salvage mode with unreadable rows, and this
@@ -145,6 +183,14 @@ impl core::fmt::Display for Error {
                 f,
                 "database is full at its declared capacity of {capacity} rows"
             ),
+            Error::CapacityTooSmall { required, asked } => write!(
+                f,
+                "opened with room for {asked} rows, but {required} are already \
+                 stored; reopen with at least {required}"
+            ),
+            Error::Locked { detail } => {
+                write!(f, "database is open by another writer: {detail}")
+            }
             Error::ValueTooLong { len, max } => {
                 write!(f, "value is {len} bytes; the row holds {max}")
             }
@@ -184,7 +230,13 @@ impl From<DbError> for Error {
                 file_schema,
                 binary: binary_schema,
             },
-            DbError::CapacityBelowData { required, .. } => Error::Full { capacity: required },
+            DbError::CapacityBelowData {
+                required,
+                configured,
+            } => Error::CapacityTooSmall {
+                required,
+                asked: configured,
+            },
             DbError::IoFailed { file } => Error::Io {
                 detail: format!("{file:?}"),
             },
@@ -272,6 +324,11 @@ pub type Page = (Vec<Row>, Option<u64>);
 /// An open database.
 pub struct Db<S: Storage> {
     host: Host<S>,
+    /// Where this database lives, when it lives somewhere. Kept so it can
+    /// compact itself in place without the caller having to hand the path
+    /// back.
+    #[cfg(unix)]
+    origin: Option<(std::path::PathBuf, u64)>,
 }
 
 impl<S: Storage> core::fmt::Debug for Db<S> {
@@ -327,8 +384,71 @@ impl Db<PosixStorage> {
     /// As [`Db::open`], with a chosen row capacity. The capacity must be
     /// at least as large as the data already there.
     pub fn open_with(path: impl AsRef<std::path::Path>, rows: u64) -> Result<Self, Error> {
-        let storage = PosixStorage::open_dir(path.as_ref()).map_err(io_err)?;
-        Self::start(Host::new(caps(rows), storage))
+        let path = path.as_ref();
+        // Finish any compaction that a crash interrupted, before anything
+        // looks at the directory.
+        finish_interrupted_compaction(path)?;
+        let storage = PosixStorage::open_dir(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                Error::Locked {
+                    detail: e.to_string(),
+                }
+            } else {
+                io_err(e)
+            }
+        })?;
+        let mut db = Self::start(Host::new(caps(rows), storage))?;
+        db.origin = Some((path.to_path_buf(), rows.max(1)));
+        Ok(db)
+    }
+
+    /// Rebuild this database in place, dropping the slots that deletes and
+    /// updates retired. The answer to [`Error::Full`] when
+    /// [`Stats::dead`] is nonzero.
+    ///
+    /// Crash-safe by construction, and it is the library's job rather than
+    /// the caller's: the compacted copy is built in a sibling directory
+    /// and only then swapped in, so an interruption at any point leaves
+    /// either the old database or the new one — never a mixture. An
+    /// interrupted swap is finished automatically by the next
+    /// [`Db::open`].
+    ///
+    /// Note that compaction reclaims DEAD slots only. A database whose
+    /// capacity is genuinely full of live rows needs a larger capacity,
+    /// not a rebuild, and says so.
+    pub fn compact(self) -> Result<Self, Error> {
+        let (path, rows) = self.origin.clone().ok_or_else(|| Error::Io {
+            detail: "this database was not opened from a path".into(),
+        })?;
+        let staging = sibling(&path, COMPACT_STAGING);
+        let retired = sibling(&path, COMPACT_RETIRED);
+
+        let mut source = self;
+        let live = source.all()?;
+        // Release the single-writer lock before touching the directory.
+        drop(source);
+
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&retired);
+        {
+            let mut fresh = Db::open_with(&staging, rows)?;
+            for (id, value) in live {
+                fresh.insert(id, value)?;
+            }
+            // Drop to release the staging lock before the swap.
+        }
+        sync_dir(&staging)?;
+
+        // The swap. Each step is a rename, and the recovery below resolves
+        // every point a crash can land between them.
+        std::fs::rename(&path, &retired).map_err(io_err)?;
+        std::fs::rename(&staging, &path).map_err(io_err)?;
+        if let Some(parent) = path.parent() {
+            let _ = sync_dir(parent);
+        }
+        let _ = std::fs::remove_dir_all(&retired);
+
+        Db::open_with(&path, rows)
     }
 }
 
@@ -350,11 +470,62 @@ impl Db<ReadOnlyDir> {
         let storage = ReadOnlyDir::open_dir(path.as_ref()).map_err(io_err)?;
         let mut host = Host::new(caps(rows), storage);
         match host.open_salvage().map_err(io_err)? {
-            Output::OpenDone { result: Ok(_) } => Ok(Db { host }),
+            Output::OpenDone { result: Ok(_) } => Ok(Db { host, origin: None }),
             Output::OpenDone { result: Err(e) } => Err(e.into()),
             other => unreachable!("open returned {other:?}"),
         }
     }
+}
+
+#[cfg(unix)]
+const COMPACT_STAGING: &str = ".compacting";
+#[cfg(unix)]
+const COMPACT_RETIRED: &str = ".retired";
+
+#[cfg(unix)]
+fn sibling(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &std::path::Path) -> Result<(), Error> {
+    std::fs::File::open(path)
+        .and_then(|d| d.sync_all())
+        .map_err(io_err)
+}
+
+/// Resolve a compaction that a crash interrupted.
+///
+/// The swap is `rename(live -> retired)` then `rename(staging -> live)`,
+/// so exactly three states are possible afterwards, and each has one
+/// correct resolution:
+///
+/// - live present, retired present → the swap completed; drop the retired
+///   copy (a crash before cleanup);
+/// - live MISSING, retired present → the crash landed between the two
+///   renames; put the old database back, since the new one was not yet
+///   in place;
+/// - anything else → nothing to do.
+///
+/// Staging is always discarded: a half-built copy is worth nothing, and
+/// the original is untouched either way.
+#[cfg(unix)]
+fn finish_interrupted_compaction(path: &std::path::Path) -> Result<(), Error> {
+    let retired = sibling(path, COMPACT_RETIRED);
+    let staging = sibling(path, COMPACT_STAGING);
+    if retired.exists() {
+        if path.exists() {
+            std::fs::remove_dir_all(&retired).map_err(io_err)?;
+        } else {
+            std::fs::rename(&retired, path).map_err(io_err)?;
+        }
+    }
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 fn caps(rows: u64) -> Capacities {
@@ -372,7 +543,11 @@ const _: () = assert!(VALUE_LEN == CORE_VALUE_LEN);
 impl<S: Storage> Db<S> {
     fn start(mut host: Host<S>) -> Result<Self, Error> {
         match host.open().map_err(io_err)? {
-            Output::OpenDone { result: Ok(_) } => Ok(Db { host }),
+            Output::OpenDone { result: Ok(_) } => Ok(Db {
+                host,
+                #[cfg(unix)]
+                origin: None,
+            }),
             Output::OpenDone { result: Err(e) } => Err(e.into()),
             other => unreachable!("open returned {other:?}"),
         }

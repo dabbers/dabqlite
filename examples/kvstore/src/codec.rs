@@ -42,6 +42,10 @@ pub const MAX_KEY: usize = 256;
 /// How far a lookup probes past a colliding record before giving up.
 pub const MAX_PROBE: u64 = 256;
 
+/// The two banks must tile the record without overlapping.
+const _: () = assert!(BANK_A_START + BANK_CHUNKS == BANK_B_START);
+const _: () = assert!(BANK_B_START + BANK_CHUNKS <= CHUNKS_PER_RECORD);
+
 const MAGIC: u8 = 0xD5;
 const F_LIVE: u8 = 0b0000_0001;
 const F_BANK_B: u8 = 0b0000_0010;
@@ -218,12 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn banks_do_not_overlap_and_fit_the_record() {
-        assert_eq!(BANK_A_START + BANK_CHUNKS, BANK_B_START);
-        assert!(BANK_B_START + BANK_CHUNKS <= CHUNKS_PER_RECORD);
-    }
-
-    #[test]
     fn header_round_trips_and_alternates_banks() {
         let h = Header::new(7, 300, 1_700_000_000, BANK_A_START);
         let back = Header::decode(&h.encode()).unwrap();
@@ -264,8 +262,13 @@ mod tests {
         let payload = b"ab\0cd".to_vec();
         let chunks = split(&payload);
         assert_eq!(chunks.len(), 1);
-        // The raw row keeps the interior NUL; `as_bytes()` would not.
         assert_eq!(&chunks[0].raw()[..5], &payload[..]);
-        assert_eq!(chunks[0].as_bytes(), b"ab");
+        // `as_bytes()` used to stop at the first zero ANYWHERE, returning
+        // b"ab" and silently losing the tail. It now trims only trailing
+        // padding, so interior zeros survive. (This crate still uses
+        // `raw()` plus an explicit length, because a payload whose own
+        // last byte is zero remains indistinguishable from padding in a
+        // fixed-width slot.)
+        assert_eq!(chunks[0].as_bytes(), b"ab\0cd");
     }
 }

@@ -269,3 +269,155 @@ fn errors_are_all_displayable_and_say_something_useful() {
         assert!(!msg.contains("Err("), "leaked a debug format: {msg}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn compaction_reclaims_dead_slots_in_place_and_survives_interruption() {
+    use dabqlite::FileDb;
+    let dir = scratch("compact");
+
+    let survivors: Vec<u64> = (0..60u64).filter(|i| i % 4 == 0).collect();
+    let mut db: FileDb = Db::open_with(&dir, 512).expect("open");
+    for i in 0..60u64 {
+        db.insert(i, Value::from_text(&format!("v{i}")).unwrap())
+            .unwrap();
+    }
+    for i in 0..60u64 {
+        if !survivors.contains(&i) {
+            assert!(db.remove(i).unwrap());
+        }
+    }
+    let before = db.stats();
+    assert!(before.dead > 0, "the workload should have left dead weight");
+
+    // In place: same path, same data, no dead weight.
+    let mut db = db.compact().expect("compact");
+    let after = db.stats();
+    assert_eq!(after.live, before.live);
+    assert_eq!(after.dead, 0, "compaction left dead slots behind");
+    assert!(
+        after.slots < before.slots,
+        "compaction did not shrink the database"
+    );
+    for i in 0..60u64 {
+        let got = db.get(i).unwrap();
+        if survivors.contains(&i) {
+            assert_eq!(got.unwrap().text(), format!("v{i}"));
+        } else {
+            assert_eq!(got, None, "row {i} came back from the dead");
+        }
+    }
+    // Still the same database on disk, and still writable.
+    db.insert(1000, Value::from_text("after").unwrap()).unwrap();
+    drop(db);
+    let reopened: FileDb = Db::open_with(&dir, 512).expect("reopen");
+    assert_eq!(reopened.len(), survivors.len() as u64 + 1);
+
+    // An interrupted swap resolves itself. Simulate a crash landing
+    // between the two renames: the live directory is gone and the old one
+    // is sitting beside it.
+    let retired = dir.with_file_name(format!(
+        "{}.retired",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    drop(reopened);
+    std::fs::rename(&dir, &retired).expect("simulate crash mid-swap");
+    assert!(!dir.exists());
+    let recovered: FileDb = Db::open_with(&dir, 512).expect("open must resolve the swap");
+    assert_eq!(
+        recovered.len(),
+        survivors.len() as u64 + 1,
+        "data lost mid-swap"
+    );
+    assert!(
+        !retired.exists(),
+        "the retired copy should have been reclaimed"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_database_can_be_held_in_a_struct_now() {
+    use dabqlite::{FileDb, MemDb};
+    // The point of this test is that it COMPILES: `Db<S>` has to be
+    // nameable for anyone to build anything on it.
+    struct App {
+        memory: MemDb,
+        disk: Option<FileDb>,
+    }
+    fn count<S: dabqlite::Storage>(db: &mut Db<S>) -> u64 {
+        db.len()
+    }
+
+    let dir = scratch("nameable");
+    let mut app = App {
+        memory: Db::in_memory().expect("memory"),
+        disk: Some(Db::open(&dir).expect("disk")),
+    };
+    app.memory
+        .insert(1, Value::from_text("a").unwrap())
+        .unwrap();
+    app.disk
+        .as_mut()
+        .unwrap()
+        .insert(2, Value::from_text("b").unwrap())
+        .unwrap();
+    assert_eq!(count(&mut app.memory), 1);
+    assert_eq!(count(app.disk.as_mut().unwrap()), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_value_keeps_its_interior_zeros() {
+    // This used to truncate at the first zero ANYWHERE, silently losing
+    // the tail of any binary payload.
+    let v = Value::from_bytes(b"ab\0cd").unwrap();
+    assert_eq!(v.as_bytes(), b"ab\0cd", "interior zeros must survive");
+    assert_eq!(Value::from_bytes(b"").unwrap().as_bytes(), b"");
+    assert_eq!(
+        Value::from_bytes(&[0u8; VALUE_LEN]).unwrap().as_bytes(),
+        b""
+    );
+    // Full-width values round-trip.
+    let full = [7u8; VALUE_LEN];
+    assert_eq!(Value::from_bytes(&full).unwrap().as_bytes(), &full);
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_too_small_says_so_instead_of_claiming_the_database_is_full() {
+    let dir = scratch("too-small");
+    {
+        let mut db = Db::open_with(&dir, 64).expect("open");
+        for i in 0..20u64 {
+            db.insert(i, Value::from_text("x").unwrap()).unwrap();
+        }
+    }
+    match Db::open_with(&dir, 5) {
+        Err(Error::CapacityTooSmall { required, asked }) => {
+            assert_eq!(asked, 5);
+            assert!(required >= 20, "required {required}");
+            let msg = Error::CapacityTooSmall { required, asked }.to_string();
+            assert!(msg.contains("reopen with at least"), "{msg}");
+            assert!(!msg.contains("full"), "this is the opposite of full: {msg}");
+        }
+        other => panic!("expected CapacityTooSmall, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_contention_is_its_own_error_not_an_io_failure() {
+    let dir = scratch("locked");
+    let _held = Db::open(&dir).expect("first writer");
+    match Db::open(&dir) {
+        Err(Error::Locked { detail }) => {
+            assert!(detail.contains("single-writer"), "{detail}");
+        }
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
