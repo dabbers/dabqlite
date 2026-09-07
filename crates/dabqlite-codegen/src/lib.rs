@@ -633,12 +633,19 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
         w("superblock. One commit point for the whole batch, so it lands".into());
         w("all-or-nothing; the fsync count does not grow with `n`.".into());
         w(String::new());
-        w("After a crash, recovery reads slots past the manifest and groups them".into());
-        w("by span. One incomplete group, or one complete group with nothing".into());
-        w("after it, is the ordinary trace of a commit that was in flight and".into());
-        w("never acknowledged. A complete group with a further valid row after it".into());
-        w("cannot be: it means an acknowledged commit was rolled back by storage".into());
-        w("that lied about an fsync, and the open reports that loudly.".into());
+        w("Each row of a commit therefore knows how big its commit was: a row".into());
+        w("found `j` slots past the manifest carrying span `s` is claiming to be".into());
+        w("row `j` of a commit of `j + s + 1` rows. Every surviving row of one".into());
+        w("interrupted commit makes the SAME claim, whichever of them reached the".into());
+        w("disk and whichever did not.".into());
+        w(String::new());
+        w("So after a crash, recovery reads the slots past the manifest and asks".into());
+        w("whether they all agree on one commit size. Agreement is what an".into());
+        w("interrupted, never-acknowledged commit looks like. Disagreement is not".into());
+        w("producible that way — two stranded single-row commits sit at offsets 0".into());
+        w("and 1 with span 0 and claim sizes 1 and 2 — so it means an".into());
+        w("acknowledged commit was rolled back by storage that lied about an".into());
+        w("fsync, and the open reports that loudly.".into());
         w(String::new());
     }
     w(format!(

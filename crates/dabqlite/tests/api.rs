@@ -5,7 +5,7 @@
 //! test here needs a helper that feels like plumbing, that is a signal the
 //! library is missing something, not that the test needs more code.
 
-use dabqlite::{Db, Error, Snapshot, Value, VALUE_LEN};
+use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_BATCH, VALUE_LEN};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-api-{}-{tag}", std::process::id()));
@@ -262,7 +262,45 @@ fn errors_are_all_displayable_and_say_something_useful() {
         Error::Io {
             detail: "disk".into(),
         },
+        Error::CapacityTooSmall {
+            required: 20,
+            asked: 5,
+        },
+        Error::Locked {
+            detail: "held".into(),
+        },
+        Error::BatchRejected {
+            at: 3,
+            cause: Box::new(Error::NotFound { id: 7 }),
+        },
     ];
+    // Every variant must appear above. This match exists to break the
+    // build when a new one is added: a variant with no case here is a
+    // variant whose message nobody ever read.
+    fn covered(e: &Error) -> &'static str {
+        match e {
+            Error::NotFound { .. } => "NotFound",
+            Error::AlreadyExists { .. } => "AlreadyExists",
+            Error::Full { .. } => "Full",
+            Error::CapacityTooSmall { .. } => "CapacityTooSmall",
+            Error::Locked { .. } => "Locked",
+            Error::ValueTooLong { .. } => "ValueTooLong",
+            Error::Degraded { .. } => "Degraded",
+            Error::Corrupt { .. } => "Corrupt",
+            Error::SchemaMismatch { .. } => "SchemaMismatch",
+            Error::Io { .. } => "Io",
+            Error::BatchRejected { .. } => "BatchRejected",
+        }
+    }
+    let mut seen: Vec<&'static str> = cases.iter().map(covered).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        cases.len(),
+        "the case list has duplicates, so some variant is untested"
+    );
+
     for e in cases {
         let msg = e.to_string();
         assert!(msg.len() > 8, "unhelpful message for {e:?}: {msg:?}");
@@ -419,5 +457,156 @@ fn lock_contention_is_its_own_error_not_an_io_failure() {
         }
         other => panic!("expected Locked, got {other:?}"),
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Batches, from the caller's side
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_batch_reads_like_a_list_of_writes_and_lands_as_one() {
+    let mut db = Db::in_memory().expect("open");
+    db.batch(&[
+        Op::put(1, Value::from_text("one").unwrap()),
+        Op::put(2, Value::from_text("two").unwrap()),
+        Op::put(3, Value::from_text("three").unwrap()),
+    ])
+    .expect("batch");
+    assert_eq!(db.len(), 3);
+
+    // A second batch that reads and rewrites what the first wrote.
+    db.batch(&[
+        Op::update(1, Value::from_text("uno").unwrap()),
+        Op::delete(2),
+        Op::remove(999),
+        Op::insert(4, Value::from_text("four").unwrap()),
+    ])
+    .expect("batch");
+
+    assert_eq!(db.get(1).unwrap().unwrap().text(), "uno");
+    assert_eq!(db.get(2).unwrap(), None);
+    assert_eq!(db.get(3).unwrap().unwrap().text(), "three");
+    assert_eq!(db.get(4).unwrap().unwrap().text(), "four");
+}
+
+/// The property an application actually leans on: a refused batch is not a
+/// mess to clean up. It names the operation that stopped it, and the
+/// database is byte-for-byte what it was.
+#[test]
+fn a_refused_batch_changes_nothing_and_says_which_operation_refused_it() {
+    let mut db = Db::in_memory().expect("open");
+    db.insert(1, Value::from_text("one").unwrap()).unwrap();
+    let before = db.snapshot().unwrap().to_bytes();
+
+    let err = db
+        .batch(&[
+            Op::put(2, Value::from_text("two").unwrap()),
+            Op::put(3, Value::from_text("three").unwrap()),
+            Op::update(77, Value::from_text("nope").unwrap()),
+            Op::put(4, Value::from_text("four").unwrap()),
+        ])
+        .expect_err("a batch with an impossible op must be refused");
+
+    match &err {
+        Error::BatchRejected { at, cause } => {
+            assert_eq!(*at, 2, "the refusal must name the operation that failed");
+            assert_eq!(**cause, Error::NotFound { id: 77 });
+        }
+        other => panic!("expected BatchRejected, got {other:?}"),
+    }
+    // The message is readable on its own, and `source()` reaches the cause
+    // without the caller having to destructure.
+    let text = err.to_string();
+    assert!(text.contains("operation 2"), "{text}");
+    assert!(text.contains("nothing in it was applied"), "{text}");
+    assert_eq!(
+        std::error::Error::source(&err).map(|e| e.to_string()),
+        Some("no row with id 77".to_string())
+    );
+
+    // Nothing was written — not even the two operations that came first.
+    assert_eq!(db.get(2).unwrap(), None);
+    assert_eq!(db.get(3).unwrap(), None);
+    assert_eq!(db.len(), 1);
+    assert_eq!(
+        db.snapshot().unwrap().to_bytes(),
+        before,
+        "a refused batch changed the database on disk"
+    );
+}
+
+#[test]
+fn a_batch_sees_its_own_earlier_operations() {
+    let mut db = Db::in_memory().expect("open");
+    db.batch(&[
+        Op::insert(5, Value::from_text("first").unwrap()),
+        Op::delete(5),
+        Op::insert(5, Value::from_text("second").unwrap()),
+        Op::put(5, Value::from_text("third").unwrap()),
+    ])
+    .expect("batch");
+    assert_eq!(db.get(5).unwrap().unwrap().text(), "third");
+    assert_eq!(db.len(), 1);
+}
+
+#[test]
+fn an_over_long_batch_is_refused_rather_than_silently_split() {
+    let mut db = Db::in_memory().expect("open");
+    let ops: Vec<Op> = (0..MAX_BATCH as u64 + 1)
+        .map(|i| Op::put(i, Value::from_text("x").unwrap()))
+        .collect();
+    match db.batch(&ops) {
+        Err(Error::BatchRejected { cause, .. }) => {
+            assert!(
+                matches!(*cause, Error::Full { .. }),
+                "expected a capacity error, got {cause:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(db.is_empty(), "an over-long batch wrote rows anyway");
+
+    // Exactly at the limit is fine.
+    let ops: Vec<Op> = (0..MAX_BATCH as u64)
+        .map(|i| Op::put(i, Value::from_text("x").unwrap()))
+        .collect();
+    db.batch(&ops)
+        .expect("a batch at the limit must be accepted");
+    assert_eq!(db.len(), MAX_BATCH as u64);
+}
+
+#[test]
+fn an_empty_batch_is_allowed_and_does_nothing() {
+    let mut db = Db::in_memory().expect("open");
+    db.insert(1, Value::from_text("one").unwrap()).unwrap();
+    let before = db.snapshot().unwrap().to_bytes();
+    db.batch(&[])
+        .expect("an empty batch is a no-op, not an error");
+    assert_eq!(db.snapshot().unwrap().to_bytes(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_batch_is_durable_as_a_unit_across_a_reopen() {
+    let dir = scratch("batch-durable");
+    {
+        let mut db = Db::open(&dir).expect("open");
+        db.batch(&[
+            Op::put(10, Value::from_text("ten").unwrap()),
+            Op::put(20, Value::from_text("twenty").unwrap()),
+            Op::put(30, Value::from_text("thirty").unwrap()),
+        ])
+        .expect("batch");
+    }
+    let mut db = Db::open(&dir).expect("reopen");
+    assert_eq!(db.len(), 3);
+    assert_eq!(db.get(10).unwrap().unwrap().text(), "ten");
+    assert_eq!(db.get(20).unwrap().unwrap().text(), "twenty");
+    assert_eq!(db.get(30).unwrap().unwrap().text(), "thirty");
+    assert!(
+        !db.recovery_report().rollback_evidence,
+        "a clean reopen after a batch must not report lost data"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

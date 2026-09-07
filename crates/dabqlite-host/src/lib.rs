@@ -140,6 +140,18 @@ impl<S: Storage> Host<S> {
         self.drive(Input::Delete { id })
     }
 
+    /// Apply several writes as ONE commit (docs/FORMAT.md, "Batch of `n`
+    /// rows"). Atomic: the whole batch becomes visible together or none of
+    /// it does, whatever a crash does in the middle.
+    ///
+    /// It is also how throughput is bought back. A single write costs two
+    /// fsyncs; a batch of `n` costs the same two, not `2n`. Nothing about
+    /// durability is traded for that — every row is still fsynced before
+    /// the superblock that references it.
+    pub fn batch(&mut self, ops: &[dabqlite_core::BatchOp]) -> Output {
+        self.drive(Input::Batch { ops })
+    }
+
     pub fn get(&mut self, id: u64) -> Output {
         self.drive(Input::Get { id })
     }

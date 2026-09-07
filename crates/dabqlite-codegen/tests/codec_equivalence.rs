@@ -193,8 +193,7 @@ fn both_codecs_refuse_a_span_the_format_does_not_define() {
         hand::encode_row(RowKind::Record, 0, 7, b"................", &mut slot);
         slot[RECORDS_SPAN_OFFSET] = span as u8;
         let crc = crc32_ieee(&slot[0..RECORDS_SPAN_OFFSET + 1]);
-        slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5]
-            .copy_from_slice(&crc.to_le_bytes());
+        slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
 
         assert_eq!(
             decode_records_row(&slot),

@@ -42,7 +42,7 @@
 //! the schema says so ([`VALUE_LEN`]); [`Value`] helps you pack text into
 //! them and tells you when it does not fit rather than truncating.
 
-use dabqlite_core::{Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
+use dabqlite_core::{BatchOp, Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
 use dabqlite_host::Host;
 
 pub use dabqlite_core::{DbError as EngineError, RecoveryReport, VALUE_LEN};
@@ -138,6 +138,60 @@ impl From<[u8; VALUE_LEN]> for Value {
     }
 }
 
+/// One write inside a [`Db::batch`].
+///
+/// The constructors read better than the struct literals at a call site —
+/// `Op::put(id, v)` beside `Op::remove(id)` — so prefer them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// Add a row. Refuses the batch if the id is already there.
+    Insert { id: u64, value: Value },
+    /// Replace a row's value. Refuses the batch if the id is absent.
+    Update { id: u64, value: Value },
+    /// Insert or replace, whichever applies.
+    Put { id: u64, value: Value },
+    /// Delete a row. Refuses the batch if the id is absent.
+    Delete { id: u64 },
+    /// Delete a row if it is there; do nothing if it is not.
+    Remove { id: u64 },
+}
+
+impl Op {
+    pub fn insert(id: u64, value: Value) -> Self {
+        Op::Insert { id, value }
+    }
+    pub fn update(id: u64, value: Value) -> Self {
+        Op::Update { id, value }
+    }
+    pub fn put(id: u64, value: Value) -> Self {
+        Op::Put { id, value }
+    }
+    pub fn delete(id: u64) -> Self {
+        Op::Delete { id }
+    }
+    pub fn remove(id: u64) -> Self {
+        Op::Remove { id }
+    }
+
+    fn to_core(self) -> BatchOp {
+        match self {
+            Op::Insert { id, value } => BatchOp::Insert { id, value: value.0 },
+            Op::Update { id, value } => BatchOp::Update { id, value: value.0 },
+            Op::Put { id, value } => BatchOp::Put { id, value: value.0 },
+            Op::Delete { id } => BatchOp::Delete { id },
+            Op::Remove { id } => BatchOp::Remove { id },
+        }
+    }
+}
+
+/// The most operations one [`Db::batch`] may carry.
+///
+/// Fixed by the on-disk format: each row of a commit records how many
+/// rows follow it in the same commit, and that field has a range
+/// (docs/FORMAT.md). Larger workloads split into several batches — each
+/// one still atomic in itself.
+pub const MAX_BATCH: usize = dabqlite_core::MAX_COMMIT_ROWS;
+
 /// Everything that can go wrong, in the caller's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -172,6 +226,14 @@ pub enum Error {
     SchemaMismatch { file_schema: u64, binary: u64 },
     /// Storage failed. The database has fail-stopped; reopen it.
     Io { detail: String },
+    /// A [`Db::batch`] was refused, and nothing in it was applied. `at` is
+    /// the index of the operation that stopped it and `cause` is the error
+    /// that operation would have returned on its own.
+    ///
+    /// The batch is validated in full before any byte is written, so this
+    /// is never a partial write to clean up — the database is exactly as
+    /// it was before the call.
+    BatchRejected { at: usize, cause: Box<Error> },
 }
 
 impl core::fmt::Display for Error {
@@ -209,11 +271,26 @@ impl core::fmt::Display for Error {
                  0x{binary:016X}"
             ),
             Error::Io { detail } => write!(f, "storage failed: {detail}"),
+            Error::BatchRejected { at, cause } => write!(
+                f,
+                "batch refused at operation {at} ({cause}); nothing in it was applied"
+            ),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    /// The underlying cause, where there is one. Only a rejected batch has
+    /// one today: it wraps the error of the operation that stopped it, so
+    /// `source()` reaches the real reason without the caller having to
+    /// destructure.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::BatchRejected { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<DbError> for Error {
     fn from(e: DbError) -> Self {
@@ -586,6 +663,58 @@ impl<S: Storage> Db<S> {
             Output::DeleteDone { result: Ok(()), .. } => Ok(()),
             Output::DeleteDone { result: Err(e), .. } => Err(e.into()),
             other => unreachable!("delete returned {other:?}"),
+        }
+    }
+
+    /// Apply several writes as ONE atomic commit.
+    ///
+    /// Either every operation lands or none does — including across a
+    /// crash, a kill, or a storage failure in the middle. There is no
+    /// window in which half a batch is visible, so an invariant that spans
+    /// rows ("this row moves to done exactly when that one is deleted")
+    /// can be maintained without a journal of your own.
+    ///
+    /// It is also the throughput lever. A single write costs two fsyncs;
+    /// a batch of `n` writes costs the same two, not `2n`. Nothing about
+    /// durability is traded away for that — every row is still made
+    /// durable before the superblock that makes it visible.
+    ///
+    /// Each operation sees the state the ones before it in the same batch
+    /// would leave, so `[insert(5, a), delete(5), insert(5, b)]` is legal
+    /// and means what it reads as, and [`Op::Put`] resolves to an insert
+    /// or a replace with no read-then-write gap to race in.
+    ///
+    /// If any operation is refused, the batch is refused whole with
+    /// [`Error::BatchRejected`] naming which one and why, and NOTHING is
+    /// written — not even the operations before it. Batches are limited to
+    /// [`MAX_BATCH`] operations.
+    ///
+    /// ```no_run
+    /// # use dabqlite::{MemDb, Op, Value};
+    /// # fn main() -> Result<(), dabqlite::Error> {
+    /// # let mut db = MemDb::in_memory_with(64)?;
+    /// db.batch(&[
+    ///     Op::put(1, Value::from_bytes(b"ready")?),
+    ///     Op::put(2, Value::from_bytes(b"ready")?),
+    ///     Op::remove(3),
+    /// ])?;
+    /// # Ok(()) }
+    /// ```
+    pub fn batch(&mut self, ops: &[Op]) -> Result<(), Error> {
+        // The core takes its own op type; translating here keeps the
+        // public surface free of `[u8; 16]`.
+        let mut core_ops = Vec::with_capacity(ops.len());
+        core_ops.extend(ops.iter().map(|op| op.to_core()));
+        match self.host.batch(&core_ops) {
+            Output::BatchDone { result: Ok(()), .. } => Ok(()),
+            Output::BatchDone {
+                result: Err(reject),
+                ..
+            } => Err(Error::BatchRejected {
+                at: reject.at as usize,
+                cause: Box::new(reject.error.into()),
+            }),
+            other => unreachable!("batch returned {other:?}"),
         }
     }
 

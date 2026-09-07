@@ -364,6 +364,12 @@ impl SimHost {
         }
     }
 
+    /// Drive one atomic batch to completion. Not part of [`ClientOp`],
+    /// which is a `Copy` value type and cannot carry a slice.
+    pub fn batch(&mut self, ops: &[dabqlite_core::BatchOp]) -> Driven {
+        self.drive(Input::Batch { ops })
+    }
+
     /// Convenience: get that must complete (pure in-memory, no I/O).
     pub fn get(&mut self, id: u64) -> Option<[u8; VALUE_LEN]> {
         match self.run(ClientOp::Get { id }) {

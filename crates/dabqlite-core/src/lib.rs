@@ -73,7 +73,9 @@ pub mod trigram;
 
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{
-    Capacities, DbError, Engine, FileId, FindPage, Input, Output, RangePage, RecoveryReport,
-    WriteBuf, FIND_PAGE, RANGE_PAGE,
+    BatchOp, BatchReject, Capacities, DbError, Engine, FileId, FindPage, Input, Output, RangePage,
+    RecoveryReport, WriteBuf, FIND_PAGE, RANGE_PAGE,
 };
-pub use layout::{ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN};
+pub use layout::{
+    MAX_COMMIT_ROWS, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
+};

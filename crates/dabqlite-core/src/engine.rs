@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 
 use crate::btree::BTreeIndex;
 use crate::layout::{
-    decode_row, decode_sb, encode_row, encode_sb, RowKind, SbDecodeError, ROW_SIZE, SB_COPIES,
-    SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
+    decode_row, decode_sb, encode_row, encode_sb, RowKind, SbDecodeError, MAX_COMMIT_ROWS,
+    ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
 use crate::trigram::TrigramIndex;
 
@@ -120,6 +120,81 @@ pub enum DbError {
     IoFailed { file: FileId },
 }
 
+/// One operation inside an atomic batch (`Input::Batch`).
+///
+/// The same three writes the engine offers singly. What a batch changes is
+/// not what an operation means but when it becomes true: every op in a
+/// batch becomes durable under ONE superblock flip, so the batch lands
+/// whole or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOp {
+    /// Add a row; refuses the batch if the id is already live.
+    Insert { id: u64, value: [u8; VALUE_LEN] },
+    /// Replace a live row's value; refuses the batch if the id is absent.
+    Update { id: u64, value: [u8; VALUE_LEN] },
+    /// Insert or replace, whichever applies. Resolved during validation
+    /// against the state the batch's earlier ops would leave, so it is
+    /// exact: no read-then-write race can open between the decision and
+    /// the commit, because there is no gap to race in.
+    Put { id: u64, value: [u8; VALUE_LEN] },
+    /// Delete a live row; refuses the batch if the id is absent.
+    Delete { id: u64 },
+    /// Delete the row if it is there, and do nothing if it is not. Stages
+    /// no row when there is nothing to remove, so a batch is not lost to
+    /// one target that had already gone.
+    Remove { id: u64 },
+}
+
+/// Why a batch was refused, and where.
+///
+/// A batch is validated in full BEFORE any byte is written, against the
+/// state each op would see if its predecessors had already applied. If any
+/// op cannot proceed, the whole batch is refused having performed no I/O
+/// at all — so a rejected batch is not a partial write to clean up, it is
+/// a no-op. `at` says which operation stopped it, and `error` is exactly
+/// the error that operation would have returned on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchReject {
+    pub at: u8,
+    pub error: DbError,
+}
+
+/// What one staged batch row will do at the commit point. Resolved during
+/// validation, when the projected state is known, so that the commit
+/// itself is a straight-line application with nothing left to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchEffect {
+    Insert {
+        id: u64,
+        value: [u8; VALUE_LEN],
+    },
+    Update {
+        id: u64,
+        value: [u8; VALUE_LEN],
+        /// The slot whose record this supersedes.
+        old_row: u64,
+    },
+    Delete {
+        id: u64,
+        /// The slot holding the record this tombstone retires.
+        record_row: u64,
+    },
+}
+
+impl BatchEffect {
+    fn id(self) -> u64 {
+        match self {
+            BatchEffect::Insert { id, .. }
+            | BatchEffect::Update { id, .. }
+            | BatchEffect::Delete { id, .. } => id,
+        }
+    }
+    /// Does this effect leave `id` live in the slot it occupies?
+    fn leaves_live(self) -> bool {
+        !matches!(self, BatchEffect::Delete { .. })
+    }
+}
+
 /// An owned, bounded write payload. Rows are 32 bytes and superblock copies
 /// 64, so every write the core ever issues fits in one fixed buffer — no
 /// allocation, no streaming (docs/DESIGN.md §4.5: bounded buffers
@@ -196,6 +271,22 @@ pub enum Input<'a> {
     /// (`dabqlite-inspect --repair-to`) compacts both the tombstone and
     /// the record it retired.
     Delete { id: u64 },
+    /// Client: apply several writes as ONE commit.
+    ///
+    /// The rows are appended like any other, then a single superblock flip
+    /// makes all of them visible at once: the batch is atomic, and its
+    /// fsync count does not grow with its length (two, as for one insert).
+    /// A crash anywhere inside it resolves to all-or-nothing exactly like
+    /// a crash inside a single write, because it IS a single commit.
+    ///
+    /// Each op is validated against the state its predecessors in the same
+    /// batch would leave, so `insert 5; delete 5; insert 5` is legal and
+    /// means what it reads as. If any op is refused, the whole batch is
+    /// refused with no I/O performed (see [`BatchReject`]).
+    ///
+    /// An empty batch commits nothing and is `Ok`: there is no generation
+    /// to flip and nothing to make durable.
+    Batch { ops: &'a [BatchOp] },
     /// Client: fetch a row by primary key.
     Get { id: u64 },
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
@@ -242,6 +333,13 @@ pub enum Output {
     DeleteDone {
         id: u64,
         result: Result<(), DbError>,
+    },
+    /// Batch finished. `rows` is the number of row slots it committed —
+    /// equal to the number of ops on success, and 0 on refusal, because a
+    /// refused batch performs no I/O and applies nothing.
+    BatchDone {
+        rows: u64,
+        result: Result<(), BatchReject>,
     },
     /// Get finished (pure in-memory lookup, always immediate).
     GetDone {
@@ -369,6 +467,19 @@ enum State {
     DeleteWriteSb { copy: u8 },
     /// Delete: superblock fsync in flight (the commit point).
     DeleteFsyncSb,
+    /// Batch: the write of staged row `next` (batch-relative) is in
+    /// flight. Rows are written one at a time, in order, so a crash can
+    /// only ever leave a PREFIX of the batch on disk — which is what
+    /// makes the span bytes enough for recovery to recognize it.
+    BatchWriteRow { next: u8 },
+    /// Batch: rows-file fsync in flight — one fsync for the whole batch,
+    /// covering every row it wrote.
+    BatchFsyncRows,
+    /// Batch: superblock-copy write in flight (copy 0 or 1 of the pair).
+    BatchWriteSb { copy: u8 },
+    /// Batch: superblock fsync in flight (the commit point for every op
+    /// in the batch at once).
+    BatchFsyncSb,
     /// Open in SALVAGE mode with quarantined rows: READ-ONLY, and honest.
     /// Verified rows are served exactly; anything the quarantine makes
     /// unanswerable returns `DbError::Degraded`.
@@ -414,6 +525,9 @@ pub struct Engine {
     opened_rows_len: u64,
     /// Checksum-valid rows found beyond the manifest during recovery.
     orphan_valid_rows: u64,
+    /// True when those rows cannot all have come from one interrupted
+    /// commit. See [`scan_orphans`].
+    orphan_rollback: bool,
     /// Recovery scratch: the chosen generation's twin slot needs repair
     /// (pair-relative copy index). Set while reading the superblock,
     /// consumed when staging the recovery fsyncs.
@@ -437,6 +551,13 @@ pub struct Engine {
     /// The update in flight: the id, its new value, and the row slot it
     /// supersedes.
     pending_update: Option<(u64, [u8; VALUE_LEN], u64)>,
+    /// The batch in flight: what each staged row will do at the commit
+    /// point, in slot order. Empty when no batch is in flight.
+    ///
+    /// Allocated ONCE at init with room for the largest batch the format
+    /// can describe, and only ever cleared and refilled, so a batch — like
+    /// everything else here — allocates nothing at run time.
+    batch: Vec<BatchEffect>,
     /// One bit per row slot: set when that slot holds a LIVE record.
     /// Cleared when a tombstone retires it, and never set for a tombstone
     /// slot itself. Derived state, sized at init like every other arena —
@@ -456,10 +577,86 @@ pub struct Engine {
     salvage: bool,
     /// Committed rows quarantined by a salvage open (0 in every other mode).
     quarantined: u64,
-    /// Negative-space invariant: the allocations must never move. If either
+    /// Negative-space invariant: the allocations must never move. If any
     /// pointer changes, something allocated after init.
     arena_addr: usize,
     index_addr: usize,
+    batch_addr: usize,
+}
+
+/// What the slots past the manifest add up to.
+struct OrphanScan {
+    /// Checksum-valid rows anywhere beyond the manifest.
+    valid: u64,
+    /// True when those rows cannot all have come from ONE commit that was
+    /// in flight at the crash.
+    rollback_evidence: bool,
+}
+
+/// Read the slots past the manifest and work out whether they are the
+/// ordinary trace of a commit that was in flight at the crash, or evidence
+/// that an acknowledged commit was rolled back by an out-of-budget fault
+/// such as a lying fsync.
+///
+/// The trick is that each row of a commit knows how big its commit was. A
+/// commit of `n` rows writes spans `n-1, n-2, ..., 0` into consecutive
+/// slots starting at the manifest, so a row found `j` slots past the
+/// manifest carrying span `s` is claiming: *I am row `j` of a commit of
+/// `j + s + 1` rows.* Every row of one interrupted commit makes the SAME
+/// claim, whichever of them survived and whichever did not.
+///
+/// So the test is agreement. All valid rows past the manifest agreeing on
+/// one commit size is exactly what an interrupted commit looks like, and
+/// nothing else produces it:
+///
+/// - An interrupted commit of `n` leaves any subset of its `n` slots (the
+///   writes were issued in order but none were fsynced, so the settle can
+///   drop any of them, leaving holes). Each survivor still claims `n`.
+/// - Two acknowledged single-row commits stranded past the manifest sit at
+///   offsets 0 and 1 with span 0, claiming sizes 1 and 2. They disagree,
+///   and that disagreement is the loss becoming loud — the same verdict
+///   the pre-batch rule ("two or more orphans") reached, reached the same
+///   way for the same reason.
+/// - A valid row beyond the group's end claims a size larger than the
+///   group's, so it cannot hide behind it.
+/// - A misdirected write dropping a genuine row with a large span at the
+///   head of the run raises the claimed size, but a claim is only believed
+///   while every other survivor makes the same one.
+///
+/// The limit of the method, stated plainly: a rolled-back commit of
+/// exactly `n` rows looks the same as an interrupted commit of `n` rows,
+/// because it is the same bytes in the same places. Detection begins at
+/// the first row that cannot be explained that way — which for single-row
+/// commits is the second orphan, exactly as before.
+///
+/// Walked with `chunks_exact` rather than hand-rolled index arithmetic,
+/// deliberately: a manual `off += ROW_SIZE` cursor can be made to stop
+/// advancing (mutation testing found exactly that — `off *= ROW_SIZE` with
+/// `off == 0` loops forever), and an unbounded loop INSIDE one `tick` is
+/// the one stall the fuel watchdog cannot see, because the engine never
+/// returns to be counted. An iterator over fixed-size chunks cannot fail
+/// to terminate, so the failure mode is structurally absent instead of
+/// merely untested.
+fn scan_orphans(past_manifest: &[u8]) -> OrphanScan {
+    let mut valid = 0u64;
+    let mut claimed: Option<u64> = None;
+    let mut disagreed = false;
+    for (j, chunk) in past_manifest.chunks_exact(ROW_SIZE).enumerate() {
+        let Some(slot) = decode_row(chunk) else {
+            continue;
+        };
+        valid += 1;
+        let claim = j as u64 + slot.span as u64 + 1;
+        match claimed {
+            None => claimed = Some(claim),
+            Some(first) if first == claim => {}
+            Some(_) => disagreed = true,
+        }
+    }
+    OrphanScan {
+        valid,
+        rollback_evidence: disagreed,
+    }
 }
 
 impl Engine {
@@ -478,8 +675,13 @@ impl Engine {
         let index = vec![0u64; index_len];
         let ordered = BTreeIndex::new(caps.rows);
         let trigram = TrigramIndex::new(caps.rows);
+        // Room for the longest commit the row format can describe, taken
+        // once so that pushing effects during validation can never
+        // reallocate (asserted in `check_invariants`).
+        let batch_staging: Vec<BatchEffect> = Vec::with_capacity(MAX_COMMIT_ROWS);
         let arena_addr = arena.as_ptr() as usize;
         let index_addr = index.as_ptr() as usize;
+        let batch_addr = batch_staging.as_ptr() as usize;
         Engine {
             state: State::New,
             caps,
@@ -488,9 +690,11 @@ impl Engine {
             pending: None,
             opened_rows_len: 0,
             orphan_valid_rows: 0,
+            orphan_rollback: false,
             pending_repair: None,
             pending_delete: None,
             pending_update: None,
+            batch: batch_staging,
             live_bits: vec![0u64; (caps.rows as usize).div_ceil(64)],
             live_count: 0,
             retired: 0,
@@ -503,6 +707,7 @@ impl Engine {
             trigram,
             arena_addr,
             index_addr,
+            batch_addr,
         }
     }
 
@@ -532,7 +737,7 @@ impl Engine {
         RecoveryReport {
             row_count: self.row_count,
             orphan_valid_rows: self.orphan_valid_rows,
-            rollback_evidence: self.orphan_valid_rows >= 2,
+            rollback_evidence: self.orphan_rollback,
             quarantined_rows: self.quarantined,
         }
     }
@@ -602,6 +807,12 @@ impl Engine {
             self.index_addr,
             "index moved: allocation after init is forbidden"
         );
+        debug_assert_eq!(
+            self.batch.as_ptr() as usize,
+            self.batch_addr,
+            "batch staging moved: a batch longer than the format allows got past validation"
+        );
+        debug_assert!(self.batch.len() <= MAX_COMMIT_ROWS);
         debug_assert!(self.row_count <= self.caps.rows);
         // The ordered index is derived state over exactly the committed
         // rows — outside recovery, where it is rebuilt before `row_count`
@@ -613,6 +824,10 @@ impl Engine {
                 | State::InsertFsyncRows
                 | State::InsertWriteSb { .. }
                 | State::InsertFsyncSb
+                | State::BatchWriteRow { .. }
+                | State::BatchFsyncRows
+                | State::BatchWriteSb { .. }
+                | State::BatchFsyncSb
         ) {
             // Every SLOT is accounted for in the trigram cursor, records
             // indexed and tombstones skipped, so row numbers stay true.
@@ -661,8 +876,21 @@ impl Engine {
                 | State::DeleteFsyncSb
         );
         debug_assert_eq!(self.pending_delete.is_some(), deleting);
-        // Never both.
-        debug_assert!(u8::from(inserting) + u8::from(deleting) + u8::from(updating) <= 1);
+        let batching = matches!(
+            self.state,
+            State::BatchWriteRow { .. }
+                | State::BatchFsyncRows
+                | State::BatchWriteSb { .. }
+                | State::BatchFsyncSb
+        );
+        // Staged effects exist exactly while a batch is in flight, and the
+        // engine forgets them the moment the batch commits or fails — a
+        // leftover effect would be applied twice by the next batch.
+        debug_assert_eq!(!self.batch.is_empty(), batching);
+        // Never more than one write in flight: v1 serializes all access.
+        debug_assert!(
+            u8::from(inserting) + u8::from(deleting) + u8::from(updating) + u8::from(batching) <= 1
+        );
         // Live records are a subset of the slots, and of the keys the
         // ordered index holds (one per distinct id ever inserted). Only
         // meaningful once open has published `row_count`: during recovery
@@ -683,6 +911,10 @@ impl Engine {
                 | State::UpdateFsyncRows
                 | State::UpdateWriteSb { .. }
                 | State::UpdateFsyncSb
+                | State::BatchWriteRow { .. }
+                | State::BatchFsyncRows
+                | State::BatchWriteSb { .. }
+                | State::BatchFsyncSb
         ) {
             debug_assert!(self.live_count <= self.row_count);
             debug_assert!(self.live_count <= self.ordered.len());
@@ -709,6 +941,7 @@ impl Engine {
             Input::Insert { id, value } => self.on_insert(id, value),
             Input::Update { id, value } => self.on_update(id, value),
             Input::Delete { id } => self.on_delete(id),
+            Input::Batch { ops } => self.on_batch(ops),
             Input::Get { id } => self.on_get(id),
             Input::Range { lo, hi } => self.on_range(lo, hi),
             Input::Find {
@@ -1017,28 +1250,9 @@ impl Engine {
                 }
             }
         }
-        // Rollback-evidence scan: checksum-valid rows beyond the manifest.
-        // ONE is the normal artifact of an in-flight, never-acknowledged
-        // insert. TWO OR MORE cannot arise that way (writes are serialized;
-        // slot N+1 is only written after commit N+1 was acknowledged as
-        // durable) — they are surviving evidence that acknowledged commits
-        // were rolled back by an out-of-budget fault such as a lying fsync.
-        // Silent loss becomes loud whenever the evidence physically exists.
-        //
-        // Walked with `chunks_exact` rather than hand-rolled index
-        // arithmetic, deliberately: a manual `off += ROW_SIZE` cursor can
-        // be made to stop advancing (mutation testing found exactly that —
-        // `off *= ROW_SIZE` with `off == 0` loops forever), and an
-        // unbounded loop INSIDE one `tick` is the one stall the fuel
-        // watchdog cannot see, because the engine never returns to be
-        // counted. An iterator over fixed-size chunks cannot fail to
-        // terminate, so the failure mode is structurally absent instead of
-        // merely untested.
-        let orphans = data[live..]
-            .chunks_exact(ROW_SIZE)
-            .filter(|chunk| decode_row(chunk).is_some())
-            .count() as u64;
-        self.orphan_valid_rows = orphans;
+        let scan = scan_orphans(&data[live..]);
+        self.orphan_valid_rows = scan.valid;
+        self.orphan_rollback = scan.rollback_evidence;
 
         // Salvage touches NOTHING. A damaged database must not be mutated
         // by the act of rescuing data from it, and a rescue must work on a
@@ -1111,33 +1325,7 @@ impl Engine {
     }
 
     fn on_update(&mut self, id: u64, value: [u8; VALUE_LEN]) -> Output {
-        let err = match self.state {
-            State::Ready => None,
-            State::New
-            | State::InitWriteSb { .. }
-            | State::InitFsyncSb
-            | State::RecoverReadSb
-            | State::RecoverReadRows { .. }
-            | State::RecoverFsyncRows { .. }
-            | State::RecoverRepairSb { .. }
-            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
-            State::InsertWriteRow
-            | State::InsertFsyncRows
-            | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb
-            | State::UpdateWriteRow
-            | State::UpdateFsyncRows
-            | State::UpdateWriteSb { .. }
-            | State::UpdateFsyncSb
-            | State::DeleteWriteRow
-            | State::DeleteFsyncRows
-            | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Some(DbError::Busy),
-            State::Degraded => Some(DbError::Degraded {
-                quarantined: self.quarantined,
-            }),
-            State::Failed(e) => Some(e),
-        };
+        let err = self.write_gate();
         if let Some(e) = err {
             return Output::UpdateDone { id, result: Err(e) };
         }
@@ -1174,33 +1362,7 @@ impl Engine {
     }
 
     fn on_delete(&mut self, id: u64) -> Output {
-        let err = match self.state {
-            State::Ready => None,
-            State::New
-            | State::InitWriteSb { .. }
-            | State::InitFsyncSb
-            | State::RecoverReadSb
-            | State::RecoverReadRows { .. }
-            | State::RecoverFsyncRows { .. }
-            | State::RecoverRepairSb { .. }
-            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
-            State::InsertWriteRow
-            | State::InsertFsyncRows
-            | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb
-            | State::UpdateWriteRow
-            | State::UpdateFsyncRows
-            | State::UpdateWriteSb { .. }
-            | State::UpdateFsyncSb
-            | State::DeleteWriteRow
-            | State::DeleteFsyncRows
-            | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Some(DbError::Busy),
-            State::Degraded => Some(DbError::Degraded {
-                quarantined: self.quarantined,
-            }),
-            State::Failed(e) => Some(e),
-        };
+        let err = self.write_gate();
         if let Some(e) = err {
             return Output::DeleteDone { id, result: Err(e) };
         }
@@ -1240,36 +1402,7 @@ impl Engine {
     }
 
     fn on_insert(&mut self, id: u64, value: [u8; VALUE_LEN]) -> Output {
-        let err = match self.state {
-            State::Ready => None,
-            State::New
-            | State::InitWriteSb { .. }
-            | State::InitFsyncSb
-            | State::RecoverReadSb
-            | State::RecoverReadRows { .. }
-            | State::RecoverFsyncRows { .. }
-            | State::RecoverRepairSb { .. }
-            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
-            State::InsertWriteRow
-            | State::InsertFsyncRows
-            | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb
-            | State::UpdateWriteRow
-            | State::UpdateFsyncRows
-            | State::UpdateWriteSb { .. }
-            | State::UpdateFsyncSb
-            | State::DeleteWriteRow
-            | State::DeleteFsyncRows
-            | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Some(DbError::Busy),
-            // Salvage is strictly read-only: appending to a file we know is
-            // damaged, and flipping the manifest over it, could only make a
-            // recoverable situation worse.
-            State::Degraded => Some(DbError::Degraded {
-                quarantined: self.quarantined,
-            }),
-            State::Failed(e) => Some(e),
-        };
+        let err = self.write_gate();
         if let Some(e) = err {
             return Output::InsertDone { id, result: Err(e) };
         }
@@ -1307,6 +1440,254 @@ impl Engine {
             offset: off as u64,
             data: WriteBuf::from_slice(&self.arena[off..off + ROW_SIZE]),
         }
+    }
+
+    // ---- batch: several writes, one commit ---------------------------
+
+    /// The state gate every client WRITE shares. Reads have their own (a
+    /// degraded database still answers hits); writes are refused in every
+    /// state but `Ready`, and this is the single place that says so, so a
+    /// new write operation cannot accidentally be laxer than the others.
+    fn write_gate(&self) -> Option<DbError> {
+        match self.state {
+            State::Ready => None,
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
+            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb
+            | State::UpdateWriteRow
+            | State::UpdateFsyncRows
+            | State::UpdateWriteSb { .. }
+            | State::UpdateFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb
+            | State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => Some(DbError::Busy),
+            // Salvage is strictly read-only: appending to a file we know is
+            // damaged, and flipping the manifest over it, could only make a
+            // recoverable situation worse.
+            State::Degraded => Some(DbError::Degraded {
+                quarantined: self.quarantined,
+            }),
+            State::Failed(e) => Some(e),
+        }
+    }
+
+    /// Where `id`'s live record sits partway through validating a batch:
+    /// what the committed state says, amended by the batch's own earlier
+    /// operations.
+    ///
+    /// This is what makes a batch mean what it reads as. `insert 5; delete
+    /// 5; insert 5` has to be legal — the second insert sees an id the
+    /// batch itself freed — while `insert 5; insert 5` has to be a
+    /// duplicate. Validating each op against the committed state alone
+    /// would get both backwards.
+    fn projected_live_row(&self, staged: usize, base_row: u64, id: u64) -> Option<u64> {
+        for i in (0..staged).rev() {
+            let effect = self.batch[i];
+            if effect.id() == id {
+                return effect.leaves_live().then_some(base_row + i as u64);
+            }
+        }
+        self.live_row_of(id)
+    }
+
+    fn on_batch(&mut self, ops: &[BatchOp]) -> Output {
+        if let Some(error) = self.write_gate() {
+            return Output::BatchDone {
+                rows: 0,
+                result: Err(BatchReject { at: 0, error }),
+            };
+        }
+        // An empty batch commits nothing. There is no generation to flip
+        // and nothing to make durable, so it performs no I/O and succeeds
+        // — refusing it would be inventing a failure out of a no-op.
+        if ops.is_empty() {
+            return Output::BatchDone {
+                rows: 0,
+                result: Ok(()),
+            };
+        }
+        if ops.len() > MAX_COMMIT_ROWS {
+            // The span byte is what lets recovery recognize a commit group;
+            // a batch longer than it can describe would be a commit the
+            // engine could write but not recognize afterwards. Refused
+            // before any I/O, like every other capacity limit.
+            return Output::BatchDone {
+                rows: 0,
+                result: Err(BatchReject {
+                    at: MAX_COMMIT_ROWS as u8,
+                    error: DbError::Full {
+                        entity: "batch rows",
+                        capacity: MAX_COMMIT_ROWS as u64,
+                    },
+                }),
+            };
+        }
+
+        // Validate the WHOLE batch first, against the projected state, and
+        // refuse it entire if any op cannot proceed. Nothing is written
+        // until every op is known to be legal, so a rejected batch leaves
+        // no partial work behind and needs no unwinding.
+        let base = self.row_count;
+        self.batch.clear();
+        for (i, op) in ops.iter().enumerate() {
+            // Slots are consumed by STAGED rows, not by ops: a `Remove` of
+            // an absent id stages nothing and costs nothing.
+            let row = base + self.batch.len() as u64;
+            let reject = |at: usize, error: DbError| Output::BatchDone {
+                rows: 0,
+                result: Err(BatchReject {
+                    at: at as u8,
+                    error,
+                }),
+            };
+            if row >= self.caps.rows {
+                self.batch.clear();
+                return reject(
+                    i,
+                    DbError::Full {
+                        entity: "records",
+                        capacity: self.caps.rows,
+                    },
+                );
+            }
+            let effect = match *op {
+                BatchOp::Insert { id, value } => {
+                    if self
+                        .projected_live_row(self.batch.len(), base, id)
+                        .is_some()
+                    {
+                        self.batch.clear();
+                        return reject(i, DbError::DuplicateId { id });
+                    }
+                    BatchEffect::Insert { id, value }
+                }
+                BatchOp::Update { id, value } => {
+                    match self.projected_live_row(self.batch.len(), base, id) {
+                        Some(old_row) => BatchEffect::Update { id, value, old_row },
+                        None => {
+                            self.batch.clear();
+                            return reject(i, DbError::NotFound { id });
+                        }
+                    }
+                }
+                BatchOp::Put { id, value } => {
+                    match self.projected_live_row(self.batch.len(), base, id) {
+                        Some(old_row) => BatchEffect::Update { id, value, old_row },
+                        None => BatchEffect::Insert { id, value },
+                    }
+                }
+                BatchOp::Delete { id } => match self.projected_live_row(self.batch.len(), base, id)
+                {
+                    Some(record_row) => BatchEffect::Delete { id, record_row },
+                    None => {
+                        self.batch.clear();
+                        return reject(i, DbError::NotFound { id });
+                    }
+                },
+                BatchOp::Remove { id } => match self.projected_live_row(self.batch.len(), base, id)
+                {
+                    Some(record_row) => BatchEffect::Delete { id, record_row },
+                    // Nothing to remove: stage no row at all. The batch
+                    // stays as long as it needs to be and no longer.
+                    None => continue,
+                },
+            };
+            self.batch.push(effect);
+        }
+
+        // Every op turned out to be a no-op (a batch of `Remove`s for ids
+        // that had already gone). There is nothing to make durable, so
+        // this is the empty batch again: no I/O, no generation flip.
+        if self.batch.is_empty() {
+            return Output::BatchDone {
+                rows: 0,
+                result: Ok(()),
+            };
+        }
+
+        // Stage every row in its arena slot, carrying the span that tells
+        // recovery how many rows travel with it. They become visible only
+        // when the superblock generation flips, all at once.
+        let n = self.batch.len();
+        for i in 0..n {
+            let (kind, id, value) = match self.batch[i] {
+                BatchEffect::Insert { id, value } => (RowKind::Record, id, value),
+                BatchEffect::Update { id, value, .. } => (RowKind::Update, id, value),
+                BatchEffect::Delete { id, .. } => (RowKind::Tombstone, id, [0u8; VALUE_LEN]),
+            };
+            let off = (base as usize + i) * ROW_SIZE;
+            let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
+                .try_into()
+                .expect("fixed slice");
+            encode_row(kind, (n - 1 - i) as u8, id, &value, slot);
+        }
+        self.state = State::BatchWriteRow { next: 0 };
+        self.batch_row_write(0)
+    }
+
+    /// The write request for batch-relative row `next`.
+    fn batch_row_write(&self, next: u8) -> Output {
+        let off = (self.row_count as usize + next as usize) * ROW_SIZE;
+        Output::Write {
+            file: FileId::Rows,
+            offset: off as u64,
+            data: WriteBuf::from_slice(&self.arena[off..off + ROW_SIZE]),
+        }
+    }
+
+    /// Apply every staged effect, in slot order. Called once, at the
+    /// commit point, when the superblock flip that makes all of them
+    /// visible is already durable.
+    ///
+    /// Order matters and is the same order the ops were written in: an
+    /// effect may retire a slot an earlier effect in the same batch
+    /// created (`insert 5; delete 5`), which only comes out right if the
+    /// creation is applied first.
+    fn apply_batch(&mut self) {
+        let base = self.row_count;
+        for i in 0..self.batch.len() {
+            let row = base + i as u64;
+            match self.batch[i] {
+                BatchEffect::Insert { id, value } => {
+                    self.bind_indices(id, row);
+                    self.trigram.insert(row, &value);
+                    self.set_live(row, true);
+                    self.live_count += 1;
+                }
+                BatchEffect::Update { id, value, old_row } => {
+                    self.set_live(old_row, false);
+                    self.bind_indices(id, row);
+                    self.trigram.insert(row, &value);
+                    self.set_live(row, true);
+                    self.retired += 1;
+                }
+                BatchEffect::Delete { record_row, .. } => {
+                    self.set_live(record_row, false);
+                    // Accounted for, never indexed: a deletion is not
+                    // searchable content.
+                    self.trigram.skip_row(row);
+                    self.live_count -= 1;
+                    self.retired += 1;
+                    self.tombstones += 1;
+                }
+            }
+        }
+        self.row_count += self.batch.len() as u64;
+        self.batch.clear();
     }
 
     fn on_write_done(&mut self, file: FileId) -> Output {
@@ -1361,6 +1742,33 @@ impl Engine {
             }
             (State::DeleteWriteSb { copy: 1 }, FileId::Superblock) => {
                 self.state = State::DeleteFsyncSb;
+                Output::Fsync {
+                    file: FileId::Superblock,
+                }
+            }
+            (State::BatchWriteRow { next }, FileId::Rows) => {
+                // One row durable-ish (not yet fsynced); write the next, or
+                // move to the single fsync that covers all of them.
+                let n = self.batch.len() as u8;
+                debug_assert!(next < n, "batch write past the staged rows");
+                if next + 1 < n {
+                    self.state = State::BatchWriteRow { next: next + 1 };
+                    self.batch_row_write(next + 1)
+                } else {
+                    self.state = State::BatchFsyncRows;
+                    Output::Fsync { file: FileId::Rows }
+                }
+            }
+            (State::BatchWriteSb { copy: 0 }, FileId::Superblock) => {
+                self.state = State::BatchWriteSb { copy: 1 };
+                Self::sb_copy_write(
+                    self.generation + 1,
+                    self.row_count + self.batch.len() as u64,
+                    1,
+                )
+            }
+            (State::BatchWriteSb { copy: 1 }, FileId::Superblock) => {
+                self.state = State::BatchFsyncSb;
                 Output::Fsync {
                     file: FileId::Superblock,
                 }
@@ -1479,6 +1887,28 @@ impl Engine {
                 self.state = State::InsertWriteSb { copy: 0 };
                 Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
             }
+            (State::BatchFsyncRows, FileId::Rows) => {
+                // Every row of the batch is durable; now flip the manifest
+                // over all of them at once.
+                self.state = State::BatchWriteSb { copy: 0 };
+                Self::sb_copy_write(
+                    self.generation + 1,
+                    self.row_count + self.batch.len() as u64,
+                    0,
+                )
+            }
+            (State::BatchFsyncSb, FileId::Superblock) => {
+                // Commit point: every op in the batch is durable, together.
+                let rows = self.batch.len() as u64;
+                debug_assert!(rows > 0, "empty batch reached the commit point");
+                self.generation += 1;
+                self.apply_batch();
+                self.state = State::Ready;
+                Output::BatchDone {
+                    rows,
+                    result: Ok(()),
+                }
+            }
             (State::InsertFsyncSb, FileId::Superblock) => {
                 // Commit point: the new generation is durable.
                 let (id, value) = self.pending.take().expect("pending insert at commit");
@@ -1524,6 +1954,8 @@ impl Engine {
             State::UpdateWriteSb { .. } | State::UpdateFsyncSb => FileId::Superblock,
             State::DeleteWriteRow | State::DeleteFsyncRows => FileId::Rows,
             State::DeleteWriteSb { .. } | State::DeleteFsyncSb => FileId::Superblock,
+            State::BatchWriteRow { .. } | State::BatchFsyncRows => FileId::Rows,
+            State::BatchWriteSb { .. } | State::BatchFsyncSb => FileId::Superblock,
             state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
         };
         assert!(
@@ -1570,6 +2002,23 @@ impl Engine {
                     result: Err(err),
                 }
             }
+            State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => {
+                // Fail-stop, and the staged effects are dropped unapplied:
+                // the superblock still names the old generation, so
+                // whatever rows did reach the disk are past the manifest
+                // and inert. `rows: 0` is the literal truth — nothing this
+                // batch wrote is committed.
+                debug_assert!(!self.batch.is_empty(), "batch effects lost before failure");
+                self.batch.clear();
+                self.state = State::Failed(err);
+                Output::BatchDone {
+                    rows: 0,
+                    result: Err(BatchReject { at: 0, error: err }),
+                }
+            }
             _ => self.fail_open(err),
         }
     }
@@ -1608,7 +2057,11 @@ impl Engine {
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Err(DbError::Busy),
+            | State::DeleteFsyncSb
+            | State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::GetDone { id, result }
@@ -1640,7 +2093,11 @@ impl Engine {
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Err(DbError::Busy),
+            | State::DeleteFsyncSb
+            | State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::RangeDone { result }
@@ -1674,7 +2131,11 @@ impl Engine {
             | State::DeleteWriteRow
             | State::DeleteFsyncRows
             | State::DeleteWriteSb { .. }
-            | State::DeleteFsyncSb => Err(DbError::Busy),
+            | State::DeleteFsyncSb
+            | State::BatchWriteRow { .. }
+            | State::BatchFsyncRows
+            | State::BatchWriteSb { .. }
+            | State::BatchFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::FindDone { result }

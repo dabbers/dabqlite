@@ -71,12 +71,19 @@ fsync rows → write both superblock copies of generation g+1 → fsync
 superblock. One commit point for the whole batch, so it lands
 all-or-nothing; the fsync count does not grow with `n`.
 
-After a crash, recovery reads slots past the manifest and groups them
-by span. One incomplete group, or one complete group with nothing
-after it, is the ordinary trace of a commit that was in flight and
-never acknowledged. A complete group with a further valid row after it
-cannot be: it means an acknowledged commit was rolled back by storage
-that lied about an fsync, and the open reports that loudly.
+Each row of a commit therefore knows how big its commit was: a row
+found `j` slots past the manifest carrying span `s` is claiming to be
+row `j` of a commit of `j + s + 1` rows. Every surviving row of one
+interrupted commit makes the SAME claim, whichever of them reached the
+disk and whichever did not.
+
+So after a crash, recovery reads the slots past the manifest and asks
+whether they all agree on one commit size. Agreement is what an
+interrupted, never-acknowledged commit looks like. Disagreement is not
+producible that way — two stranded single-row commits sit at offsets 0
+and 1 with span 0 and claim sizes 1 and 2 — so it means an
+acknowledged commit was rolled back by storage that lied about an
+fsync, and the open reports that loudly.
 
 ## Migration (schema `0xC4345B300A440058` → `0xA621C5242711BDF9`)
 
