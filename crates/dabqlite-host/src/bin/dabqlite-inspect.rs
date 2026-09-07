@@ -1,7 +1,8 @@
 //! The inspector CLI (docs/DESIGN.md §9 step 8): `sqlite3 file.db` for
 //! dabqlite. Read-only forensics over a database directory.
 //!
-//! Usage: `dabqlite-inspect <dir> [--verify | --repair-to <newdir> | --gc]`
+//! Usage: `dabqlite-inspect <dir> [--verify | --repair-to <newdir>
+//!         [--force-live] | --gc]`
 //!
 //! - Opens every file READ-ONLY and takes NO lock: forensics must work
 //!   beside a live (or wedged) writer, and a mid-commit view is itself
@@ -19,7 +20,12 @@
 //!   only copy of the truth is never overwritten and a failed repair
 //!   costs nothing. Rows that cannot be verified are DROPPED, and exactly
 //!   how many is reported: this is the one operation in the system that
-//!   knowingly discards data, so it says so plainly.
+//!   knowingly discards data, so it says so plainly. It REFUSES a
+//!   database that a writer currently holds open, because reading a
+//!   moving target would rebuild from a mix of commits; `--force-live`
+//!   overrides that for the case salvage exists to serve — rescuing data
+//!   out from under a wedged process — accepting that the result is a
+//!   crash-consistent snapshot rather than a quiescent copy.
 //! - `--gc` reclaims dead space in place. Today that is exactly one
 //!   thing: the legacy rows file a completed migration left behind
 //!   (docs/DESIGN.md §4.4 — inert, but not free). It runs ONLY when the
@@ -35,7 +41,7 @@ use dabqlite_core::inspect::{inspect, InspectReport, SlotState, Verdict};
 use dabqlite_core::migration::V1_SCHEMA_HASH;
 use dabqlite_core::SCHEMA_HASH;
 use dabqlite_core::{Capacities, Output};
-use dabqlite_host::posix::{rows_file_name, SUPERBLOCK_FILE};
+use dabqlite_host::posix::{rows_file_name, LOCK_FILE, SUPERBLOCK_FILE};
 use dabqlite_host::{Host, PosixStorage, ReadOnlyDir};
 
 fn read_optional(path: &Path) -> Vec<u8> {
@@ -163,7 +169,50 @@ fn print_report(dir: &Path, report: &InspectReport) {
 /// new directory. Nothing is overwritten, so an interrupted repair leaves
 /// both the damaged original and a partial copy — never a damaged
 /// original made worse.
-fn repair_to(src: &Path, dest: &Path) -> Result<(u64, u64), String> {
+/// Is a writer holding the single-writer lock right now?
+///
+/// Checked WITHOUT creating or writing anything: the lock file is opened
+/// read-only (flock works on any descriptor) and released immediately.
+/// `None` means the question could not be answered — no lock file, or a
+/// mount that will not even open it — which is treated as "no writer",
+/// since a rescue must still be possible on media that barely works.
+fn live_writer(dir: &Path) -> Option<bool> {
+    let path = dir.join(LOCK_FILE);
+    if !path.exists() {
+        return Some(false);
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file); // release immediately; we only asked a question
+            Some(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Err(_) => None,
+    }
+}
+
+fn repair_to(src: &Path, dest: &Path, force_live: bool) -> Result<(u64, u64), String> {
+    // A database with no superblock is not damaged, it is absent — say
+    // so, rather than reporting a puzzling I/O error from deep inside a
+    // salvage open that tried to initialize a fresh database.
+    let sb_bytes = std::fs::metadata(src.join(SUPERBLOCK_FILE))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if sb_bytes == 0 {
+        return Err(format!(
+            "no dabqlite database in {}: there is no {SUPERBLOCK_FILE} to read",
+            src.display()
+        ));
+    }
+    if live_writer(src) == Some(true) && !force_live {
+        return Err(format!(
+            "{} is open by another process. Rebuilding from a database that is \
+             being written would copy a moving target; close the writer, or pass \
+             --force-live to accept a crash-consistent snapshot",
+            src.display()
+        ));
+    }
     if dest.exists() && std::fs::read_dir(dest).map(|d| d.count()).unwrap_or(1) != 0 {
         return Err(format!(
             "{} already exists and is not empty; repair writes a NEW database \
@@ -272,13 +321,17 @@ fn main() -> ExitCode {
     };
     let mut verify = false;
     let mut collect = false;
+    let mut force_live = false;
     let mut repair: Option<String> = None;
     match args.next().as_deref() {
         None => {}
         Some("--verify") => verify = true,
         Some("--gc") => collect = true,
         Some("--repair-to") => match args.next() {
-            Some(dest) => repair = Some(dest),
+            Some(dest) => {
+                repair = Some(dest);
+                force_live = matches!(args.next().as_deref(), Some("--force-live"));
+            }
             None => {
                 eprintln!("--repair-to needs a destination directory");
                 return ExitCode::FAILURE;
@@ -311,7 +364,7 @@ fn main() -> ExitCode {
 
     if let Some(dest) = repair {
         println!();
-        match repair_to(dir, Path::new(&dest)) {
+        match repair_to(dir, Path::new(&dest), force_live) {
             Ok((recovered, dropped)) => {
                 println!("repair: wrote {recovered} rows to {dest}");
                 if dropped > 0 {

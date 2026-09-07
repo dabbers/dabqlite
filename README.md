@@ -76,8 +76,10 @@ crates/
                   hand codec the fault matrix validated; SCHEMA_HASH is
                   derived, pinned by test, drift-checked in CI.
   dabqlite-host   The storage seam (trait shaped by OPFS sync access
-                  handles) plus the generic host driver and the real POSIX
-                  file backend. Equivalence tests prove the simulator and
+                  handles) plus the generic host driver, the real POSIX
+                  file backend, and the in-memory backend (which runs
+                  anywhere, with explicit snapshot/restore instead of
+                  durability). Equivalence tests prove the simulator and
                   real disk produce byte-identical files and identical
                   fault outcomes — the simulation is not a fiction.
   dabqlite-sim    The deterministic simulator: simulated disk with crash and

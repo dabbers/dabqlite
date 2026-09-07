@@ -25,7 +25,7 @@
 //! CHROMEDRIVER=... cargo test -p dabqlite-web --target wasm32-unknown-unknown
 //! ```
 
-use dabqlite_core::{Capacities, FileId, Output, VALUE_LEN};
+use dabqlite_core::{Capacities, FileId, Output, ROW_SIZE, VALUE_LEN};
 use dabqlite_host::{rows_file_name, Host, Storage, SUPERBLOCK_FILE};
 use dabqlite_web::fake::FakeSet;
 use dabqlite_web::opfs;
@@ -233,4 +233,156 @@ async fn flushed_bytes_are_visible_to_a_fresh_handle() {
     assert_eq!(n, payload.len(), "short read of flushed bytes");
     assert_eq!(buf, payload, "flushed bytes came back different");
     fresh.raw().close();
+}
+
+/// The browser's in-memory store, in the browser — and interchangeable
+/// with OPFS in both directions.
+///
+/// This is the workflow a browser without OPFS (Safari private mode) has
+/// to live on, and the one a browser WITH OPFS wants anyway: run entirely
+/// in RAM at memory speed, then snapshot the image to durable storage,
+/// and load it back later. The images are the same bytes either way, so
+/// "in-memory" and "persistent" are the same database in two places.
+#[wasm_bindgen_test]
+async fn the_in_memory_store_and_opfs_are_interchangeable() {
+    use dabqlite_host::MemoryStorage;
+
+    let dir = "dabqlite-mem-bridge";
+    let _ = opfs::remove_dir(dir).await;
+    let ops = workload();
+
+    // Run the whole database in RAM — no OPFS, no handles, no locks.
+    let mut ram = Host::new(CAPS, MemoryStorage::new());
+    run_workload(&mut ram, &ops);
+    for &(id, value) in &ops {
+        match ram.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v, value),
+            other => panic!("in-memory get {id}: {other:?}"),
+        }
+    }
+    let (sb_image, rows_image, _) = ram.storage.snapshot();
+
+    // Snapshot it into OPFS by writing the images through the seam.
+    let mut opfs_storage = opfs::open_dir(dir).await.expect("open OPFS");
+    opfs_storage
+        .write(FileId::Superblock, 0, &sb_image)
+        .expect("persist superblock");
+    opfs_storage
+        .write(FileId::Rows, 0, &rows_image)
+        .expect("persist rows");
+    opfs_storage.sync(FileId::Superblock).expect("flush sb");
+    opfs_storage.sync(FileId::Rows).expect("flush rows");
+    opfs_storage.close();
+
+    // A later session opens it from OPFS and finds the same database.
+    let storage = opfs::open_dir(dir).await.expect("reopen OPFS");
+    let mut persisted = Host::new(CAPS, storage);
+    match persisted.open().expect("probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64),
+        other => panic!("opening the snapshot from OPFS: {other:?}"),
+    }
+    for &(id, value) in &ops {
+        match persisted.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v, value, "id={id}"),
+            other => panic!("persisted get {id}: {other:?}"),
+        }
+    }
+    // Keep writing on the OPFS-backed database...
+    match persisted.insert(31_337, [0xA5; VALUE_LEN]) {
+        Output::InsertDone { result: Ok(()), .. } => {}
+        other => panic!("insert on the persisted database: {other:?}"),
+    }
+    let sb_back = whole_file(&mut persisted.storage, FileId::Superblock);
+    let rows_back = whole_file(&mut persisted.storage, FileId::Rows);
+    persisted.storage.close();
+
+    // ...and carry it back into RAM, where it is the same database again.
+    let mut ram_again = Host::new(
+        CAPS,
+        MemoryStorage::from_images(sb_back, rows_back, Vec::new()),
+    );
+    match ram_again.open().expect("probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64 + 1),
+        other => panic!("loading OPFS bytes back into RAM: {other:?}"),
+    }
+    for &(id, value) in &ops {
+        match ram_again.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v, value, "id={id}"),
+            other => panic!("round-tripped get {id}: {other:?}"),
+        }
+    }
+    match ram_again.get(31_337) {
+        Output::GetDone {
+            result: Ok(Some(v)),
+            ..
+        } => assert_eq!(v, [0xA5; VALUE_LEN]),
+        other => panic!("the OPFS-side commit did not survive the trip: {other:?}"),
+    }
+}
+
+/// Corruption containment works in the browser too, on real OPFS bytes.
+#[wasm_bindgen_test]
+async fn salvage_contains_damage_on_real_opfs() {
+    let dir = "dabqlite-salvage";
+    let _ = opfs::remove_dir(dir).await;
+    let ops = workload();
+
+    let storage = opfs::open_dir(dir).await.expect("open");
+    let mut host = Host::new(CAPS, storage);
+    run_workload(&mut host, &ops);
+
+    // Damage one committed row in place, through the real handle.
+    let victim = 2usize;
+    let mut row = host
+        .storage
+        .read(FileId::Rows, (victim * ROW_SIZE) as u64, ROW_SIZE as u64)
+        .expect("read row");
+    row[6] ^= 0x40;
+    host.storage
+        .write(FileId::Rows, (victim * ROW_SIZE) as u64, &row)
+        .expect("damage row");
+    host.storage.sync(FileId::Rows).expect("flush");
+    host.storage.close();
+
+    // Strict open refuses it.
+    let storage = opfs::open_dir(dir).await.expect("reopen strict");
+    let mut strict = Host::new(CAPS, storage);
+    match strict.open().expect("probe") {
+        Output::OpenDone {
+            result: Err(dabqlite_core::DbError::Corrupt { .. }),
+        } => {}
+        other => panic!("strict open must refuse damage: {other:?}"),
+    }
+    strict.storage.close();
+
+    // Salvage contains it: every other row is exact, in a real browser.
+    let storage = opfs::open_dir(dir).await.expect("reopen salvage");
+    let mut rescue = Host::new(CAPS, storage);
+    match rescue.open_salvage().expect("probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, ops.len() as u64),
+        other => panic!("salvage open: {other:?}"),
+    }
+    assert_eq!(rescue.engine.quarantined(), 1);
+    for (row_ix, &(id, value)) in ops.iter().enumerate() {
+        if row_ix == victim {
+            continue;
+        }
+        match rescue.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v, value, "id={id}"),
+            other => panic!("survivor {id}: {other:?}"),
+        }
+    }
+    rescue.storage.close();
 }

@@ -25,6 +25,9 @@
 use dabqlite_core::migration::MigrationEngine;
 use dabqlite_core::{Capacities, Engine, FileId, Input, Output};
 
+pub mod memory;
+pub use memory::MemoryStorage;
+
 #[cfg(unix)]
 pub mod posix;
 

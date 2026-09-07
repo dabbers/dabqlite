@@ -820,14 +820,20 @@ impl Engine {
         // durable) — they are surviving evidence that acknowledged commits
         // were rolled back by an out-of-budget fault such as a lying fsync.
         // Silent loss becomes loud whenever the evidence physically exists.
-        let mut orphans = 0u64;
-        let mut off = live;
-        while off + ROW_SIZE <= data.len() {
-            if decode_row(&data[off..off + ROW_SIZE]).is_some() {
-                orphans += 1;
-            }
-            off += ROW_SIZE;
-        }
+        //
+        // Walked with `chunks_exact` rather than hand-rolled index
+        // arithmetic, deliberately: a manual `off += ROW_SIZE` cursor can
+        // be made to stop advancing (mutation testing found exactly that —
+        // `off *= ROW_SIZE` with `off == 0` loops forever), and an
+        // unbounded loop INSIDE one `tick` is the one stall the fuel
+        // watchdog cannot see, because the engine never returns to be
+        // counted. An iterator over fixed-size chunks cannot fail to
+        // terminate, so the failure mode is structurally absent instead of
+        // merely untested.
+        let orphans = data[live..]
+            .chunks_exact(ROW_SIZE)
+            .filter(|chunk| decode_row(chunk).is_some())
+            .count() as u64;
         self.orphan_valid_rows = orphans;
 
         // Salvage touches NOTHING. A damaged database must not be mutated

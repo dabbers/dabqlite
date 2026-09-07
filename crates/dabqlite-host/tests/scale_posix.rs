@@ -109,3 +109,110 @@ fn hundred_thousand_rows_on_real_files() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Salvage and rebuild at volume. Containment that only works on toy
+/// databases is not containment: a rescue is needed precisely when the
+/// database is large enough that losing it matters.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "scale suite runs in release (assertions stay on); CI runs it explicitly"
+)]
+fn salvage_and_repair_at_a_hundred_thousand_rows() {
+    use dabqlite_host::rows_file_name;
+    let caps = Capacities { rows: N };
+    // Its own directory: these tests run in parallel in one process, so a
+    // shared scratch path would have them clobber each other.
+    let dir = std::env::temp_dir().join(format!("dabqlite-scale-salvage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let mut host = Host::new(caps, PosixStorage::open_dir(&dir).expect("open"));
+        assert!(matches!(
+            host.open().expect("probe"),
+            Output::OpenDone { result: Ok(0) }
+        ));
+        for id in 0..N {
+            match host.insert(id, value_for(id)) {
+                Output::InsertDone { result: Ok(()), .. } => {}
+                other => panic!("insert {id}: {other:?}"),
+            }
+        }
+    }
+
+    // Damage rows scattered across the whole file, including both ends.
+    let victims = [0u64, 1, N / 3, N / 2, N - 2, N - 1];
+    let rows_path = dir.join(rows_file_name(dabqlite_core::SCHEMA_HASH));
+    let mut bytes = std::fs::read(&rows_path).expect("read rows");
+    for &v in &victims {
+        bytes[v as usize * dabqlite_core::ROW_SIZE + 11] ^= 0x80;
+    }
+    std::fs::write(&rows_path, bytes).expect("write rows");
+
+    // Strict open refuses; salvage contains exactly the damage.
+    {
+        let mut host = Host::new(caps, PosixStorage::open_dir(&dir).expect("open"));
+        assert!(matches!(
+            host.open().expect("probe"),
+            Output::OpenDone {
+                result: Err(dabqlite_core::DbError::Corrupt { .. })
+            }
+        ));
+    }
+    let mut host = Host::new(caps, PosixStorage::open_dir(&dir).expect("open"));
+    match host.open_salvage().expect("probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, N),
+        other => panic!("salvage at scale: {other:?}"),
+    }
+    assert_eq!(host.engine.quarantined(), victims.len() as u64);
+    // Every undamaged row — all ~100k of them — is still exact.
+    for id in 0..N {
+        if victims.contains(&id) {
+            continue;
+        }
+        match host.get(id) {
+            Output::GetDone {
+                result: Ok(Some(v)),
+                ..
+            } => assert_eq!(v, value_for(id)),
+            other => panic!("survivor {id}: {other:?}"),
+        }
+    }
+    drop(host);
+
+    // Rebuild at volume, then verify the rebuilt database exhaustively.
+    let dest = std::env::temp_dir().join(format!("dabqlite-scale-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dabqlite-inspect"))
+        .arg(&dir)
+        .arg("--repair-to")
+        .arg(&dest)
+        .output()
+        .expect("run inspector");
+    assert!(
+        out.status.success(),
+        "repair at scale failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut host = Host::new(caps, PosixStorage::open_dir(&dest).expect("open rebuilt"));
+    match host.open().expect("probe") {
+        Output::OpenDone { result: Ok(n) } => assert_eq!(n, N - victims.len() as u64),
+        other => panic!("rebuilt database: {other:?}"),
+    }
+    assert!(!host.engine.is_degraded());
+    for id in 0..N {
+        let got = match host.get(id) {
+            Output::GetDone { result: Ok(v), .. } => v,
+            other => panic!("rebuilt get {id}: {other:?}"),
+        };
+        if victims.contains(&id) {
+            assert_eq!(got, None, "row {id} was resurrected");
+        } else {
+            assert_eq!(got, Some(value_for(id)), "rebuilt row {id}");
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dest).ok();
+}

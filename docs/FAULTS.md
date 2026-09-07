@@ -232,6 +232,10 @@ error now names the remedy, and `Host::open_salvage()` is the remedy.
 | Salvage of a **healthy** database | seeds | `salvage.rs` | identical to an ordinary open: not degraded, fully writable, recovery fsyncs performed, pages not flagged. Salvage is a fallback, not a downgrade |
 | Unreadable **manifest** (all superblock copies destroyed) | targeted | `salvage.rs` | salvage agrees with strict open and refuses — it widens what can be READ, never what can be BELIEVED |
 | Containment under the full fault schedule | every cycle of every lifetime (floor-asserted) | `lifetime.rs`, `vopr` | a committed row is damaged on a COPY of each cycle's disk and salvaged: ~2,300 episodes per 40 lifetimes, every survivor checked against the insertion log |
+| **Legacy-schema database** offered to salvage | seeds | `salvage.rs` | the schema gate OUTRANKS salvage: same `SchemaMismatch` verdict as a strict open, zero rows quarantined, and the migration still works afterwards. Getting this wrong would turn salvage into a data-destroying "repair" of a healthy pre-migration database |
+| **I/O failure DURING the rescue**, at every boundary | exhaustive | `salvage.rs` | clean fail-stop, never a panic, never a half-read database, zero writes — and a retry after the volume settles contains the damage exactly as before, so a failed rescue costs nothing |
+| Containment and rebuild **at 100k rows** | release scale suite | `scale_posix.rs` | damage scattered across the whole file (both ends included) is contained; all ~100k survivors verified exactly; the rebuild is verified row by row. Containment that only works on toy databases is not containment |
+| Containment **in a real browser**, on real OPFS bytes | real Chromium | `opfs_browser.rs` | strict open refuses, salvage serves every survivor exactly — the same guarantee on the platform, not just in the model |
 
 ### Repair by rebuild, never by surgery
 
@@ -251,6 +255,8 @@ slots and any legacy file left behind.
 | Non-empty destination | `repair.rs` | refused; the one destructive operation does not get to be accidentally destructive too |
 | Repair of a healthy database | `repair.rs` | reproduces the rows file **byte-for-byte** — a copy that skips nothing |
 | Unreadable manifest | `repair.rs` | refused, rather than inventing a plausible empty database |
+| **Live writer holds the database** | `repair.rs` | refused by default — rebuilding from a database being written copies a moving target — with `--force-live` as the deliberate override for rescuing data out from under a wedged process. The liveness probe takes no lock and creates no file: it opens the lock file read-only, asks, and releases |
+| Absent database (empty or missing directory) | `repair.rs` | says "no dabqlite database here" instead of leaking an internal `IoFailed` from a salvage open that tried to initialize one |
 | The read-only handle | `repair.rs` | writes fail with `PermissionDenied`; missing files read as empty; takes NO lock, so it works beside a live writer |
 
 ### Dead data and vacuum
@@ -407,6 +413,37 @@ the simulation to real hardware behavior:
 | Same seeded workload, same generic driver, sim vs. real POSIX files | seeds | `dabqlite-host/tests/equivalence.rs` | **byte-for-byte identical files** — any divergence means the storage contract differs and simulated results are suspect |
 | Identical at-rest damage (flips, truncations) applied to both | fault grid | same | identical recovery outcomes, row for row, error for error |
 | Close and reopen real files (real fsync path) | seeds | same | full recovery, no rollback evidence |
+
+## The in-memory backend (the store that runs anywhere)
+
+The one backend with no filesystem, no OPFS, no permissions and no locks
+— and therefore the one that works everywhere, including Safari in
+private mode, which has no OPFS at all (§8.1). It is held to the same bar
+as the durable backends rather than treated as a lesser one, because the
+easy way to get an in-memory store subtly wrong is to let it drift from
+the real thing.
+
+Everything above the seam is unchanged: the same commit protocol,
+checksums, superblock generations, recovery, indices and compiled
+queries. What is gone is **durability, completely and by construction** —
+`sync` has nothing to flush and process death takes everything. That is
+stated rather than implied, and pinned as a test.
+
+The persistence story is explicit instead: `snapshot()` and
+`from_images()` move the database in and out of RAM as plain byte arrays
+— the *same bytes* the POSIX and OPFS backends hold — so a browser
+without OPFS can run entirely in memory and snapshot wherever the
+platform will take bytes.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Same workload, memory vs simulator vs real files | seeds | `dabqlite-host/tests/memory.rs` | **byte-identical images** — an in-memory database is the same database |
+| Identical at-rest damage, memory vs disk | fault grid | same | identical outcomes, row for row, error for error — the simulated fault matrix means the same thing here |
+| Snapshot → restore, at **every commit boundary** | exhaustive | same | exact round-trip: right row count, every row byte-exact, byte-identical images, no rollback evidence, writable from there |
+| An image moved **both ways** between RAM and disk | targeted | same | a database built in a browser opens on a server and vice versa, including commits made on the far side |
+| Corruption containment in RAM | every row damaged in turn | same | identical to disk: one bad row costs one row, salvage leaves the images untouched |
+| The durability claim itself | pinned | same | the commit protocol demonstrably runs (images grow exactly as on disk), and a dropped store recovers nothing — no accidental persistence, no false promise |
+| In-memory ↔ OPFS **in a real browser** | real Chromium | `opfs_browser.rs` | run in RAM, snapshot into OPFS, reopen from OPFS, keep writing, carry it back to RAM — same database throughout |
 
 ## The browser backend (OPFS, design §8.1 — web-native, not a port)
 
@@ -756,6 +793,10 @@ engine.)
   those semantics explicitly, so a divergence would surface as a test
   failure rather than as data loss — but cross-browser runs are not
   wired up yet.
+- **In-memory has no durability at all**, by construction — the same
+  consistency, none of the persistence. `snapshot`/`from_images` is the
+  explicit substitute, and the tests pin that a dropped store recovers
+  nothing rather than accidentally persisting.
 - **Multi-tab is refused, not coordinated.** A second worker is rejected
   by OPFS's exclusive handles (the browser's `flock`); the
   `BroadcastChannel` leader election design §8.1 contemplates is not

@@ -346,3 +346,102 @@ fn salvage_does_not_paper_over_manifest_damage() {
         "salvage must agree with strict open about unreadable manifests"
     );
 }
+
+/// The schema gate outranks salvage. A legacy-schema database is not
+/// damaged — it is DATA THIS BINARY CANNOT READ — and salvage must say
+/// exactly that rather than quarantining rows it merely misparsed. Get
+/// this wrong and salvage becomes a data-destroying "repair" of a
+/// perfectly healthy pre-migration database.
+#[test]
+fn salvage_respects_the_schema_gate_and_never_quarantines_legacy_data() {
+    use dabqlite_sim::workload::build_v1_disk;
+    use rand_chacha::rand_core::SeedableRng;
+
+    for seed in [0xA1u64, 0xB2, 0xC3] {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let (disk, v1_ops) = build_v1_disk(&mut rng, 6);
+
+        // Strict and salvage must reach the SAME verdict: schema mismatch.
+        let (_, strict) = open_strict(disk.clone());
+        let (mut host, salvaged) = open_salvage(disk.clone());
+        assert!(
+            matches!(strict, Err(DbError::SchemaMismatch { .. })),
+            "seed={seed}: {strict:?}"
+        );
+        assert_eq!(
+            salvaged, strict,
+            "seed={seed}: salvage must not reinterpret a foreign schema as damage"
+        );
+        assert_eq!(
+            host.engine.quarantined(),
+            0,
+            "seed={seed}: salvage quarantined legacy rows instead of refusing"
+        );
+        assert!(!host.engine.is_degraded(), "seed={seed}");
+
+        // And the legacy data is still there afterwards, untouched: the
+        // migration path still works on a database salvage looked at.
+        let mut host = SimHost::new(CAPS, std::mem::take(&mut host.disk), None);
+        assert!(matches!(
+            host.run_migration(),
+            Driven::Done(Output::MigrateDone { result: Ok(n) }) if n == v1_ops.len() as u64
+        ));
+        let disk = std::mem::take(&mut host.disk);
+        let mut host = SimHost::new(CAPS, disk, None);
+        assert!(matches!(
+            host.open(),
+            Driven::Done(Output::OpenDone { result: Ok(n) }) if n == v1_ops.len() as u64
+        ));
+        for &(id, v1) in &v1_ops {
+            let mut want = [0u8; VALUE_LEN];
+            want[..8].copy_from_slice(&v1);
+            assert_eq!(host.get(id), Some(want), "seed={seed} id={id}");
+        }
+    }
+}
+
+/// Salvage runs on volumes that are already failing — that is its job —
+/// so an I/O error DURING the rescue must fail-stop cleanly at every
+/// point it can occur, never panic and never serve a half-read database.
+#[test]
+fn an_io_failure_during_salvage_fail_stops_at_every_boundary() {
+    let n = 6usize;
+    let (pristine, ops) = build(17, n);
+    let mut damaged = pristine.clone();
+    damaged.corrupt(FileId::Rows, (2 * ROW_SIZE) as u64, 0x40);
+
+    // How many I/Os does an undisturbed salvage open take?
+    let (probe, _) = open_salvage(damaged.clone());
+    let budget = probe.io_count;
+    assert!(budget > 0, "salvage performed no I/O at all");
+
+    for fail_at in 0..budget {
+        let ctx = format!("fail_at={fail_at}");
+        let mut host = SimHost::new(CAPS, damaged.clone(), None);
+        host.fail_after = Some(fail_at);
+        match host.open_salvage() {
+            Driven::Done(Output::OpenDone {
+                result: Err(DbError::IoFailed { .. }),
+            }) => {}
+            // Reaching the end before the injected failure is fine too.
+            Driven::Done(Output::OpenDone { result: Ok(rows) }) => {
+                assert_eq!(rows, n as u64, "[{ctx}]");
+            }
+            other => panic!("[{ctx}] salvage must fail-stop cleanly: {other:?}"),
+        }
+        // Whatever happened, the rescue wrote nothing.
+        assert_eq!(host.n_writes, 0, "[{ctx}] salvage wrote during failure");
+    }
+
+    // After the failing volume settles, a retry still contains the damage
+    // exactly as before — a failed rescue costs nothing.
+    let (mut host, salvaged) = open_salvage(damaged);
+    assert_eq!(salvaged, Ok(n as u64));
+    assert_eq!(host.engine.quarantined(), 1);
+    for (row, &(id, value)) in ops.iter().enumerate() {
+        if row == 2 {
+            continue;
+        }
+        assert_eq!(get_result(&mut host, id), Ok(Some(value)), "row {row}");
+    }
+}

@@ -327,3 +327,95 @@ fn gc_reclaims_the_legacy_file_only_after_migration_completed() {
     std::fs::remove_dir_all(&pre).ok();
     std::fs::remove_dir_all(&post).ok();
 }
+
+/// Repair refuses a database a writer currently holds open: rebuilding
+/// from a moving target would copy a mix of commits. `--force-live` is
+/// the deliberate override for the case salvage exists to serve —
+/// getting data out from under a wedged process.
+#[test]
+fn repair_refuses_a_live_database_unless_forced() {
+    let src = damaged_db("live", 5);
+    let dest = scratch("live-out");
+    let forced_dest = scratch("live-forced-out");
+
+    // Hold the single-writer lock, as a live process would.
+    let writer = PosixStorage::open_dir(&src).expect("take the lock");
+
+    let out = inspect(&[src.as_os_str(), "--repair-to".as_ref(), dest.as_os_str()]);
+    assert!(!out.status.success(), "repair ran against a live writer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("open by another process") && stderr.contains("--force-live"),
+        "the refusal must name the override: {stderr}"
+    );
+    assert!(
+        !dest.exists(),
+        "a refused repair still created a destination"
+    );
+
+    // --force-live proceeds, and the check never disturbed the writer.
+    let out = inspect(&[
+        src.as_os_str(),
+        "--repair-to".as_ref(),
+        forced_dest.as_os_str(),
+        "--force-live".as_ref(),
+    ]);
+    assert!(
+        out.status.success(),
+        "--force-live should proceed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The writer still owns the lock: asking the question did not take it.
+    assert!(
+        PosixStorage::open_dir(&src).is_err(),
+        "the liveness probe stole the single-writer lock"
+    );
+    drop(writer);
+
+    // Once the writer is gone, repair works without the override.
+    let plain = scratch("live-after-out");
+    let out = inspect(&[src.as_os_str(), "--repair-to".as_ref(), plain.as_os_str()]);
+    assert!(
+        out.status.success(),
+        "repair should work once the writer closed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for d in [&src, &dest, &forced_dest, &plain] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// An absent database is not a damaged one, and the tool says which.
+#[test]
+fn repair_of_an_absent_database_says_so_plainly() {
+    let empty = scratch("absent");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    let dest = scratch("absent-out");
+
+    let out = inspect(&[empty.as_os_str(), "--repair-to".as_ref(), dest.as_os_str()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no dabqlite database"),
+        "an absent database must not be reported as an I/O error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("IoFailed"),
+        "leaked an internal error: {stderr}"
+    );
+
+    // Same for a directory that does not exist at all.
+    let missing = scratch("absent-missing");
+    let out = inspect(&[
+        missing.as_os_str(),
+        "--repair-to".as_ref(),
+        dest.as_os_str(),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no dabqlite database"));
+
+    std::fs::remove_dir_all(&empty).ok();
+    std::fs::remove_dir_all(&dest).ok();
+}
