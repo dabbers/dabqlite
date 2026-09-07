@@ -494,6 +494,8 @@ functions:
 | Scenario | Mode | Suite | Guarantee |
 |---|---|---|---|
 | Structure vs `BTreeMap` oracle: random inserts × 5 key shapes, continuous range diffs, degenerate ranges | seeded fuzz | `btree_oracle.rs` | exact agreement; deep invariants (ordering, uniform depth, occupancy, leaf chain) checked continuously |
+| The same ranges read DESCENDING (a different traversal: the leaf chain runs one way, so this climbs the descent path to each previous leaf) | seeded fuzz + every start | `btree_oracle.rs`, core `btree.rs` | exact agreement with the oracle reversed; stopping early costs only what it took (the 20 highest keys visit 20 keys, not the 2000 below them) |
+| Descending pages under random insert/update/delete traffic, long values included, at every crash boundary, and every soak cycle | seeded + exhaustive boundary + lifetime | `range_rev.rs`, `lifetime.rs` | equal to the ascending scan reversed, and to the oracle, over the recovered prefix |
 | **Every insertion order** of small key sets (5040 permutations) | exhaustive | core `btree.rs` tests | identical in-order output, valid structure, always |
 | Node-pool bound (no allocation after init) | adversarial fill + fuzz assert | core + `btree_oracle.rs` | usage stays below the derived N/3 bound |
 | Multi-row range results vs oracle: full-table, empty, inverted, singleton, arbitrary sub-ranges, page-boundary edges | seeded × grids | `query_surface.rs` | exact rows, strictly ascending, bounded pages |

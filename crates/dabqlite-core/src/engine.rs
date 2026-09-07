@@ -408,6 +408,13 @@ pub enum Input<'a> {
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
     /// call. Continue by re-issuing with `lo = page.next`.
     Range { lo: u64, hi: u64 },
+    /// Client: the same range, DESCENDING — greatest key first. Continue
+    /// by re-issuing with `hi = page.next`.
+    ///
+    /// Not sugar over `Range`: "the twenty highest keys" through an
+    /// ascending scan means walking everything below them first, which is
+    /// the difference between twenty rows of work and the whole database.
+    RangeRev { lo: u64, hi: u64 },
     /// Client: substring search over `value` bytes (trigram-accelerated,
     /// verification-exact). One bounded page per call, newest row first;
     /// continue by re-issuing with `after = page.next`.
@@ -514,7 +521,8 @@ pub struct FindPage {
 pub struct RangePage {
     pub items: [RowRef; RANGE_PAGE],
     pub count: u8,
-    /// `Some(k)`: more rows exist; continue with `lo = k`.
+    /// `Some(k)`: more rows exist. Continue with `lo = k` for an
+    /// ascending page, `hi = k` for a descending one.
     pub next: Option<u64>,
     /// True when the database is open in salvage mode with quarantined
     /// rows — see [`FindPage::incomplete`].
@@ -1180,7 +1188,8 @@ impl Engine {
             Input::Batch { ops } => self.on_batch(ops),
             Input::Get { id } => self.on_get(id),
             Input::GetFrom { id, offset } => self.read_window(id, offset),
-            Input::Range { lo, hi } => self.on_range(lo, hi),
+            Input::Range { lo, hi } => self.on_range(lo, hi, false),
+            Input::RangeRev { lo, hi } => self.on_range(lo, hi, true),
             Input::Find { needle, after } => self.on_find(needle, after),
         }
     }
@@ -2553,13 +2562,13 @@ impl Engine {
         Output::GetDone { id, result }
     }
 
-    fn on_range(&mut self, lo: u64, hi: u64) -> Output {
+    fn on_range(&mut self, lo: u64, hi: u64, descending: bool) -> Output {
         let result = match self.state {
             // Served, but every page carries `incomplete: true` — the rows
             // returned are exact; rows that would have matched may be
             // missing, and silence about that would be indistinguishable
             // from data loss.
-            State::Ready | State::Degraded => Ok(self.scan_page(lo, hi)),
+            State::Ready | State::Degraded => Ok(self.scan_page(lo, hi, descending)),
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -2707,7 +2716,7 @@ impl Engine {
     /// One bounded page of `lo..=hi`, ascending. Reads only committed
     /// state: the ordered index is updated at the commit point, so an
     /// in-flight insert is never visible here (serializable, §5).
-    fn scan_page(&self, lo: u64, hi: u64) -> RangePage {
+    fn scan_page(&self, lo: u64, hi: u64, descending: bool) -> RangePage {
         let mut page = RangePage {
             items: [RowRef::EMPTY; RANGE_PAGE],
             count: 0,
@@ -2720,8 +2729,9 @@ impl Engine {
         let mut hits = [(0u64, 0u64); RANGE_PAGE];
         let mut n = 0usize;
         let mut next = None;
-        self.ordered.for_each_from(lo, |key, row| {
-            if key > hi {
+        let visit = |key: u64, row: u64| {
+            // Past the far bound: this page, and the scan, are done.
+            if if descending { key < lo } else { key > hi } {
                 return false;
             }
             // The tree keeps an entry for every id ever inserted, including
@@ -2736,12 +2746,21 @@ impl Engine {
             hits[n] = (key, row);
             n += 1;
             true
-        });
+        };
+        if descending {
+            self.ordered.for_each_down_from(hi, visit);
+        } else {
+            self.ordered.for_each_from(lo, visit);
+        }
         for (slot, &(key, row)) in page.items.iter_mut().zip(hits.iter().take(n)) {
             *slot = self.row_ref(key, row);
         }
         for pair in hits[..n].windows(2) {
-            debug_assert!(pair[0].0 < pair[1].0, "range page out of order");
+            if descending {
+                debug_assert!(pair[0].0 > pair[1].0, "descending page out of order");
+            } else {
+                debug_assert!(pair[0].0 < pair[1].0, "range page out of order");
+            }
         }
         page.count = n as u8;
         page.next = next;

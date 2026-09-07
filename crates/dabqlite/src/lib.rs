@@ -1202,6 +1202,69 @@ impl<S: Storage> Db<S> {
         }
     }
 
+    /// The same range, DESCENDING — greatest id first.
+    pub fn range_rev(&mut self, lo: u64, hi: u64) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut cursor = hi;
+        loop {
+            let (page, next) = self.range_page_rev(lo, cursor)?;
+            out.extend(page);
+            match next {
+                Some(n) => cursor = n,
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One bounded page of a range, greatest id first, plus where to
+    /// continue from (pass it back as `hi`).
+    ///
+    /// This is the descending scan the ordered index can do cheaply.
+    /// Reaching the highest ids by scanning upward means walking every row
+    /// below them first, which is the difference between a page of work
+    /// and the whole database — see [`Db::last`].
+    pub fn range_page_rev(&mut self, lo: u64, hi: u64) -> Result<Page, Error> {
+        use dabqlite_core::Input;
+        match self.hm().run(Input::RangeRev { lo, hi }) {
+            Output::RangeDone { result: Ok(page) } => {
+                let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+                let next = page.next;
+                Ok((self.rows_from(&items)?, next))
+            }
+            Output::RangeDone { result: Err(e) } => Err(e.into()),
+            other => unreachable!("range returned {other:?}"),
+        }
+    }
+
+    /// The `n` rows with the highest ids, greatest first.
+    ///
+    /// For anything that hands out ascending ids — a log, an outbox, a
+    /// job queue, a feed — this is "the n newest", and it costs `n` rows
+    /// of work rather than a scan and a sort. Every sample application
+    /// built against this library wrote that query, and before there was
+    /// a descending scan every one of them materialised the whole database
+    /// to answer it.
+    pub fn last(&mut self, n: usize) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::with_capacity(n.min(dabqlite_core::RANGE_PAGE));
+        if n == 0 {
+            return Ok(out);
+        }
+        let mut cursor = u64::MAX;
+        loop {
+            let (page, next) = self.range_page_rev(0, cursor)?;
+            for row in page {
+                out.push(row);
+                if out.len() == n {
+                    return Ok(out);
+                }
+            }
+            match next {
+                Some(k) => cursor = k,
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Turn a page of scan references into rows, reading back any value
     /// too long to travel in the page itself. A page carries the whole
     /// value when it fits and its LENGTH when it does not, so a long

@@ -62,6 +62,25 @@ fn btree_matches_btreemap_under_random_traffic() {
             });
             let want: Vec<(u64, u64)> = oracle.range(lo..=hi).map(|(&k, &v)| (k, v)).collect();
             assert_eq!(got, want, "seed={seed} i={i}: range [{lo},{hi}] diverged");
+
+            // The same range from the other end. The leaf chain runs one
+            // way only, so descending climbs the descent path to reach
+            // each previous leaf — a different traversal answering the
+            // same question, held to the same oracle.
+            let mut down = Vec::new();
+            tree.for_each_down_from(hi, |k, v| {
+                if k < lo {
+                    return false;
+                }
+                down.push((k, v));
+                true
+            });
+            let mut want_down = want.clone();
+            want_down.reverse();
+            assert_eq!(
+                down, want_down,
+                "seed={seed} i={i}: descending [{lo},{hi}] diverged"
+            );
         }
 
         tree.check_invariants();
@@ -75,6 +94,32 @@ fn btree_matches_btreemap_under_random_traffic() {
         });
         let want: Vec<(u64, u64)> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
         assert_eq!(got, want, "seed={seed}: full scan diverged");
+
+        // And the whole tree the other way.
+        let mut got = Vec::new();
+        tree.for_each_down_from(u64::MAX, |k, v| {
+            got.push((k, v));
+            true
+        });
+        let want: Vec<(u64, u64)> = oracle.iter().rev().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(got, want, "seed={seed}: descending full scan diverged");
+
+        // Stopping early costs only what it took: "the twenty highest"
+        // must not walk the two thousand below them. Counting visits is
+        // the honest way to say that — it is the work an ascending scan
+        // would have done.
+        let mut visits = 0u64;
+        let mut top = Vec::new();
+        tree.for_each_down_from(u64::MAX, |k, v| {
+            visits += 1;
+            top.push((k, v));
+            top.len() < 20
+        });
+        assert_eq!(top, want[..20.min(want.len())], "seed={seed}: top 20");
+        assert!(
+            visits <= 20,
+            "seed={seed}: reaching the 20 highest keys visited {visits}"
+        );
 
         // Degenerate ranges: empty (lo>hi handled by caller), singleton,
         // off-by-one around present keys.

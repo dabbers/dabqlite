@@ -277,6 +277,91 @@ impl BTreeIndex {
         }
     }
 
+    /// The greatest depth a descent will ever record. The pool is bounded
+    /// by `pool_nodes_for`, and a tree of `ORDER`-way nodes over the whole
+    /// `u64` row space is nowhere near this deep; the assertion below says
+    /// so rather than trusting it.
+    const MAX_DEPTH: usize = 40;
+
+    /// Walk keys DOWNWARD from `start`, greatest first, calling `f(key,
+    /// row)` until it returns false. The mirror of `for_each_from`.
+    ///
+    /// Leaves are chained forwards only, so this cannot simply run the
+    /// chain in reverse. It keeps the descent path instead and, at the
+    /// start of each leaf, climbs until a left sibling exists and descends
+    /// rightmost from it — the standard predecessor-leaf walk, bounded by
+    /// the tree's depth rather than its size. That bound is the whole
+    /// point: "the twenty highest keys" costs twenty keys and a couple of
+    /// leaves, not a scan of everything below them.
+    pub fn for_each_down_from(&self, start: u64, mut f: impl FnMut(u64, u64) -> bool) {
+        // Descend to the leaf that could own `start`, remembering which
+        // child was taken at every level.
+        let mut path = [(NIL, 0usize); Self::MAX_DEPTH];
+        let mut depth = 0usize;
+        let mut id = self.root;
+        loop {
+            let n = self.node(id);
+            if n.leaf {
+                break;
+            }
+            let len = n.len as usize;
+            let mut child = len;
+            for (i, &k) in n.keys[..len].iter().enumerate() {
+                if routes_before(start, k) {
+                    child = i;
+                    break;
+                }
+            }
+            assert!(depth < Self::MAX_DEPTH, "btree deeper than the pool allows");
+            path[depth] = (id, child);
+            depth += 1;
+            id = n.children[child];
+        }
+
+        let mut steps = 0u64;
+        loop {
+            assert!(steps <= self.used as u64, "leaf chain cycle");
+            steps += 1;
+            let n = self.node(id);
+            for i in (0..n.len as usize).rev() {
+                // The bound only bites in the first leaf; every later one
+                // lies entirely below `start`.
+                if n.keys[i] <= start && !f(n.keys[i], n.vals[i]) {
+                    return;
+                }
+            }
+            // Step to the previous leaf: climb until some ancestor has a
+            // left sibling to take, then descend its rightmost spine.
+            let mut d = depth;
+            loop {
+                if d == 0 {
+                    // The root's leftmost leaf: nothing below it.
+                    return;
+                }
+                d -= 1;
+                let (parent, child) = path[d];
+                if child == 0 {
+                    continue;
+                }
+                path[d] = (parent, child - 1);
+                depth = d + 1;
+                id = self.node(parent).children[child - 1];
+                loop {
+                    let n = self.node(id);
+                    if n.leaf {
+                        break;
+                    }
+                    let last = n.len as usize;
+                    assert!(depth < Self::MAX_DEPTH, "btree deeper than the pool allows");
+                    path[depth] = (id, last);
+                    depth += 1;
+                    id = n.children[last];
+                }
+                break;
+            }
+        }
+    }
+
     /// Recursive insert; returns `Some((separator, new_right))` if `id`
     /// split.
     fn insert_into(&mut self, id: u32, key: u64, row: u64) -> Option<(u64, u32)> {
@@ -790,6 +875,74 @@ mod tests {
                     oracle.keys().next_back().copied(),
                     "seed {seed} after inserting {key}"
                 );
+            }
+        }
+    }
+
+    /// The descending walk against the same free oracle as the ascending
+    /// one, from every starting point, over every tree shape random
+    /// insertion produces.
+    ///
+    /// The leaf chain runs forwards only, so this walk climbs the descent
+    /// path to reach each previous leaf. That is the part with somewhere
+    /// to go wrong: a wrong climb repeats a leaf, skips one, or loops.
+    #[test]
+    fn the_descending_walk_matches_the_oracle_from_every_start() {
+        use alloc::collections::BTreeMap;
+        for seed in 0..12u64 {
+            let mut t = BTreeIndex::new(600);
+            let mut oracle: BTreeMap<u64, u64> = BTreeMap::new();
+            // Empty: nothing below anything.
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            t.for_each_down_from(u64::MAX, |k, v| {
+                seen.push((k, v));
+                true
+            });
+            assert!(seen.is_empty(), "an empty tree yields nothing");
+
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for row in 0..400u64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let key = x % 2_000;
+                if oracle.contains_key(&key) {
+                    continue;
+                }
+                t.insert(key, row);
+                oracle.insert(key, row);
+            }
+
+            // Every start, including ones between and outside the keys.
+            for start in (0..2_100u64).step_by(7).chain([0, u64::MAX]) {
+                let mut got: Vec<(u64, u64)> = Vec::new();
+                t.for_each_down_from(start, |k, v| {
+                    got.push((k, v));
+                    true
+                });
+                let want: Vec<(u64, u64)> = oracle
+                    .range(..=start)
+                    .rev()
+                    .map(|(&k, &v)| (k, v))
+                    .collect();
+                assert_eq!(got, want, "seed {seed} start {start}");
+            }
+
+            // And it stops early where it is told to, which is what makes
+            // "the twenty highest" cost twenty rather than everything.
+            for limit in [1usize, 3, 20] {
+                let mut got = Vec::new();
+                t.for_each_down_from(u64::MAX, |k, v| {
+                    got.push((k, v));
+                    got.len() < limit
+                });
+                let want: Vec<(u64, u64)> = oracle
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .map(|(&k, &v)| (k, v))
+                    .collect();
+                assert_eq!(got, want, "seed {seed} limit {limit}");
             }
         }
     }

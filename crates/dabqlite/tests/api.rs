@@ -941,6 +941,127 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// "The n newest" — the query every sample application wrote, and the
+/// one none of them could express.
+///
+/// Ids ascend in a log, an outbox, a feed or a job queue, so the newest
+/// rows are the highest ones. Reaching them through an ascending scan
+/// means walking everything below them first: three separate samples
+/// materialised the whole database and sorted it to answer this.
+#[test]
+fn the_newest_rows_are_a_page_of_work_not_a_scan() {
+    let mut db = Db::in_memory_with(4096).expect("open");
+    for i in 0..2000u64 {
+        db.insert(i, Value::from_text(&format!("row {i}")).unwrap())
+            .unwrap();
+    }
+
+    // The n highest ids, greatest first, for every n across a page
+    // boundary and past the end.
+    for n in [0usize, 1, 7, 8, 9, 20, 2000, 2500] {
+        let got = db.last(n).expect("last");
+        assert_eq!(got.len(), n.min(2000), "n={n}");
+        let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+        let want: Vec<u64> = (0..2000u64).rev().take(n.min(2000)).collect();
+        assert_eq!(ids, want, "n={n}");
+        if n > 0 {
+            assert_eq!(got[0].1.text(), "row 1999", "n={n}");
+        }
+    }
+
+    // Descending equals ascending reversed, over bounded windows too.
+    let mut ascending = db.range(500, 540).expect("range");
+    ascending.reverse();
+    assert_eq!(db.range_rev(500, 540).expect("range_rev"), ascending);
+    let mut everything = db.all().expect("all");
+    everything.reverse();
+    assert_eq!(db.range_rev(0, u64::MAX).expect("range_rev"), everything);
+
+    // And a page stops where it says it does.
+    let (page, next) = db.range_page_rev(0, u64::MAX).expect("page");
+    assert_eq!(page.len(), dabqlite_core::RANGE_PAGE);
+    assert_eq!(page[0].0, 1999);
+    let next = next.expect("more rows below");
+    let (page2, _) = db.range_page_rev(0, next).expect("page");
+    assert_eq!(page2[0].0, 1999 - dabqlite_core::RANGE_PAGE as u64);
+
+    // Deletes and updates move rows, and the descending view follows.
+    db.remove(1999).unwrap();
+    db.remove(1998).unwrap();
+    assert_eq!(db.last(1).unwrap()[0].0, 1997);
+    db.put(1997, Value::from_text("edited").unwrap()).unwrap();
+    assert_eq!(db.last(1).unwrap()[0].1.text(), "edited");
+
+    // An empty database has no newest row rather than an error.
+    let mut empty = Db::in_memory().expect("open");
+    assert!(empty.last(10).unwrap().is_empty());
+    assert!(empty.range_rev(0, u64::MAX).unwrap().is_empty());
+}
+
+/// Getting out of a full database, both ways.
+///
+/// A deletion is recorded by APPENDING a tombstone, so it needs a slot
+/// like any other write — which means "just delete something" is not the
+/// escape from `Error::Full`, and a caller who assumes it is finds their
+/// database wedged. There are exactly two escapes, they depend on whether
+/// any slot is reclaimable, and `Error::Full` carries the number that
+/// decides which: rebuild, or reopen bigger.
+#[test]
+fn a_full_database_has_a_way_out_and_the_error_names_it() {
+    // Churned full: four rows in six slots, two of them dead weight.
+    let mut db = Db::in_memory_with(6).expect("open");
+    for i in 0..4u64 {
+        db.insert(i, Value::from_text("v").unwrap()).unwrap();
+    }
+    db.put(0, Value::from_text("w").unwrap()).unwrap();
+    db.put(1, Value::from_text("x").unwrap()).unwrap();
+    assert_eq!(db.stats().free(), 0);
+    assert_eq!(db.stats().dead, 2);
+
+    let e = db.remove(2).expect_err("a tombstone needs a slot too");
+    match e {
+        Error::Full { capacity, dead } => assert_eq!((capacity, dead), (6, 2)),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        e.to_string().contains("Db::compact()"),
+        "the error must name the escape: {e}"
+    );
+
+    // The escape it names works, and needs no free slot to do it.
+    let mut db = db.compact_to_memory().expect("rebuild");
+    assert_eq!(db.stats().slots, 4);
+    assert_eq!(db.stats().free(), 2);
+    db.remove(2).expect("now there is room for the tombstone");
+    assert_eq!(db.len(), 3);
+
+    // Genuinely full: every slot live, nothing to reclaim. Rebuilding
+    // cannot help and the error says so instead of suggesting it.
+    let mut db = Db::in_memory_with(4).expect("open");
+    for i in 0..4u64 {
+        db.insert(i, Value::from_text("v").unwrap()).unwrap();
+    }
+    let e = db.remove(0).expect_err("full is full");
+    match e {
+        Error::Full { capacity, dead } => assert_eq!((capacity, dead), (4, 0)),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        e.to_string().contains("larger capacity"),
+        "with nothing to reclaim the error must send the caller to a \
+         bigger database, not to a rebuild that would return nothing: {e}"
+    );
+    assert_eq!(db.compact_to_memory().unwrap().stats().free(), 0);
+
+    // And that escape works: the bytes are the same database, reopened
+    // with more room.
+    let snapshot = db.snapshot().expect("snapshot");
+    let mut bigger = Db::load_with(&snapshot, 16).expect("reopen larger");
+    assert_eq!(bigger.len(), 4);
+    bigger.remove(0).expect("room now");
+    assert_eq!(bigger.len(), 3);
+}
+
 /// A damaged BLOB is salvageable, not fatal.
 ///
 /// `Db::salvage` opens a damaged directory. A snapshot had no equivalent,

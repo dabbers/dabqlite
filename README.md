@@ -19,6 +19,7 @@ db.batch(&[
 ])?;
 
 let hits = db.find_text("ell")?;              // exact substring search
+let newest = db.last(20)?;                    // 20 highest ids, 20 rows of work
 let blob = db.snapshot()?.to_bytes();         // move it anywhere
 Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;
 
@@ -28,8 +29,8 @@ let mut reader = Db::read_only("./mydb")?;
 
 **Status: steps 1–8 of the [build order](docs/DESIGN.md#9-build-order), plus
 the OPFS backend (step 2).** One table with insert, update, delete, get,
-ordered range scans and substring search; values of any length up to 2 KiB;
-atomic multi-write batches; lock-free readers alongside the single writer; a
+ordered range scans in both directions and substring search; values of any
+length up to 2 KiB; atomic multi-write batches; lock-free readers alongside the single writer; a
 declared memory ceiling recorded in the database itself; three interchangeable
 backends (POSIX files, in-memory, browser OPFS) proven to write byte-identical
 databases; an offline migration path; corruption containment with

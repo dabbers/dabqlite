@@ -694,6 +694,19 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                 "[{ctx}] ordered scan missed rows"
             );
         }
+        // The same tree read the other way. Descending pages climb the
+        // descent path to reach each previous leaf rather than following
+        // the leaf chain, so it is a different traversal of the rebuilt
+        // index and deserves the same oracle after every recovery.
+        {
+            let want: Vec<(u64, Vec<u8>)> =
+                oracle.iter().rev().map(|(&k, v)| (k, v.clone())).collect();
+            assert_eq!(
+                host.range_all_rev(0, u64::MAX),
+                want,
+                "[{ctx}] descending scan diverged"
+            );
+        }
         // Negative space: ids never inserted must be absent.
         for _ in 0..4 {
             let absent: u64 = rng.gen();

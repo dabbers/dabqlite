@@ -362,6 +362,7 @@ impl SimHost {
                     | Input::Delete { .. }
                     | Input::Get { .. }
                     | Input::Range { .. }
+                    | Input::RangeRev { .. }
                     | Input::Find { .. }
             ),
             "run_input takes client operations, not I/O completions"
@@ -507,6 +508,25 @@ impl SimHost {
                 }
             }
         }
+    }
+
+    /// Full paged DESCENDING range scan `lo..=hi`, concatenated: greatest
+    /// key first, one `Input::RangeRev` per page.
+    pub fn range_all_rev(&mut self, lo: u64, hi: u64) -> Vec<(u64, Vec<u8>)> {
+        let mut refs = Vec::new();
+        let mut cursor = hi;
+        loop {
+            let page = match self.run_input(Input::RangeRev { lo, hi: cursor }) {
+                Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
+                other => panic!("range_all_rev: {other:?}"),
+            };
+            refs.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        refs.into_iter().map(|r| self.whole(r)).collect()
     }
 
     /// Full paged range scan `lo..=hi`, concatenated: a test convenience
