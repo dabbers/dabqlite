@@ -321,23 +321,30 @@ impl TrigramIndex {
     /// rest. For shorter needles there is no trigram to look up: scan all
     /// rows (bounded by len; still exact).
     ///
-    /// `exhaustive` forces the scan path even for a long needle. The
-    /// caller asks for it when the index no longer holds a superset of the
-    /// answer for the way it wants to use it — the engine sets it once any
-    /// value spans more than one row. The scan is bounded by the row count
-    /// and exact either way; taking it is a cost, never a compromise.
-    pub fn find_page<F: Fn(u64) -> bool>(
+    /// A value longer than one row is indexed over its WHOLE text, so a
+    /// posting for a window at offset 40 lives in the third slot-row of
+    /// that value rather than in its head. The chain therefore hands back
+    /// rows that are continuations, and `head_of` maps one back to the row
+    /// that owns it. Without that mapping the chain is not a superset —
+    /// which is why this used to fall back to scanning every row the
+    /// moment a database held a single long value, at a cost of four
+    /// orders of magnitude on a selective needle.
+    ///
+    /// `page` receives HEAD rows; the cursor tracks the chain by posting
+    /// row, which is what makes a continuation resume in the chain instead
+    /// of walking it again.
+    pub fn find_page<M: Fn(u64) -> bool, H: Fn(u64) -> Option<u64>>(
         &self,
         needle: &[u8],
         cursor: Option<FindCursor>,
         page: &mut [u64],
-        exhaustive: bool,
-        matches: F,
+        matches: M,
+        head_of: H,
     ) -> (usize, Option<FindCursor>) {
         self.assert_invariants();
         let mut found = 0usize;
 
-        if needle.len() < 3 || exhaustive {
+        if needle.len() < 3 {
             // Descending scan from just below the cursor.
             let mut row = match cursor {
                 Some(c) if c.row == 0 => return (0, None),
@@ -394,11 +401,20 @@ impl TrigramIndex {
             // A cursor whose slot was lost (the caller crossed between the
             // chain and the scan path) still bounds the walk by row.
             let past = below.is_some_and(|b| row >= b);
-            if !past && matches(row) {
-                page[found] = row;
-                found += 1;
-                if found == page.len() {
-                    return (found, Some(FindCursor { row, slot }));
+            // The posting names the row its window STARTS in, which for a
+            // value spanning several rows is a continuation. Resolve it to
+            // the row that owns the value before asking whether the value
+            // matches: one posting per distinct trigram per VALUE means a
+            // chain still reaches each head at most once.
+            if !past {
+                if let Some(head) = head_of(row) {
+                    if matches(head) {
+                        page[found] = head;
+                        found += 1;
+                        if found == page.len() {
+                            return (found, Some(FindCursor { row, slot }));
+                        }
+                    }
                 }
             }
             slot = self.next[slot as usize];
@@ -432,9 +448,14 @@ mod tests {
             pages += 1;
             assert!(pages <= 1 + values.len(), "paging did not terminate");
             let mut page = [0u64; 4];
-            let (n, next) = t.find_page(needle, cursor, &mut page, false, |row| {
-                contains(&values[row as usize], needle)
-            });
+            let (n, next) = t.find_page(
+                needle,
+                cursor,
+                &mut page,
+                |row| contains(&values[row as usize], needle),
+                // One row per value here, so a posting row IS its head.
+                Some,
+            );
             // Pages descend, and never repeat a row.
             for w in page[..n].windows(2) {
                 assert!(w[0] > w[1], "a page was not descending: {page:?}");
@@ -516,34 +537,43 @@ mod tests {
         assert!(t.table.len().is_power_of_two());
     }
 
-    /// A value spanning several rows is searchable as ONE value, including
-    /// substrings that straddle a slot boundary. Without that, a long value
-    /// would be quietly unsearchable across its own seams.
+    /// A value spanning several rows is searchable as ONE value, wherever
+    /// the match falls: across a slot seam, and wholly inside a
+    /// continuation slot.
+    ///
+    /// The second case is the one that used to force the whole database
+    /// onto the scan path. A posting is filed under the row its window
+    /// STARTS in, so a match at offset 34 is filed under the value's third
+    /// row; without `head_of` mapping that back, the chain silently
+    /// dropped it and the index stopped being a superset.
     #[test]
     fn a_value_spanning_rows_is_searchable_across_its_seams() {
-        // 40 bytes: three rows, with "needle" placed so it crosses the
-        // boundary between the first row and the second.
-        let mut long = vec![b'.'; 40];
+        // 48 bytes: three rows. "needle" crosses the first seam;
+        // "deeper" sits entirely inside the third row.
+        let mut long = vec![b'.'; 48];
         long[14..20].copy_from_slice(b"needle");
+        long[34..40].copy_from_slice(b"deeper");
         let mut t = TrigramIndex::new(8);
         t.insert_value(0, 3, &long);
 
-        let mut page = [0u64; 4];
-        let (n, _) = t.find_page(b"needle", None, &mut page, false, |row| {
-            row == 0 && long.windows(6).any(|w| w == b"needle")
-        });
-        assert_eq!(
-            &page[..n],
-            &[0],
-            "a substring across a slot seam was missed"
-        );
+        // Every row of the run resolves to the head; nothing else exists.
+        let head_of = |row: u64| (row < 3).then_some(0u64);
+        for needle in [&b"needle"[..], b"deeper", b"..needle", b"deeper.."] {
+            let mut page = [0u64; 4];
+            let (n, _) = t.find_page(needle, None, &mut page, |row| row == 0, head_of);
+            assert_eq!(
+                &page[..n],
+                &[0],
+                "{:?} was not found in the value that contains it",
+                core::str::from_utf8(needle)
+            );
+        }
 
-        // And the exhaustive path agrees, which is the guarantee the
-        // engine leans on once any value is long.
-        let (n, _) = t.find_page(b"needle", None, &mut page, true, |row| {
-            row == 0 && long.windows(6).any(|w| w == b"needle")
-        });
-        assert_eq!(&page[..n], &[0]);
+        // A posting whose head cannot be resolved is not a candidate: the
+        // walk drops it rather than returning a continuation row.
+        let mut page = [0u64; 4];
+        let (n, _) = t.find_page(b"deeper", None, &mut page, |row| row == 0, |_| None);
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -590,6 +620,6 @@ mod tests {
         assert_ne!(head, NIL);
         t.next[head as usize] = head;
         let mut page = [0u64; 4];
-        let _ = t.find_page(b"abc", None, &mut page, false, |_| true);
+        let _ = t.find_page(b"abc", None, &mut page, |_| true, Some);
     }
 }

@@ -734,10 +734,11 @@ pub struct Engine {
     /// directly rather than by wall clock, and this is the work that
     /// would grow if a page ever went back to re-walking the chain.
     find_verifications: core::cell::Cell<u64>,
-    /// Head rows whose value spans more than one slot. While this is
-    /// nonzero, substring search takes the exhaustive path: the trigram
-    /// index only holds single-slot values, so a chain walk would be a
-    /// SUPERSET of the answer no longer (see `find_page`).
+    /// Head rows whose value spans more than one slot. Zero is the fast
+    /// path for reads: a value occupies exactly one row, so nothing has
+    /// to be looked ahead for (`value_extent`). Search does not depend on
+    /// it — the trigram index reaches a long value through `head_of`
+    /// regardless (see `find_page`).
     long_values: u64,
     /// Salvage mode was requested at open: verification failures quarantine
     /// a row instead of failing the whole database.
@@ -2598,15 +2599,11 @@ impl Engine {
     /// like the btree, the trigram index is updated at the commit point.
     fn find_page(&self, needle: &[u8], after: Option<FindCursor>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
-        // Once any value spans more than one slot, the chain walk stops
-        // being the cheapest way to reach every candidate, so take the
-        // exhaustive path. It is bounded by the row count and exactly as
-        // correct — a cost, never a compromise (see `find_page` in the
-        // trigram index).
-        let exhaustive = self.long_values > 0;
-        let (n, next) = self
-            .trigram
-            .find_page(needle, after, &mut rows, exhaustive, |row| {
+        let (n, next) = self.trigram.find_page(
+            needle,
+            after,
+            &mut rows,
+            |row| {
                 self.find_verifications
                     .set(self.find_verifications.get() + 1);
                 // Postings survive their record's retirement (the trigram
@@ -2644,7 +2641,9 @@ impl Engine {
                         false
                     }
                 }
-            });
+            },
+            |row| self.head_of(row),
+        );
         let mut page = FindPage {
             items: [RowRef::EMPTY; FIND_PAGE],
             count: n as u8,
@@ -2791,6 +2790,49 @@ impl Engine {
             at += n;
         }
         at
+    }
+
+    /// The row that owns the value covering `row`: itself when `row` is a
+    /// value's head, and the head of the run when it is a continuation.
+    ///
+    /// The trigram index addresses a posting by the value offset its
+    /// window starts at, so a window past the first slot of a long value
+    /// is filed under a continuation row. Resolving it back is what keeps
+    /// the chain a superset of the answer for values of any length; the
+    /// alternative — treating those postings as unreachable — meant
+    /// scanning every row in the database the moment one long value
+    /// existed.
+    ///
+    /// The walk is bounded by `MAX_COMMIT_ROWS`, because a value is
+    /// written whole inside one commit and a commit is bounded by what
+    /// the span byte can describe.
+    fn head_of(&self, row: u64) -> Option<u64> {
+        let off = (row as usize) * ROW_SIZE;
+        let slot = decode_row(&self.arena[off..off + ROW_SIZE])?;
+        match slot.kind {
+            RowKind::Record | RowKind::Update => Some(row),
+            RowKind::Tombstone => None,
+            RowKind::Chunk => {
+                let mut r = row;
+                for _ in 0..MAX_COMMIT_ROWS {
+                    if r == 0 {
+                        return None;
+                    }
+                    r -= 1;
+                    let o = (r as usize) * ROW_SIZE;
+                    let previous = decode_row(&self.arena[o..o + ROW_SIZE])?;
+                    if previous.id != slot.id {
+                        return None;
+                    }
+                    match previous.kind {
+                        RowKind::Chunk => continue,
+                        RowKind::Record | RowKind::Update => return Some(r),
+                        RowKind::Tombstone => return None,
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// How many slots the value starting at `head_row` occupies, and how

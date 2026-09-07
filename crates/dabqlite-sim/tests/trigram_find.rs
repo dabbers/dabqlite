@@ -4,7 +4,7 @@
 //! trigram" open decision (§10). Results are in insertion (row) order,
 //! which is what the naive oracle produces by construction.
 
-use dabqlite_core::{Capacities, DbError, Input, Output, VALUE_LEN};
+use dabqlite_core::{BatchOp, Capacities, DbError, Input, Output, VALUE_LEN};
 use dabqlite_sim::host::ClientOp;
 use dabqlite_sim::workload::crash_rng;
 use dabqlite_sim::{gen_workload, Driven, SimDisk, SimHost};
@@ -146,6 +146,152 @@ fn paging_a_common_needle_verifies_each_row_about_once() {
         verifications <= 3 * N,
         "paging {N} matches cost {verifications} row verifications; a page \
          is re-walking the chain instead of resuming in it"
+    );
+}
+
+/// One long value must not turn the index off for the whole database.
+///
+/// A posting is filed under the row its window STARTS in, so a match past
+/// the first slot of a multi-row value is filed under a continuation row.
+/// While that mapping was not inverted, the chain was not a superset of
+/// the answer and the engine compensated by scanning every row whenever
+/// `long_values > 0` — meaning ONE 17-byte value anywhere put every
+/// subsequent search on the scan path, for the life of the database. A
+/// bookmark store measured the consequence at 618 ns before and 61.7 ms
+/// after inserting a single long row.
+///
+/// Counting verifications is the honest way to test that: it is the work
+/// the scan path does and the chain does not, and it does not depend on
+/// how fast this machine happens to be.
+#[test]
+fn one_long_value_does_not_put_the_whole_database_on_the_scan_path() {
+    const N: u64 = 400;
+    let caps = Capacities { rows: 1024 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    for i in 0..N {
+        let mut value = [0u8; VALUE_LEN];
+        value[..6].copy_from_slice(b"filler");
+        value[6..14].copy_from_slice(&i.to_le_bytes());
+        host.run(ClientOp::Insert { id: i, value });
+    }
+    // Three rows and a bit, with the needle wholly inside the THIRD slot
+    // — the posting the old mapping could not resolve — and a second one
+    // straddling the first seam.
+    let mut long = vec![b'.'; 3 * VALUE_LEN + 5];
+    long[40..46].copy_from_slice(b"needle");
+    long[14..20].copy_from_slice(b"seamed");
+    assert!(matches!(
+        host.batch(&[BatchOp::Insert {
+            id: 9999,
+            value: &long,
+        }]),
+        Driven::Done(Output::BatchDone { result: Ok(()), .. })
+    ));
+
+    for needle in [&b"needle"[..], b"seamed"] {
+        let before = host.engine.find_verifications();
+        let hits = host.find_all_bytes(needle);
+        let cost = host.engine.find_verifications() - before;
+        assert_eq!(hits.len(), 1, "{needle:?} should match exactly one value");
+        assert_eq!(hits[0].0, 9999);
+        assert_eq!(hits[0].1, long, "the whole value comes back, not a slot");
+        assert!(
+            cost < N / 4,
+            "{needle:?} verified {cost} rows across {N}+ rows: the chain is \
+             not being used, so one long value has turned the index off"
+        );
+    }
+
+    // Short needles have no trigram to look up and still scan — that is
+    // the documented exception, not a regression.
+    let before = host.engine.find_verifications();
+    assert_eq!(host.find_all_bytes(b"ne").len(), 1);
+    assert!(host.engine.find_verifications() - before >= N);
+}
+
+/// Exactness over long values, against the naive oracle, with matches at
+/// every position of a multi-row value — including the seams, where a
+/// window belongs to two slots at once.
+#[test]
+fn long_values_match_the_oracle_at_every_offset() {
+    let caps = Capacities { rows: 256 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    let mut stored: Vec<(u64, Vec<u8>)> = Vec::new();
+    for i in 0..12u64 {
+        let len = (i as usize * 7) % (4 * VALUE_LEN) + 1;
+        let mut value = vec![0u8; len];
+        for (k, b) in value.iter_mut().enumerate() {
+            *b = ((i as u8).wrapping_mul(31)).wrapping_add(k as u8);
+        }
+        assert!(matches!(
+            host.batch(&[BatchOp::Insert {
+                id: i,
+                value: &value
+            }]),
+            Driven::Done(Output::BatchDone { result: Ok(()), .. })
+        ));
+        stored.push((i, value));
+    }
+    for (_, v) in &stored {
+        for off in 0..v.len().saturating_sub(2) {
+            for len in [3usize, 4, 9, VALUE_LEN] {
+                if off + len > v.len() {
+                    continue;
+                }
+                let needle = &v[off..off + len];
+                let want: Vec<(u64, Vec<u8>)> = stored
+                    .iter()
+                    .filter(|(_, s)| s.windows(len).any(|w| w == needle))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    host.find_all_bytes(needle),
+                    want,
+                    "needle={needle:?} off={off}"
+                );
+            }
+        }
+    }
+}
+
+/// Paging over long values: the cursor tracks the chain by POSTING row
+/// while a page carries HEAD rows, so a resume has to land in the right
+/// place without repeating or skipping a value. Thirty multi-row values
+/// sharing a needle is four pages of that.
+#[test]
+fn paging_long_values_neither_repeats_nor_skips() {
+    const N: u64 = 30;
+    let caps = Capacities { rows: 512 };
+    let mut host = SimHost::new(caps, SimDisk::new(), None);
+    host.open();
+    let mut stored: Vec<(u64, Vec<u8>)> = Vec::new();
+    for i in 0..N {
+        // The needle sits past the first slot, so every posting that
+        // finds it is filed under a continuation row.
+        let mut value = vec![b'-'; 3 * VALUE_LEN];
+        value[36..42].copy_from_slice(b"needle");
+        value[0..8].copy_from_slice(&i.to_le_bytes());
+        assert!(matches!(
+            host.batch(&[BatchOp::Insert {
+                id: i * 3 + 1,
+                value: &value,
+            }]),
+            Driven::Done(Output::BatchDone { result: Ok(()), .. })
+        ));
+        stored.push((i * 3 + 1, value));
+    }
+    assert_eq!(host.find_all_bytes(b"needle"), stored);
+
+    // And it is linear: paging all N matches verifies each value a
+    // bounded number of times, not once per page.
+    let before = host.engine.find_verifications();
+    let _ = host.find_all_bytes(b"needle");
+    let cost = host.engine.find_verifications() - before;
+    assert!(
+        cost <= 3 * N,
+        "paging {N} long-value matches cost {cost} verifications"
     );
 }
 
