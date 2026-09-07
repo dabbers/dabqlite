@@ -321,6 +321,17 @@ impl SimHost {
         self.drive(input)
     }
 
+    /// Catch this host up on commits made since it opened, the way a
+    /// reader process does. Drives `Input::Refresh` to its terminal.
+    pub fn refresh(&mut self) -> Driven {
+        let superblock_len = self.disk.len(FileId::Superblock);
+        let rows_len = self.disk.len(FileId::Rows);
+        self.drive(Input::Refresh {
+            superblock_len,
+            rows_len,
+        })
+    }
+
     /// Open in SALVAGE mode: damaged rows are quarantined instead of
     /// failing the whole database (docs/FAULTS.md, "corruption
     /// containment"). Read-only; writes no data byte.

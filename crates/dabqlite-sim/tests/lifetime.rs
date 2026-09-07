@@ -41,12 +41,16 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     let cfg = LifetimeConfig::default();
     let mut find_checks = 0;
     let mut value_checks = 0;
+    let mut refresh_checks = 0;
+    let mut refresh_restarts = 0;
     let mut inspections = 0;
     let mut cycles = 0;
     for seed in 0..16u64 {
         let stats = run_lifetime(seed, &cfg);
         find_checks += stats.find_checks;
         value_checks += stats.value_checks;
+        refresh_checks += stats.refresh_checks;
+        refresh_restarts += stats.refresh_restarts;
         inspections += stats.inspections;
         cycles += stats.cycles as u64;
     }
@@ -65,6 +69,24 @@ fn every_cycle_verifies_the_whole_feature_surface() {
     assert!(
         value_checks * 4 >= cycles * 3,
         "only {value_checks} bounded value-ordered scans across {cycles} cycles"
+    );
+    // The reader is caught up incrementally every cycle, and every
+    // catch-up is checked against a reader opened fresh on the same bytes.
+    assert_eq!(
+        refresh_checks, cycles,
+        "the incremental reader must be verified EVERY cycle"
+    );
+    // And it never had to be reopened. That is not a coincidence, it is
+    // the design: a reader follows COMMITTED manifests, a crash inside
+    // the fault budget cannot take an acknowledged commit away, and
+    // recovery only ever truncates residue the reader never saw. So
+    // within budget a reader never diverges. If this ever fires, either
+    // the budget was exceeded or a new operation moved a manifest
+    // backwards — both worth stopping for.
+    assert_eq!(
+        refresh_restarts, 0,
+        "a reader had to be reopened {refresh_restarts} times; inside the \
+         fault budget it should never have to"
     );
 }
 

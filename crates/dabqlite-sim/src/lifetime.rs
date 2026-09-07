@@ -113,6 +113,12 @@ pub struct LifetimeStats {
     pub assertions: u64,
     /// Bounded value-ordered scans verified against the oracle.
     pub value_checks: u64,
+    /// Reader catch-ups verified against a freshly opened reader.
+    pub refresh_checks: u64,
+    /// Times the reader could not follow the disk any further and was
+    /// reopened — a legitimate outcome (`Diverged`, a migration, a
+    /// salvage) and one worth counting rather than hiding.
+    pub refresh_restarts: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -477,6 +483,12 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
         Driven::Done(Output::OpenDone { result: Ok(n) }) if n == oracle.len() as u64 => {}
         other => panic!("[seed={seed}] first open failed: {other:?}"),
     }
+    // A second handle over the same bytes: the reader that never
+    // reopens. It is carried across every cycle of this lifetime and
+    // caught up incrementally, so by the end it has followed the writer
+    // through crashes, recoveries and salvage episodes.
+    let mut reader = SimHost::new(cfg.caps, host.disk.clone(), None);
+    let _ = reader.open();
     // A migrated database arrives with slots already consumed.
     slots = host.engine.usage().0;
 
@@ -871,6 +883,60 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                     );
                     stats.find_checks += 1;
                 }
+            }
+        }
+        // A READER over the same disk, caught up incrementally rather
+        // than reopened. Two things are checked and the second is the
+        // point: the reader's whole answer surface equals a reader opened
+        // fresh on these exact bytes, so the incremental replay and the
+        // full one agree — after every fault schedule this lifetime has
+        // been through, not just on a clean database.
+        //
+        // The reader is carried ACROSS cycles, so by late in a lifetime
+        // it has refreshed over crashes, recoveries, salvage episodes and
+        // migrations without ever being reopened.
+        {
+            let live = host.disk.clone();
+            reader.disk = live.clone();
+            let advanced = match reader.refresh() {
+                Driven::Done(Output::RefreshDone { result: Ok(n) }) => Some(n),
+                // Refusals are legitimate and each names a reason the
+                // reader cannot follow this disk any further: recovery
+                // truncated residue the reader had already seen, a
+                // migration rewrote the file set, salvage quarantined
+                // rows. The reader is rebuilt from the same bytes and the
+                // comparison below still has to hold.
+                Driven::Done(Output::RefreshDone { result: Err(_) }) => None,
+                other => panic!("[{ctx}] refresh: {other:?}"),
+            };
+            let mut fresh = SimHost::new(reader.engine.caps(), live, None);
+            let opened = matches!(
+                fresh.open(),
+                Driven::Done(Output::OpenDone { result: Ok(_) })
+            );
+            if advanced.is_some() && opened {
+                assert_eq!(
+                    reader.range_all_bytes(0, u64::MAX),
+                    fresh.range_all_bytes(0, u64::MAX),
+                    "[{ctx}] a refreshed reader diverged from a fresh one"
+                );
+                assert_eq!(
+                    reader.value_all(b"", b""),
+                    fresh.value_all(b"", b""),
+                    "[{ctx}] a refreshed reader's value order diverged"
+                );
+                assert_eq!(
+                    reader.engine.usage(),
+                    fresh.engine.usage(),
+                    "[{ctx}] a refreshed reader's accounting diverged"
+                );
+                stats.refresh_checks += 1;
+            } else {
+                // Could not follow: start again from these bytes, which
+                // is exactly what the API tells a caller to do.
+                reader = SimHost::new(reader.engine.caps(), host.disk.clone(), None);
+                let _ = reader.open();
+                stats.refresh_restarts += 1;
             }
         }
         // Inspector agreement: the independent second implementation of

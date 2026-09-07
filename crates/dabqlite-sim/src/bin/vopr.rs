@@ -42,6 +42,8 @@ struct Totals {
     recovery_crashes: u64,
     find_checks: u64,
     value_checks: u64,
+    refresh_checks: u64,
+    refresh_restarts: u64,
     inspections: u64,
     salvage_checks: u64,
     deletes: u64,
@@ -67,6 +69,8 @@ impl Totals {
         self.recovery_crashes += s.recovery_crashes;
         self.find_checks += s.find_checks;
         self.value_checks += s.value_checks;
+        self.refresh_checks += s.refresh_checks;
+        self.refresh_restarts += s.refresh_restarts;
         self.inspections += s.inspections;
         self.salvage_checks += s.salvage_checks;
         self.deletes += s.deletes;
@@ -96,7 +100,9 @@ impl Totals {
         println!(
             "vopr: full surface: {} migrations ({} attempts under faults), \
              {} substring-search oracle checks, {} value-ordered scan oracle \
-             checks, {} inspector agreements, \
+             checks, {} incremental reader catch-ups verified against a fresh \
+             reader ({} times a reader could not follow the disk and reopened), \
+             {} inspector agreements, \
              {} full-disk recovery episodes, {} salvage episodes, \
              {} deletes + {} updates, {} atomic batches carrying {} writes, \
              {} values spanning more than one row slot, {} compare-and-set \
@@ -106,6 +112,8 @@ impl Totals {
             self.migration_attempts,
             self.find_checks,
             self.value_checks,
+            self.refresh_checks,
+            self.refresh_restarts,
             self.inspections,
             self.disk_full_recoveries,
             self.salvage_checks,
