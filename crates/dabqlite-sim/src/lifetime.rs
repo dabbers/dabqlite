@@ -460,7 +460,14 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                     Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
                     other => panic!("[{ctx}] range scan failed: {other:?}"),
                 };
-                for &(k, v) in &page.items[..page.count as usize] {
+                for item in &page.items[..page.count as usize] {
+                    let (k, v) = (
+                        item.id,
+                        <[u8; VALUE_LEN]>::try_from(
+                            item.value().expect("lifetime values fit one slot"),
+                        )
+                        .expect("full-width value"),
+                    );
                     let (&ok, &ov) = oracle_iter
                         .next()
                         .unwrap_or_else(|| panic!("[{ctx}] scan has extra key {k}"));

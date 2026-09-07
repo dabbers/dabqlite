@@ -38,7 +38,12 @@ fn scan_all(host: &mut SimHost) -> Vec<(u64, [u8; VALUE_LEN])> {
             Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
             other => panic!("scan failed: {other:?}"),
         };
-        for &(k, v) in &page.items[..page.count as usize] {
+        for item in &page.items[..page.count as usize] {
+            let (k, v) = (
+                item.id,
+                <[u8; VALUE_LEN]>::try_from(item.value().expect("full-width value"))
+                    .expect("full-width value"),
+            );
             if let Some(&(pk, _)) = out.last() {
                 assert!(k > pk, "scan out of order");
             }
@@ -102,7 +107,7 @@ fn atomicity_no_observer_ever_sees_a_partial_write() {
             assert_eq!(scanned.len() as u64, n, "[{ctx}] scan vs count");
             if let Some((id, value)) = in_flight {
                 let via_get = match rec.run_input(get_record(id)) {
-                    Driven::Done(Output::GetDone { result: Ok(v), .. }) => v,
+                    Driven::Done(Output::GetDone { result: Ok(v), .. }) => v.map(|w| w.bytes),
                     other => panic!("[{ctx}] {other:?}"),
                 };
                 let via_scan = scanned.iter().find(|&&(k, _)| k == id).map(|&(_, v)| v);
@@ -220,7 +225,7 @@ fn isolation_every_operation_busy_at_every_commit_stage() {
     // After commit, everything is visible and consistent again.
     assert!(matches!(
         host.engine.tick(get_record(2)),
-        Output::GetDone { result: Ok(Some(v)), .. } if v == [2; VALUE_LEN]
+        Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == [2; VALUE_LEN]
     ));
 }
 

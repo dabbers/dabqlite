@@ -5,7 +5,7 @@
 //! test here needs a helper that feels like plumbing, that is a signal the
 //! library is missing something, not that the test needs more code.
 
-use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_BATCH, VALUE_LEN};
+use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_BATCH, MAX_VALUE_LEN, VALUE_LEN};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-api-{}-{tag}", std::process::id()));
@@ -62,20 +62,22 @@ fn values_refuse_to_truncate_and_round_trip_text() {
     let v = Value::from_text("hello").unwrap();
     assert_eq!(v.text(), "hello");
     assert_eq!(v.as_bytes(), b"hello");
-    assert_eq!(v.raw().len(), VALUE_LEN);
+    assert_eq!(v.len(), 5, "a value is as long as what you put in it");
 
-    let too_long = "x".repeat(VALUE_LEN + 1);
+    let too_long = "x".repeat(MAX_VALUE_LEN + 1);
     assert_eq!(
         Value::from_text(&too_long),
         Err(Error::ValueTooLong {
-            len: VALUE_LEN + 1,
-            max: VALUE_LEN
+            len: MAX_VALUE_LEN + 1,
+            max: MAX_VALUE_LEN
         }),
         "a value that does not fit must be refused, never silently cut"
     );
-    // Exactly full is fine, and round-trips.
-    let exact = "y".repeat(VALUE_LEN);
+    // Exactly at the ceiling is fine, and round-trips.
+    let exact = "y".repeat(MAX_VALUE_LEN);
     assert_eq!(Value::from_text(&exact).unwrap().text(), exact);
+    // So does the empty value, which is not the same as an absent row.
+    assert_eq!(Value::empty().as_bytes(), b"");
 }
 
 #[test]
@@ -407,20 +409,72 @@ fn a_database_can_be_held_in_a_struct_now() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A value is exactly what you put in it. Not "what you put in, minus
+/// trailing zeros" — the whole point of storing a length is that no byte
+/// pattern is special.
+///
+/// The two earlier versions of this both lost data: the first truncated at
+/// the first zero ANYWHERE, silently cutting the tail off any binary
+/// payload; the second kept interior zeros but still trimmed trailing
+/// ones, so a value that ended in a zero came back short.
 #[test]
-fn a_value_keeps_its_interior_zeros() {
-    // This used to truncate at the first zero ANYWHERE, silently losing
-    // the tail of any binary payload.
-    let v = Value::from_bytes(b"ab\0cd").unwrap();
-    assert_eq!(v.as_bytes(), b"ab\0cd", "interior zeros must survive");
-    assert_eq!(Value::from_bytes(b"").unwrap().as_bytes(), b"");
-    assert_eq!(
-        Value::from_bytes(&[0u8; VALUE_LEN]).unwrap().as_bytes(),
-        b""
-    );
-    // Full-width values round-trip.
-    let full = [7u8; VALUE_LEN];
-    assert_eq!(Value::from_bytes(&full).unwrap().as_bytes(), &full);
+fn a_value_is_exactly_the_bytes_you_gave_it() {
+    for case in [
+        &b"ab\0cd"[..],
+        b"",
+        b"\0",
+        b"trailing\0\0\0",
+        &[0u8; VALUE_LEN][..],
+        &[7u8; VALUE_LEN][..],
+        // Longer than one row, and ending in zeros, so both the length
+        // byte and the multi-slot path have to be exact.
+        &[0u8; VALUE_LEN * 3][..],
+    ] {
+        let v = Value::from_bytes(case).unwrap();
+        assert_eq!(v.as_bytes(), case, "in-memory value changed");
+        assert_eq!(v.len(), case.len());
+    }
+}
+
+/// And the same through an actual round trip to storage and back, which
+/// is where a length that lives in the row rather than in the caller's
+/// head earns its keep.
+#[test]
+fn a_value_survives_storage_byte_for_byte_at_every_length() {
+    let mut db = Db::in_memory().expect("open");
+    let cases: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0],
+        b"ab\0cd".to_vec(),
+        b"trailing\0\0\0".to_vec(),
+        vec![0u8; VALUE_LEN],
+        vec![7u8; VALUE_LEN],
+        vec![9u8; VALUE_LEN + 1],
+        vec![0u8; VALUE_LEN * 3],
+        (0..255u8).cycle().take(1000).collect(),
+        vec![0xFF; MAX_VALUE_LEN],
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        let id = i as u64;
+        db.put(id, Value::from_bytes(case).unwrap()).expect("put");
+        assert_eq!(
+            db.get(id).unwrap().unwrap().as_bytes(),
+            &case[..],
+            "value {i} ({} bytes) changed in storage",
+            case.len()
+        );
+    }
+    // And again after a reload from the raw bytes, so the file — not the
+    // live engine — is what is being trusted.
+    let snapshot = db.snapshot().unwrap();
+    let mut reloaded = Db::load(&snapshot).expect("reload");
+    for (i, case) in cases.iter().enumerate() {
+        assert_eq!(
+            reloaded.get(i as u64).unwrap().unwrap().as_bytes(),
+            &case[..],
+            "value {i} changed across a reload"
+        );
+    }
 }
 
 #[cfg(unix)]

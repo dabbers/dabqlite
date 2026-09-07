@@ -54,7 +54,8 @@ fn open_salvage(disk: SimDisk) -> (SimHost, Result<u64, DbError>) {
 
 fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, DbError> {
     match host.run_input(Input::Get { id }) {
-        Driven::Done(Output::GetDone { result, .. }) => result,
+        // These suites write full-width values, so one window is whole.
+        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| v.map(|w| w.bytes)),
         other => panic!("get: {other:?}"),
     }
 }
@@ -472,6 +473,7 @@ fn a_value_continuation_with_nothing_to_continue_is_refused_by_name() {
         RowKind::Chunk,
         0,
         VALUE_LEN as u8,
+        false,
         victim_id,
         &[0xAB; VALUE_LEN],
         &mut planted,

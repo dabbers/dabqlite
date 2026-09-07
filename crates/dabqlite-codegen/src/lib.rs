@@ -82,6 +82,15 @@ pub struct Schema {
     /// value too long for one slot, so a value is no longer bounded by the
     /// row it starts in.
     ///
+    /// v5 adds one bit to that byte — CONTINUES — and it is a correctness
+    /// bit, not a convenience. Without it, a row that fails its checksum
+    /// immediately after a value is ambiguous: it might be that value's
+    /// next chunk, or it might be an unrelated later row. Serving the
+    /// value would risk handing back a truncated one; quarantining it
+    /// would make every corrupt row cost its predecessor too. With the
+    /// bit, a value states where it ends, so a damaged chunk takes down
+    /// exactly the value it belonged to and nothing else.
+    ///
     /// The version is part of the schema hash, so a binary that does not
     /// understand a format refuses the file at open (`SchemaMismatch`)
     /// instead of misreading it. Declare an older format with
@@ -90,7 +99,7 @@ pub struct Schema {
 }
 
 /// The current row format emitted for a schema that does not say otherwise.
-pub const CURRENT_ROW_FORMAT: u8 = 4;
+pub const CURRENT_ROW_FORMAT: u8 = 5;
 
 /// Row kinds, v2 and later. The discriminant lives inside the checksum.
 pub const ROW_KIND_RECORD: u8 = 0;
@@ -120,7 +129,13 @@ pub const ROW_KIND_MAX: u8 = ROW_KIND_CHUNK;
 /// more byte that cannot be quietly wrong. The bound keeps a batch's
 /// staging area small enough to reason about, and keeps the worst-case
 /// work a single commit can queue behind an fsync bounded.
-pub const ROW_SPAN_MAX: u8 = 63;
+///
+/// It also bounds how long a VALUE can be, since a value spanning several
+/// rows is written as a run inside one commit: 128 rows of 16 bytes is a
+/// 2 KiB ceiling. Deliberately not 255: leaving half the byte's range
+/// illegal keeps "this span cannot exist" a real check rather than a
+/// vacuous one.
+pub const ROW_SPAN_MAX: u8 = 127;
 
 /// Computed record layout: sequential field offsets, then the CRC, then
 /// zero padding to an 8-byte multiple. Every byte of the row is covered:
@@ -622,7 +637,7 @@ pub fn emit_format_doc(schema: &Schema, legacy: &Schema, source_name: &str) -> S
     }
     if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
         w(format!(
-            "| {len} | 1 | len | bytes of the final column this row carries (0..={len_max}) |"
+            "| {len} | 1 | len | bytes this row carries (0..={len_max}), plus `0x80` when the value continues into the next row |"
         ));
     }
     let crc = layout.crc_offset;
@@ -747,7 +762,7 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if let (Some(len), Some(len_max)) = (layout.len_offset, layout.len_max) {
         o.push_str(&format!(
-            "/// Offset of the payload LEN: how many bytes of the final\n             /// fixed-width column this row carries. Also INSIDE the checksummed\n             /// region — a flip here would silently lengthen or shorten a value.\n             pub const {upper}_LEN_OFFSET: usize = {len};\n             /// Largest payload a single row can carry.\n             pub const {upper}_LEN_MAX: u8 = {len_max};\n"
+            "/// Offset of the payload LEN: how many bytes of the final\n             /// fixed-width column this row carries, in the low bits, with\n             /// `LEN_MORE` set when the value continues into the next row.\n             /// Also INSIDE the checksummed region — a flip here would silently\n             /// lengthen, shorten, or re-end a value.\n             pub const {upper}_LEN_OFFSET: usize = {len};\n             /// Largest payload a single row can carry.\n             pub const {upper}_LEN_MAX: u8 = {len_max};\n             /// Set in the LEN byte when this row is NOT the last of its\n             /// value: the next row continues it.\n             pub const {upper}_LEN_MORE: u8 = 0x80;\n"
         ));
     }
     for (col, off) in schema.columns.iter().zip(&layout.field_offsets) {
@@ -773,7 +788,7 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if layout.len_offset.is_some() {
         o.push_str(
-            "    /// Bytes of the final column this row actually carries.\n             \x20   pub len: u8,\n",
+            "    /// Bytes of the final column this row actually carries.\n             \x20   pub len: u8,\n             \x20   /// True when the value continues into the next row.\n             \x20   pub more: bool,\n",
         );
     }
     for col in &schema.columns {
@@ -839,7 +854,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
         o.push_str(&format!("    out[{upper}_SPAN_OFFSET] = row.span;\n"));
     }
     if layout.len_offset.is_some() {
-        o.push_str(&format!("    out[{upper}_LEN_OFFSET] = row.len;\n"));
+        o.push_str(&format!(
+            "    out[{upper}_LEN_OFFSET] = row.len | if row.more {{ {upper}_LEN_MORE }} else {{ 0 }};\n"
+        ));
     }
     o.push_str(&format!(
         "    let crc = gen_crc32(&out[0..{upper}_CRC_OFFSET]);\n\
@@ -883,7 +900,9 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if layout.len_offset.is_some() {
         o.push_str(&format!(
-            "    let len = bytes[{upper}_LEN_OFFSET];\n\
+            "    let len_byte = bytes[{upper}_LEN_OFFSET];\n\
+             \x20   let more = len_byte & {upper}_LEN_MORE != 0;\n\
+             \x20   let len = len_byte & !{upper}_LEN_MORE;\n\
              \x20   if len > {upper}_LEN_MAX {{\n\
              \x20       return None;\n\
              \x20   }}\n"
@@ -912,6 +931,7 @@ pub fn emit_rust(schema: &Schema, source_name: &str) -> String {
     }
     if layout.len_offset.is_some() {
         fields.push("len");
+        fields.push("more");
     }
     fields.extend(schema.columns.iter().map(|c| c.name.as_str()));
     o.push_str(&format!(

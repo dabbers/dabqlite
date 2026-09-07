@@ -12,7 +12,7 @@
 //!      8    16  value     (fixed-width payload)
 //!     24     1  kind      (0 = record, 1 = tombstone, 2 = update, 3 = chunk)
 //!     25     1  span      (further rows in the same commit; 0 = last/only)
-//!     26     1  len       (bytes of `value` this row really carries, 0..=16)
+//!     26     1  len       (bytes carried, 0..=16, | 0x80 if the value continues)
 //!     27     4  crc32     (over bytes 0..27 — kind, span and len INCLUDED)
 //!     31     1  padding   (zero)
 //!
@@ -37,9 +37,14 @@
 //! The len byte is the third of the same kind. It says how much of the
 //! 16-byte slot is really the value, which is what lets a value be
 //! shorter than its slot without the caller encoding its own length —
-//! and, with CHUNK rows, longer than one slot. A flip there would
-//! lengthen a value into its own zero padding or truncate it, silently
-//! and with a valid checksum, so it is covered too.
+//! and, with CHUNK rows, longer than one slot. Its high bit says whether
+//! the value CONTINUES into the next row, which is what makes a value's
+//! end explicit: a row that fails its checksum right after a value is
+//! then unambiguously not part of it, so a damaged chunk costs exactly
+//! the value it belonged to and a damaged unrelated row costs only
+//! itself. A flip anywhere in the byte would lengthen a value into its
+//! own zero padding, truncate it, or move its end, silently and with a
+//! valid checksum, so the whole byte is covered too.
 //! ```
 //!
 //! ## Superblock copy (64 bytes, SB_COPIES redundant slots in the zone)
@@ -141,6 +146,11 @@ pub struct RowSlot {
     /// Bytes of `value` this row really carries. Everything past it is
     /// zero padding inside the slot, not data.
     pub len: u8,
+    /// True when the value continues into the next row. A row with this
+    /// clear is the last (or only) row of its value, full stop — which is
+    /// what lets recovery tell a damaged continuation apart from a
+    /// damaged stranger.
+    pub more: bool,
     pub id: u64,
     pub value: [u8; VALUE_LEN],
 }
@@ -185,10 +195,12 @@ pub const SCHEMA_HASH: u64 = records::RECORDS_SCHEMA_HASH;
 /// Encode a row into its slot. Delegates to the schema-compiled codec; the
 /// hand-written [`reference`] implementation exists as a permanent second
 /// opinion and is asserted equivalent in debug builds and test suites.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_row(
     kind: RowKind,
     span: u8,
     len: u8,
+    more: bool,
     id: u64,
     value: &[u8; VALUE_LEN],
     out: &mut [u8; ROW_SIZE],
@@ -211,6 +223,7 @@ pub fn encode_row(
             kind: kind.byte(),
             span,
             len,
+            more,
             id,
             value: *value,
         },
@@ -221,7 +234,7 @@ pub fn encode_row(
     #[cfg(debug_assertions)]
     {
         let mut check = [0u8; ROW_SIZE];
-        reference::encode_row(kind, span, len, id, value, &mut check);
+        reference::encode_row(kind, span, len, more, id, value, &mut check);
         debug_assert_eq!(*out, check, "generated and reference codecs diverged");
     }
 }
@@ -236,6 +249,7 @@ pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
             kind: RowKind::from_byte(row.kind)?,
             span: row.span,
             len: row.len,
+            more: row.more,
             id: row.id,
             value: row.value,
         })
@@ -255,10 +269,12 @@ pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
 pub mod reference {
     use super::{crc32, RowKind, RowSlot, MAX_COMMIT_ROWS, ROW_SIZE, VALUE_LEN};
 
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_row(
         kind: RowKind,
         span: u8,
         len: u8,
+        more: bool,
         id: u64,
         value: &[u8; VALUE_LEN],
         out: &mut [u8; ROW_SIZE],
@@ -272,7 +288,7 @@ pub mod reference {
             RowKind::Chunk => 3,
         };
         out[25] = span;
-        out[26] = len;
+        out[26] = len | if more { 0x80 } else { 0 };
         let crc = crc32(&out[0..27]);
         out[27..31].copy_from_slice(&crc.to_le_bytes());
         out[31..32].fill(0);
@@ -300,7 +316,8 @@ pub mod reference {
         if span as usize >= MAX_COMMIT_ROWS {
             return None;
         }
-        let len = bytes[26];
+        let more = bytes[26] & 0x80 != 0;
+        let len = bytes[26] & 0x7F;
         if len as usize > VALUE_LEN {
             return None;
         }
@@ -310,6 +327,7 @@ pub mod reference {
             kind,
             span,
             len,
+            more,
             id,
             value,
         })
@@ -402,13 +420,22 @@ mod tests {
     fn row_roundtrip() {
         let mut slot = [0u8; ROW_SIZE];
         let value = *b"0123456789abcdef";
-        encode_row(RowKind::Record, 0, VALUE_LEN as u8, 42, &value, &mut slot);
+        encode_row(
+            RowKind::Record,
+            0,
+            VALUE_LEN as u8,
+            false,
+            42,
+            &value,
+            &mut slot,
+        );
         assert_eq!(
             decode_row(&slot),
             Some(RowSlot {
                 kind: RowKind::Record,
                 span: 0,
                 len: VALUE_LEN as u8,
+                more: false,
                 id: 42,
                 value
             })
@@ -423,6 +450,7 @@ mod tests {
             RowKind::Tombstone,
             0,
             VALUE_LEN as u8,
+            false,
             42,
             &value,
             &mut slot,
@@ -442,7 +470,15 @@ mod tests {
     fn length_gates_are_exact_in_both_codecs() {
         let value = *b"0123456789abcdef";
         let mut slot = [0u8; ROW_SIZE];
-        encode_row(RowKind::Record, 0, VALUE_LEN as u8, 42, &value, &mut slot);
+        encode_row(
+            RowKind::Record,
+            0,
+            VALUE_LEN as u8,
+            false,
+            42,
+            &value,
+            &mut slot,
+        );
         let mut long_row = [0u8; ROW_SIZE + 1];
         long_row[..ROW_SIZE].copy_from_slice(&slot);
         for short in 0..ROW_SIZE {
@@ -457,6 +493,7 @@ mod tests {
             kind: RowKind::Record,
             span: 0,
             len: VALUE_LEN as u8,
+            more: false,
             id: 42,
             value,
         };
@@ -487,6 +524,7 @@ mod tests {
             RowKind::Record,
             0,
             VALUE_LEN as u8,
+            false,
             42,
             &[7u8; VALUE_LEN],
             &mut slot,
@@ -512,11 +550,16 @@ mod tests {
             RowKind::Update,
             RowKind::Chunk,
         ] {
-            for (span, len) in [(0u8, 0u8), (1, 1), (0b0010_1010, 10), (63, 16)] {
+            for (span, len, more) in [
+                (0u8, 0u8, false),
+                (1, 1, true),
+                (0b0010_1010, 10, false),
+                (127, 16, true),
+            ] {
                 let mut row = [0u8; ROW_SIZE];
                 let mut value = [7u8; VALUE_LEN];
                 value[len as usize..].fill(0);
-                encode_row(kind, span, len, 42, &value, &mut row);
+                encode_row(kind, span, len, more, 42, &value, &mut row);
                 for byte in 0..ROW_SIZE {
                     for bit in 0..8 {
                         let mut damaged = row;
@@ -524,7 +567,7 @@ mod tests {
                         assert_eq!(
                             decode_row(&damaged),
                             None,
-                            "row flip at byte {byte} bit {bit} undetected ({kind:?}, span {span}, len {len})"
+                            "row flip at byte {byte} bit {bit} undetected ({kind:?}, span {span}, len {len}, more {more})"
                         );
                     }
                 }

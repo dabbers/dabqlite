@@ -33,17 +33,44 @@ use dabqlite_sim::{Driven, SimDisk, SimHost};
 
 const CAPS: Capacities = Capacities { rows: 512 };
 
-fn val(n: u64) -> [u8; VALUE_LEN] {
+/// A distinctive value for `n`, leaked so it can be borrowed by a batch
+/// op written inline.
+///
+/// Deliberate: batch ops borrow their payloads, and a suite that had to
+/// keep every payload alive by hand would read as a test about lifetimes
+/// rather than a test about batches. A test binary exits; these bytes are
+/// never reclaimed and never need to be.
+fn val(n: u64) -> &'static [u8] {
     let mut v = [0u8; VALUE_LEN];
     v[..8].copy_from_slice(&n.to_le_bytes());
     v[8..].copy_from_slice(&(n.wrapping_mul(0x9E37_79B9)).to_le_bytes());
-    v
+    Box::leak(Box::new(v))
+}
+
+/// A value of exactly `len` bytes, deterministic in `n`, leaked like
+/// `val`. Used to build values that span several row slots.
+fn long_val(n: u64, len: usize) -> &'static [u8] {
+    let mut v = vec![0u8; len];
+    for (i, b) in v.iter_mut().enumerate() {
+        *b = (n.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64) & 0xFF) as u8;
+    }
+    Box::leak(v.into_boxed_slice())
 }
 
 fn fresh() -> SimHost {
     let mut host = SimHost::new(CAPS, SimDisk::new(), None);
     host.open();
     host
+}
+
+/// The fixed-slot write path still takes a full-width array; this is the
+/// bridge from the byte-slice values the batch path uses.
+fn arr(v: &[u8]) -> [u8; VALUE_LEN] {
+    <[u8; VALUE_LEN]>::try_from(v).expect("a full-width value")
+}
+
+fn got(host: &mut SimHost, id: u64) -> Option<Vec<u8>> {
+    host.get_bytes(id)
 }
 
 fn open(disk: SimDisk) -> (SimHost, u64) {
@@ -55,7 +82,7 @@ fn open(disk: SimDisk) -> (SimHost, u64) {
     (host, n)
 }
 
-fn batch(host: &mut SimHost, ops: &[BatchOp]) -> Result<u64, (u8, DbError)> {
+fn batch(host: &mut SimHost, ops: &[BatchOp]) -> Result<u64, (u16, DbError)> {
     match host.batch(ops) {
         Driven::Done(Output::BatchDone {
             rows,
@@ -87,14 +114,22 @@ fn every_op_in_a_batch_is_visible_together_and_survives_restart() {
         .collect();
     assert_eq!(batch(&mut host, &ops), Ok(8));
     for i in 0..8 {
-        assert_eq!(host.get(i), Some(val(i)), "id {i} not visible after commit");
+        assert_eq!(
+            got(&mut host, i),
+            Some(val(i).to_vec()),
+            "id {i} not visible after commit"
+        );
     }
 
     let disk = std::mem::take(&mut host.disk);
     let (mut host, n) = open(disk);
     assert_eq!(n, 8);
     for i in 0..8 {
-        assert_eq!(host.get(i), Some(val(i)), "id {i} lost across restart");
+        assert_eq!(
+            got(&mut host, i),
+            Some(val(i).to_vec()),
+            "id {i} lost across restart"
+        );
     }
 }
 
@@ -104,7 +139,7 @@ fn a_batch_mixes_inserts_updates_and_deletes_in_one_commit() {
     for i in 0..4 {
         host.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     assert_eq!(
@@ -132,22 +167,42 @@ fn a_batch_mixes_inserts_updates_and_deletes_in_one_commit() {
         ),
         Ok(5)
     );
-    assert_eq!(host.get(0), Some(val(100)), "update did not apply");
-    assert_eq!(host.get(1), None, "delete did not apply");
-    assert_eq!(host.get(2), Some(val(200)), "put over a live row");
-    assert_eq!(host.get(3), Some(val(3)), "untouched row moved");
-    assert_eq!(host.get(9), Some(val(9)), "insert did not apply");
-    assert_eq!(host.get(10), Some(val(10)), "put of a new row");
+    assert_eq!(
+        got(&mut host, 0),
+        Some(val(100).to_vec()),
+        "update did not apply"
+    );
+    assert_eq!(got(&mut host, 1), None, "delete did not apply");
+    assert_eq!(
+        got(&mut host, 2),
+        Some(val(200).to_vec()),
+        "put over a live row"
+    );
+    assert_eq!(
+        got(&mut host, 3),
+        Some(val(3).to_vec()),
+        "untouched row moved"
+    );
+    assert_eq!(
+        got(&mut host, 9),
+        Some(val(9).to_vec()),
+        "insert did not apply"
+    );
+    assert_eq!(
+        got(&mut host, 10),
+        Some(val(10).to_vec()),
+        "put of a new row"
+    );
 
     // The same picture after a restart, from the file alone.
     let disk = std::mem::take(&mut host.disk);
     let (mut host, _) = open(disk);
-    assert_eq!(host.get(0), Some(val(100)));
-    assert_eq!(host.get(1), None);
-    assert_eq!(host.get(2), Some(val(200)));
-    assert_eq!(host.get(3), Some(val(3)));
-    assert_eq!(host.get(9), Some(val(9)));
-    assert_eq!(host.get(10), Some(val(10)));
+    assert_eq!(got(&mut host, 0), Some(val(100).to_vec()));
+    assert_eq!(got(&mut host, 1), None);
+    assert_eq!(got(&mut host, 2), Some(val(200).to_vec()));
+    assert_eq!(got(&mut host, 3), Some(val(3).to_vec()));
+    assert_eq!(got(&mut host, 9), Some(val(9).to_vec()));
+    assert_eq!(got(&mut host, 10), Some(val(10).to_vec()));
 }
 
 /// A batch's ops see the batch's own earlier ops. This is the difference
@@ -177,7 +232,11 @@ fn ops_inside_a_batch_see_the_batch_that_precedes_them() {
         ),
         Ok(4)
     );
-    assert_eq!(host.get(5), Some(val(3)), "the last word must win");
+    assert_eq!(
+        got(&mut host, 5),
+        Some(val(3).to_vec()),
+        "the last word must win"
+    );
     // Four slots consumed: two records, a tombstone, and a superseding
     // update. Nothing was elided just because it cancelled out.
     assert_eq!(host.engine.live_count(), 1);
@@ -186,8 +245,8 @@ fn ops_inside_a_batch_see_the_batch_that_precedes_them() {
     let disk = std::mem::take(&mut host.disk);
     let (mut host, _) = open(disk);
     assert_eq!(
-        host.get(5),
-        Some(val(3)),
+        got(&mut host, 5),
+        Some(val(3).to_vec()),
         "replay disagreed with the live engine about the last word"
     );
 }
@@ -200,7 +259,7 @@ fn remove_of_an_absent_row_costs_nothing_and_does_not_sink_the_batch() {
     let mut host = fresh();
     host.run(ClientOp::Insert {
         id: 1,
-        value: val(1),
+        value: arr(val(1)),
     });
     let before = host.engine.usage().0;
     assert_eq!(
@@ -216,7 +275,7 @@ fn remove_of_an_absent_row_costs_nothing_and_does_not_sink_the_batch() {
         "only the row that existed should be staged"
     );
     assert_eq!(host.engine.usage().0, before + 1);
-    assert_eq!(host.get(1), None);
+    assert_eq!(got(&mut host, 1), None);
 
     // A batch of nothing but absent removes is a no-op, and performs no
     // I/O at all: there is no generation to flip.
@@ -237,12 +296,12 @@ fn an_empty_batch_is_a_no_op_with_no_io_and_no_generation_flip() {
     let mut host = fresh();
     host.run(ClientOp::Insert {
         id: 1,
-        value: val(1),
+        value: arr(val(1)),
     });
     let io_before = host.io_count;
     assert_eq!(batch(&mut host, &[]), Ok(0));
     assert_eq!(host.io_count, io_before, "an empty batch performed I/O");
-    assert_eq!(host.get(1), Some(val(1)));
+    assert_eq!(got(&mut host, 1), Some(val(1).to_vec()));
 }
 
 // ---------------------------------------------------------------------
@@ -290,7 +349,7 @@ fn the_same_writes_done_singly_cost_two_fsyncs_each() {
     for i in 0..n {
         host.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     assert_eq!(host.n_fsyncs - fsyncs_before, 2 * n);
@@ -310,12 +369,12 @@ fn every_refusal_is_whole_and_performs_no_io() {
     for i in 0..4u64 {
         base.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     let disk = base.disk.clone();
 
-    let cases: Vec<(&str, Vec<BatchOp>, u8, DbError)> = vec![
+    let cases: Vec<(&str, Vec<BatchOp>, u16, DbError)> = vec![
         (
             "duplicate against a committed row",
             vec![
@@ -387,7 +446,7 @@ fn every_refusal_is_whole_and_performs_no_io() {
                     value: val(i),
                 })
                 .collect(),
-            MAX_COMMIT_ROWS as u8,
+            MAX_COMMIT_ROWS as u16,
             DbError::Full {
                 entity: "batch rows",
                 capacity: MAX_COMMIT_ROWS as u64,
@@ -410,13 +469,17 @@ fn every_refusal_is_whole_and_performs_no_io() {
         );
         // And the database is untouched and still usable.
         for i in 0..4u64 {
-            assert_eq!(host.get(i), Some(val(i)), "[{name}] id {i} changed");
+            assert_eq!(
+                got(&mut host, i),
+                Some(val(i).to_vec()),
+                "[{name}] id {i} changed"
+            );
         }
         assert!(
             matches!(
                 host.run(ClientOp::Insert {
                     id: 4242,
-                    value: val(4242)
+                    value: arr(val(4242))
                 }),
                 Driven::Done(Output::InsertDone { result: Ok(()), .. })
             ),
@@ -436,7 +499,7 @@ fn a_batch_that_overruns_capacity_is_refused_naming_the_op_that_does_not_fit() {
     for i in 0..4u64 {
         host.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     // Two slots left; ask for four.
@@ -460,7 +523,11 @@ fn a_batch_that_overruns_capacity_is_refused_naming_the_op_that_does_not_fit() {
     assert_eq!(host.io_count, io_before, "an overrunning batch wrote rows");
     // The two that WOULD have fit did not sneak in.
     for i in 10..14u64 {
-        assert_eq!(host.get(i), None, "id {i} was written by a refused batch");
+        assert_eq!(
+            got(&mut host, i),
+            None,
+            "id {i} was written by a refused batch"
+        );
     }
     // A batch that exactly fills the remaining room is accepted.
     assert_eq!(
@@ -499,7 +566,7 @@ fn a_crash_at_every_boundary_of_a_batch_is_all_or_nothing() {
         for i in 0..4u64 {
             base_host.run(ClientOp::Insert {
                 id: i,
-                value: val(i),
+                value: arr(val(i)),
             });
         }
         let base = std::mem::take(&mut base_host.disk);
@@ -536,14 +603,17 @@ fn a_crash_at_every_boundary_of_a_batch_is_all_or_nothing() {
 
                 let (mut host, live) = open(disk);
                 // Did the batch land? Every op must agree on the answer.
-                let applied = host.get(0) == Some(val(1000));
+                let applied = got(&mut host, 0) == Some(val(1000).to_vec());
                 for (k, op) in ops.iter().enumerate() {
                     let agrees = match *op {
                         BatchOp::Update { id, value } => {
-                            host.get(id) == Some(if applied { value } else { val(id) })
+                            let want = if applied { value } else { val(id) };
+                            got(&mut host, id) == Some(want.to_vec())
                         }
-                        BatchOp::Delete { id } => host.get(id).is_none() == applied,
-                        BatchOp::Insert { id, value } => host.get(id) == applied.then_some(value),
+                        BatchOp::Delete { id } => got(&mut host, id).is_none() == applied,
+                        BatchOp::Insert { id, value } => {
+                            got(&mut host, id) == applied.then(|| value.to_vec())
+                        }
                         BatchOp::Put { .. } | BatchOp::Remove { .. } => true,
                     };
                     assert!(
@@ -570,13 +640,17 @@ fn a_crash_at_every_boundary_of_a_batch_is_all_or_nothing() {
                 );
                 // Rows the batch never mentioned are untouched either way.
                 for i in 2..4u64 {
-                    assert_eq!(host.get(i), Some(val(i)), "[{ctx}] neighbour {i}");
+                    assert_eq!(
+                        got(&mut host, i),
+                        Some(val(i).to_vec()),
+                        "[{ctx}] neighbour {i}"
+                    );
                 }
                 // And the database still takes writes.
                 assert!(matches!(
                     host.run(ClientOp::Insert {
                         id: 900_001,
-                        value: val(7)
+                        value: arr(val(7))
                     }),
                     Driven::Done(Output::InsertDone { result: Ok(()), .. })
                 ));
@@ -594,7 +668,7 @@ fn an_io_failure_at_every_boundary_of_a_batch_fail_stops_cleanly() {
         for i in 0..3u64 {
             base_host.run(ClientOp::Insert {
                 id: i,
-                value: val(i),
+                value: arr(val(i)),
             });
         }
         let base = std::mem::take(&mut base_host.disk);
@@ -630,15 +704,19 @@ fn an_io_failure_at_every_boundary_of_a_batch_fail_stops_cleanly() {
             let applied = host.get(200).is_some();
             for i in 0..n as u64 {
                 assert_eq!(
-                    host.get(200 + i),
-                    applied.then(|| val(200 + i)),
+                    got(&mut host, 200 + i),
+                    applied.then(|| val(200 + i).to_vec()),
                     "[{ctx}] op {i} disagrees with the batch"
                 );
             }
             assert_eq!(live, if applied { 3 + n as u64 } else { 3 }, "[{ctx}]");
 
             for i in 0..3u64 {
-                assert_eq!(host.get(i), Some(val(i)), "[{ctx}] neighbour {i}");
+                assert_eq!(
+                    got(&mut host, i),
+                    Some(val(i).to_vec()),
+                    "[{ctx}] neighbour {i}"
+                );
             }
         }
     }
@@ -654,7 +732,7 @@ fn a_failed_batch_leaves_no_staged_effects_behind() {
     let mut host = fresh();
     host.run(ClientOp::Insert {
         id: 1,
-        value: val(1),
+        value: arr(val(1)),
     });
     host.fail_after = Some(host.io_count + 1);
     let ops = [
@@ -685,8 +763,12 @@ fn a_failed_batch_leaves_no_staged_effects_behind() {
     // And on reopen, the failed batch's delete did not happen.
     let disk = std::mem::take(&mut host.disk);
     let (mut host, _) = open(disk);
-    assert_eq!(host.get(1), Some(val(1)), "a failed batch deleted a row");
-    assert_eq!(host.get(2), None, "a failed batch inserted a row");
+    assert_eq!(
+        got(&mut host, 1),
+        Some(val(1).to_vec()),
+        "a failed batch deleted a row"
+    );
+    assert_eq!(got(&mut host, 2), None, "a failed batch inserted a row");
 }
 
 // ---------------------------------------------------------------------
@@ -702,7 +784,7 @@ fn an_interrupted_batch_is_never_mistaken_for_lost_acknowledged_data() {
         let mut base_host = fresh();
         base_host.run(ClientOp::Insert {
             id: 0,
-            value: val(0),
+            value: arr(val(0)),
         });
         let base = std::mem::take(&mut base_host.disk);
         let ops: Vec<BatchOp> = (0..n as u64)
@@ -746,7 +828,7 @@ fn two_complete_commits_past_the_manifest_are_still_reported_as_rollback() {
     for i in 0..4u64 {
         host.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     // Roll the superblock back to generation 1 / 2 rows by replaying the
@@ -758,7 +840,7 @@ fn two_complete_commits_past_the_manifest_are_still_reported_as_rollback() {
     for i in 0..2u64 {
         short.run(ClientOp::Insert {
             id: i,
-            value: val(i),
+            value: arr(val(i)),
         });
     }
     let mut disk = std::mem::take(&mut short.disk);
@@ -782,68 +864,85 @@ fn two_complete_commits_past_the_manifest_are_still_reported_as_rollback() {
 /// A long interleaved workload of batches and single writes, checked
 /// against a BTreeMap after every step and after every restart. If any
 /// batch is ever half-applied, the oracle diverges.
+/// A long interleaved workload of batches and single writes, over values
+/// of every length from empty to several slots, checked against a
+/// BTreeMap after every step and after every restart. If a batch is ever
+/// half-applied, or a long value ever comes back a slot short, the oracle
+/// diverges.
 #[test]
 fn batches_and_single_writes_track_a_btreemap_exactly_across_restarts() {
     for seed in 0..8u64 {
         let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut next = || {
+        let mut next = move || {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             rng
         };
-        let mut oracle: BTreeMap<u64, [u8; VALUE_LEN]> = BTreeMap::new();
+        // Lengths that straddle every interesting boundary: empty, inside
+        // one slot, exactly one slot, one byte over, and several slots.
+        let lengths = [0usize, 1, 15, 16, 17, 31, 32, 33, 100];
+        let mut oracle: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         let mut host = fresh();
+
+        let cost = |len: usize| (len.div_ceil(VALUE_LEN).max(1)) as u64;
 
         for step in 0..40 {
             let ctx = format!("seed={seed} step={step}");
             if next() % 3 == 0 {
                 // A batch. Build it against the oracle so it is legal by
                 // construction, then apply it to both.
-                let len = 1 + (next() % 6) as usize;
-                let mut ops = Vec::with_capacity(len);
+                let n = 1 + (next() % 6) as usize;
+                let mut ops = Vec::with_capacity(n);
                 let mut shadow = oracle.clone();
-                for _ in 0..len {
+                let mut rows = 0u64;
+                for _ in 0..n {
                     let id = next() % 24;
-                    let v = val(next());
+                    let len = lengths[(next() % lengths.len() as u64) as usize];
+                    let v = long_val(next(), len);
                     match next() % 4 {
                         0 if shadow.contains_key(&id) => {
                             ops.push(BatchOp::Delete { id });
                             shadow.remove(&id);
+                            rows += 1;
                         }
                         1 if shadow.contains_key(&id) => {
                             ops.push(BatchOp::Update { id, value: v });
-                            shadow.insert(id, v);
+                            shadow.insert(id, v.to_vec());
+                            rows += cost(len);
                         }
                         _ => {
                             ops.push(BatchOp::Put { id, value: v });
-                            shadow.insert(id, v);
+                            shadow.insert(id, v.to_vec());
+                            rows += cost(len);
                         }
                     }
                 }
-                if host.engine.usage().0 + ops.len() as u64 > CAPS.rows {
+                if host.engine.usage().0 + rows > CAPS.rows || rows as usize > MAX_COMMIT_ROWS {
                     continue;
                 }
-                assert_eq!(batch(&mut host, &ops), Ok(ops.len() as u64), "[{ctx}]");
+                assert_eq!(batch(&mut host, &ops), Ok(rows), "[{ctx}]");
                 oracle = shadow;
             } else {
                 let id = next() % 24;
-                let v = val(next());
-                if host.engine.usage().0 + 1 > CAPS.rows {
+                let len = lengths[(next() % lengths.len() as u64) as usize];
+                let v = long_val(next(), len);
+                if host.engine.usage().0 + cost(len) > CAPS.rows {
                     continue;
                 }
-                if oracle.contains_key(&id) {
-                    host.run(ClientOp::Update { id, value: v });
+                let op = if oracle.contains_key(&id) {
+                    BatchOp::Update { id, value: v }
                 } else {
-                    host.run(ClientOp::Insert { id, value: v });
-                }
-                oracle.insert(id, v);
+                    BatchOp::Insert { id, value: v }
+                };
+                assert_eq!(batch(&mut host, &[op]), Ok(cost(len)), "[{ctx}]");
+                oracle.insert(id, v.to_vec());
             }
 
             for id in 0..24u64 {
                 assert_eq!(
-                    host.get(id),
-                    oracle.get(&id).copied(),
+                    got(&mut host, id),
+                    oracle.get(&id).cloned(),
                     "[{ctx}] id {id} diverged from the oracle"
                 );
             }
@@ -858,8 +957,8 @@ fn batches_and_single_writes_track_a_btreemap_exactly_across_restarts() {
                 assert!(live >= oracle.len() as u64);
                 for id in 0..24u64 {
                     assert_eq!(
-                        host.get(id),
-                        oracle.get(&id).copied(),
+                        got(&mut host, id),
+                        oracle.get(&id).cloned(),
                         "[{ctx}] id {id} diverged after restart"
                     );
                 }

@@ -125,7 +125,7 @@ fn hundred_thousand_rows_on_real_files() {
     for id in (0..N).step_by(997) {
         assert!(matches!(
             reopened.get(id),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == value_for(id)
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == value_for(id)
         ));
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -196,7 +196,7 @@ fn salvage_and_repair_at_a_hundred_thousand_rows() {
             Output::GetDone {
                 result: Ok(Some(v)),
                 ..
-            } => assert_eq!(v, value_for(id)),
+            } => assert_eq!(v.payload(), value_for(id)),
             other => panic!("survivor {id}: {other:?}"),
         }
     }
@@ -229,9 +229,13 @@ fn salvage_and_repair_at_a_hundred_thousand_rows() {
             other => panic!("rebuilt get {id}: {other:?}"),
         };
         if victims.contains(&id) {
-            assert_eq!(got, None, "row {id} was resurrected");
+            assert!(got.is_none(), "row {id} was resurrected");
         } else {
-            assert_eq!(got, Some(value_for(id)), "rebuilt row {id}");
+            assert_eq!(
+                got.map(|w| w.bytes),
+                Some(value_for(id)),
+                "rebuilt row {id}"
+            );
         }
     }
 

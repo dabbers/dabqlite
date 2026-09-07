@@ -142,7 +142,7 @@ fn oom_at_init_is_a_crash_before_the_first_write() {
     for &(id, value) in &acked {
         assert!(matches!(
             host.get(id),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == value
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == value
         ));
     }
     std::fs::remove_dir_all(&dir).ok();

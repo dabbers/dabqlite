@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 
 use crate::btree::BTreeIndex;
 use crate::layout::{
-    decode_row, decode_sb, encode_row, encode_sb, RowKind, SbDecodeError, MAX_COMMIT_ROWS,
+    decode_row, decode_sb, encode_row, encode_sb, RowKind, RowSlot, SbDecodeError, MAX_COMMIT_ROWS,
     ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,
 };
 use crate::trigram::TrigramIndex;
@@ -112,12 +112,93 @@ pub enum DbError {
     /// Rebuild with the inspector's `--repair-to` to return to a clean
     /// database.
     Degraded { quarantined: u64 },
+    /// The value is longer than a single commit can carry. A value is
+    /// stored as a run of row slots inside ONE commit, so its ceiling is
+    /// the longest commit the format can describe (see `MAX_VALUE_LEN`).
+    /// Anything larger belongs in object storage with a reference here.
+    ValueTooLong { len: u32, max: u32 },
     /// The host reported an I/O error on this file. The engine fail-stops
     /// (TigerBeetle-style): the in-flight operation is failed, all further
     /// operations are rejected, and the host must restart and re-open. The
     /// partially-performed operation resolves to all-or-nothing at recovery,
     /// exactly like a crash.
     IoFailed { file: FileId },
+}
+
+/// The longest value this store will hold.
+///
+/// A value too long for one row slot is written as a run of slots inside
+/// ONE commit — that is what makes a long value atomic — so its ceiling is
+/// the longest commit the row format can describe. Larger payloads belong
+/// in object storage with a reference stored here (docs/DESIGN.md §4.5).
+pub const MAX_VALUE_LEN: usize = VALUE_LEN * MAX_COMMIT_ROWS;
+
+/// A bounded window onto a value, which may be longer than one row.
+///
+/// Reads are windowed rather than whole because every buffer the core
+/// touches is fixed-size (docs/DESIGN.md §4.5): a long value comes back as
+/// a sequence of windows, never as one allocation the core had to make.
+/// `total` is the value's full length, so a caller knows on the FIRST
+/// window how much there is and can never mistake a prefix for the whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueWindow {
+    /// The whole value's length in bytes.
+    pub total: u32,
+    /// Where this window starts within the value.
+    pub offset: u32,
+    /// Bytes valid in `bytes`.
+    pub len: u8,
+    pub bytes: [u8; VALUE_LEN],
+}
+
+impl ValueWindow {
+    /// The bytes this window carries.
+    pub fn payload(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+    /// Where the next window starts, or `None` when this one ends the
+    /// value.
+    pub fn next_offset(&self) -> Option<u32> {
+        let end = self.offset + self.len as u32;
+        (end < self.total).then_some(end)
+    }
+    /// The whole value, when it fits in one window. `None` means the
+    /// value is longer than a row and the caller must read the rest —
+    /// deliberately not a truncated `&[u8]`, so a prefix cannot be
+    /// mistaken for the value.
+    pub fn whole(&self) -> Option<&[u8]> {
+        (self.total == self.len as u32).then(|| self.payload())
+    }
+}
+
+/// One row of a scan result: the id, the value's full length, and as much
+/// of the value as fits in a row.
+///
+/// Pages carry the LENGTH as well as the bytes so that a value too long
+/// for one row is visibly partial rather than silently truncated — the
+/// caller either gets the whole thing from [`RowRef::value`] or gets
+/// `None` and reads it properly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRef {
+    pub id: u64,
+    /// The value's full length, which may exceed `VALUE_LEN`.
+    pub len: u32,
+    /// The value's first `min(len, VALUE_LEN)` bytes.
+    pub head: [u8; VALUE_LEN],
+}
+
+impl RowRef {
+    const EMPTY: RowRef = RowRef {
+        id: 0,
+        len: 0,
+        head: [0; VALUE_LEN],
+    };
+
+    /// The whole value, when it fits in one row; `None` when it spans
+    /// several and must be read with `Input::GetFrom`.
+    pub fn value(&self) -> Option<&[u8]> {
+        (self.len as usize <= VALUE_LEN).then(|| &self.head[..self.len as usize])
+    }
 }
 
 /// One operation inside an atomic batch (`Input::Batch`).
@@ -127,16 +208,16 @@ pub enum DbError {
 /// batch becomes durable under ONE superblock flip, so the batch lands
 /// whole or not at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchOp {
+pub enum BatchOp<'a> {
     /// Add a row; refuses the batch if the id is already live.
-    Insert { id: u64, value: [u8; VALUE_LEN] },
+    Insert { id: u64, value: &'a [u8] },
     /// Replace a live row's value; refuses the batch if the id is absent.
-    Update { id: u64, value: [u8; VALUE_LEN] },
+    Update { id: u64, value: &'a [u8] },
     /// Insert or replace, whichever applies. Resolved during validation
     /// against the state the batch's earlier ops would leave, so it is
     /// exact: no read-then-write race can open between the decision and
     /// the commit, because there is no gap to race in.
-    Put { id: u64, value: [u8; VALUE_LEN] },
+    Put { id: u64, value: &'a [u8] },
     /// Delete a live row; refuses the batch if the id is absent.
     Delete { id: u64 },
     /// Delete the row if it is there, and do nothing if it is not. Stages
@@ -155,7 +236,7 @@ pub enum BatchOp {
 /// the error that operation would have returned on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchReject {
-    pub at: u8,
+    pub at: u16,
     pub error: DbError,
 }
 
@@ -164,19 +245,26 @@ pub struct BatchReject {
 /// itself is a straight-line application with nothing left to decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchEffect {
-    Insert {
+    /// A value written into `rows` consecutive slots starting at `at`: a
+    /// head row plus however many continuations the value needs.
+    /// `supersedes` is the slot whose record this retires, which is what
+    /// distinguishes a replacement from a fresh insert.
+    Store {
         id: u64,
-        value: [u8; VALUE_LEN],
+        /// The slot this effect's HEAD row occupies. Carried rather than
+        /// derived from the effect's position, because effects no longer
+        /// take one slot each: a value spanning three slots moves every
+        /// effect after it along by three.
+        at: u64,
+        rows: u16,
+        supersedes: Option<u64>,
     },
-    Update {
-        id: u64,
-        value: [u8; VALUE_LEN],
-        /// The slot whose record this supersedes.
-        old_row: u64,
-    },
+    /// A tombstone retiring `record_row`. One slot.
     Delete {
         id: u64,
-        /// The slot holding the record this tombstone retires.
+        /// The slot this tombstone occupies.
+        at: u64,
+        /// The slot holding the head row this tombstone retires.
         record_row: u64,
     },
 }
@@ -184,14 +272,18 @@ enum BatchEffect {
 impl BatchEffect {
     fn id(self) -> u64 {
         match self {
-            BatchEffect::Insert { id, .. }
-            | BatchEffect::Update { id, .. }
-            | BatchEffect::Delete { id, .. } => id,
+            BatchEffect::Store { id, .. } | BatchEffect::Delete { id, .. } => id,
+        }
+    }
+    /// The slot this effect's head row occupies.
+    fn at(self) -> u64 {
+        match self {
+            BatchEffect::Store { at, .. } | BatchEffect::Delete { at, .. } => at,
         }
     }
     /// Does this effect leave `id` live in the slot it occupies?
     fn leaves_live(self) -> bool {
-        !matches!(self, BatchEffect::Delete { .. })
+        matches!(self, BatchEffect::Store { .. })
     }
 }
 
@@ -286,9 +378,15 @@ pub enum Input<'a> {
     ///
     /// An empty batch commits nothing and is `Ok`: there is no generation
     /// to flip and nothing to make durable.
-    Batch { ops: &'a [BatchOp] },
-    /// Client: fetch a row by primary key.
+    Batch { ops: &'a [BatchOp<'a>] },
+    /// Client: fetch a row by primary key. Returns the FIRST window of
+    /// the value, which carries the value's whole length, so a caller can
+    /// tell in one call whether there is more to read.
     Get { id: u64 },
+    /// Client: continue reading a value from `offset`. `offset` must be a
+    /// multiple of the row width — the boundaries `Get` and earlier
+    /// windows hand back — so a window never straddles two slots.
+    GetFrom { id: u64, offset: u32 },
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
     /// call. Continue by re-issuing with `lo = page.next`.
     Range { lo: u64, hi: u64 },
@@ -341,10 +439,12 @@ pub enum Output {
         rows: u64,
         result: Result<(), BatchReject>,
     },
-    /// Get finished (pure in-memory lookup, always immediate).
+    /// Get finished (pure in-memory lookup, always immediate). `None`
+    /// means the id is absent; a window carries the value's whole length
+    /// alongside the bytes it holds.
     GetDone {
         id: u64,
-        result: Result<Option<[u8; VALUE_LEN]>, DbError>,
+        result: Result<Option<ValueWindow>, DbError>,
     },
     /// Range page finished (pure in-memory, always immediate).
     RangeDone { result: Result<RangePage, DbError> },
@@ -372,7 +472,7 @@ pub const FIND_PAGE: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub struct FindPage {
-    pub items: [(u64, [u8; VALUE_LEN]); FIND_PAGE],
+    pub items: [RowRef; FIND_PAGE],
     pub count: u8,
     pub next: Option<u64>,
     /// True when the database is open in salvage mode with quarantined
@@ -385,7 +485,7 @@ pub struct FindPage {
 /// One bounded page of a range scan, in strictly ascending key order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangePage {
-    pub items: [(u64, [u8; VALUE_LEN]); RANGE_PAGE],
+    pub items: [RowRef; RANGE_PAGE],
     pub count: u8,
     /// `Some(k)`: more rows exist; continue with `lo = k`.
     pub next: Option<u64>,
@@ -471,7 +571,7 @@ enum State {
     /// flight. Rows are written one at a time, in order, so a crash can
     /// only ever leave a PREFIX of the batch on disk — which is what
     /// makes the span bytes enough for recovery to recognize it.
-    BatchWriteRow { next: u8 },
+    BatchWriteRow { next: u16 },
     /// Batch: rows-file fsync in flight — one fsync for the whole batch,
     /// covering every row it wrote.
     BatchFsyncRows,
@@ -558,6 +658,10 @@ pub struct Engine {
     /// can describe, and only ever cleared and refilled, so a batch — like
     /// everything else here — allocates nothing at run time.
     batch: Vec<BatchEffect>,
+    /// Row slots the in-flight batch stages. Not derivable from
+    /// `batch.len()` any more: one effect may hold a value spanning
+    /// several slots.
+    batch_rows: u16,
     /// One bit per row slot: set when that slot holds a LIVE record.
     /// Cleared when a tombstone retires it, and never set for a tombstone
     /// slot itself. Derived state, sized at init like every other arena —
@@ -572,6 +676,15 @@ pub struct Engine {
     retired: u64,
     /// Deletion slots. Also dead weight, and also compacted by a rebuild.
     tombstones: u64,
+    /// Continuation slots: the second and later rows of values too long
+    /// for one slot. Not records and not deletions, but every slot has to
+    /// be accounted for somewhere or the counting invariant is a lie.
+    chunks: u64,
+    /// Head rows whose value spans more than one slot. While this is
+    /// nonzero, substring search takes the exhaustive path: the trigram
+    /// index only holds single-slot values, so a chain walk would be a
+    /// SUPERSET of the answer no longer (see `find_page`).
+    long_values: u64,
     /// Salvage mode was requested at open: verification failures quarantine
     /// a row instead of failing the whole database.
     salvage: bool,
@@ -695,10 +808,13 @@ impl Engine {
             pending_delete: None,
             pending_update: None,
             batch: batch_staging,
+            batch_rows: 0,
             live_bits: vec![0u64; (caps.rows as usize).div_ceil(64)],
             live_count: 0,
             retired: 0,
             tombstones: 0,
+            chunks: 0,
+            long_values: 0,
             salvage: false,
             quarantined: 0,
             arena,
@@ -755,21 +871,29 @@ impl Engine {
         self.quarantined
     }
 
-    /// The row indices that ARE readable, ascending. The basis of a rebuild:
-    /// exactly the rows a clean database should contain.
-    pub fn live_rows(&self) -> impl Iterator<Item = (u64, [u8; VALUE_LEN])> + '_ {
+    /// The readable values, ascending by row. The basis of a rebuild:
+    /// exactly the rows a clean database should contain, each with its
+    /// WHOLE value — a rebuild that copied only a long value's head row
+    /// would write the truncation it was meant to repair.
+    pub fn live_rows(&self) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
         (0..self.row_count).filter_map(move |row| {
             let off = (row as usize) * ROW_SIZE;
             if !self.is_live(row) {
                 return None;
             }
-            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])?.record()?;
+            let (id, _) = decode_row(&self.arena[off..off + ROW_SIZE])?.record()?;
             // Quarantined slots were never copied into the arena, so they
             // hold zeros — which `decode_row` rejects, since the checksum
             // of 24 zero bytes is not zero. The index check is the belt to
             // that braces: a slot is live only if the index agrees THIS row
             // is where that id lives.
-            (self.index_lookup(id) == Some(row)).then_some((id, value))
+            if self.index_lookup(id) != Some(row) {
+                return None;
+            }
+            let (rows, _) = self.value_extent(row);
+            let mut buf = [0u8; MAX_VALUE_LEN];
+            let len = self.assemble_from_arena(row, rows, &mut buf);
+            Some((id, buf[..len].to_vec()))
         })
     }
 
@@ -836,9 +960,9 @@ impl Engine {
             // inserted: at least the live ones, at most one per slot.
             debug_assert!(self.live_count <= self.ordered.len());
             debug_assert!(self.ordered.len() <= self.row_count);
-            // Slots are records plus deletions, exactly.
+            // Slots are records, deletions and continuations, exactly.
             debug_assert_eq!(
-                self.live_count + self.retired + self.tombstones,
+                self.live_count + self.retired + self.tombstones + self.chunks,
                 self.row_count
             );
         }
@@ -943,6 +1067,7 @@ impl Engine {
             Input::Delete { id } => self.on_delete(id),
             Input::Batch { ops } => self.on_batch(ops),
             Input::Get { id } => self.on_get(id),
+            Input::GetFrom { id, offset } => self.read_window(id, offset),
             Input::Range { lo, hi } => self.on_range(lo, hi),
             Input::Find {
                 needle,
@@ -1160,12 +1285,21 @@ impl Engine {
         self.live_count = 0;
         self.retired = 0;
         self.tombstones = 0;
+        self.chunks = 0;
+        self.long_values = 0;
         self.live_bits.fill(0);
-        // The rows file IS the commit order — one slot appended per commit,
-        // records and deletions alike — so replaying it in order replays
-        // history exactly. An id may be inserted, deleted, and inserted
-        // again; the last word wins because it is last.
+        // Rows already consumed as part of a value's run. A value is read
+        // whole, at its head, so its continuations are not visited again.
+        let mut skip_until = 0u64;
+        // The rows file IS the commit order — one run of slots appended
+        // per commit, records, deletions and continuations alike — so
+        // replaying it in order replays history exactly. An id may be
+        // inserted, deleted, and inserted again; the last word wins
+        // because it is last.
         for row in 0..row_count {
+            if row < skip_until {
+                continue;
+            }
             let off = (row as usize) * ROW_SIZE;
             let chunk = &data[off..off + ROW_SIZE];
             // Pair assertion (docs/DESIGN.md §7.4): rows were verified when
@@ -1184,53 +1318,77 @@ impl Engine {
             };
             let id = slot.id;
             match slot.kind {
-                RowKind::Record => {
-                    // A second record for an id that is CURRENTLY live is a
-                    // duplicate. One whose record was retired is simply the
-                    // id being used again, which is ordinary history.
-                    if self.live_row_of(id).is_some() {
+                RowKind::Record | RowKind::Update => {
+                    // The value's whole run has to be read before any of it
+                    // can be trusted: a value is only ever written whole,
+                    // so a run that does not end where it promised is not
+                    // one this engine wrote, and serving its head alone
+                    // would be serving a value truncated.
+                    let extent = self.verify_run(data, row, row_count, &slot);
+                    let Some(rows) = extent else {
                         if self.salvage {
-                            // Keep the first occurrence; the later duplicate
-                            // is the damaged one as far as anyone can tell.
-                            self.quarantined += 1;
-                            self.trigram.skip_row(row);
+                            // The head and every continuation that was
+                            // supposed to follow it are unreadable together.
+                            let broken = self.broken_run_len(data, row, row_count, &slot);
+                            for r in row..row + broken {
+                                self.quarantined += 1;
+                                self.trigram.skip_row(r);
+                            }
+                            skip_until = row + broken;
                             continue;
                         }
                         return self.fail_open(DbError::Corrupt {
-                            what: crate::defect::DUPLICATE_ID,
-                        });
-                    }
-                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
-                    self.bind_indices(id, row);
-                    self.trigram.insert(row, &slot.value);
-                    self.set_live(row, true);
-                    self.live_count += 1;
-                }
-                RowKind::Update => {
-                    // Supersede: legitimate only for an id that IS live.
-                    let Some(old_row) = self.live_row_of(id) else {
-                        if self.salvage {
-                            self.quarantined += 1;
-                            self.trigram.skip_row(row);
-                            continue;
-                        }
-                        return self.fail_open(DbError::Corrupt {
-                            what: crate::defect::ORPHAN_UPDATE,
+                            what: crate::defect::TRUNCATED_VALUE,
                         });
                     };
-                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
-                    self.set_live(old_row, false);
-                    self.retired += 1;
+                    let duplicate = slot.kind == RowKind::Record && self.live_row_of(id).is_some();
+                    let orphan = slot.kind == RowKind::Update && self.live_row_of(id).is_none();
+                    if duplicate || orphan {
+                        if self.salvage {
+                            // Keep the first occurrence; the later
+                            // duplicate is the damaged one as far as
+                            // anyone can tell. Either way the whole value
+                            // goes, not just its head.
+                            for r in row..row + rows {
+                                self.quarantined += 1;
+                                self.trigram.skip_row(r);
+                            }
+                            skip_until = row + rows;
+                            continue;
+                        }
+                        return self.fail_open(DbError::Corrupt {
+                            what: if duplicate {
+                                crate::defect::DUPLICATE_ID
+                            } else {
+                                crate::defect::ORPHAN_UPDATE
+                            },
+                        });
+                    }
+                    if let Some(old_row) = self.live_row_of(id) {
+                        self.set_live(old_row, false);
+                        self.retired += 1;
+                    } else {
+                        self.live_count += 1;
+                    }
+                    for r in row..row + rows {
+                        let o = (r as usize) * ROW_SIZE;
+                        self.arena[o..o + ROW_SIZE].copy_from_slice(&data[o..o + ROW_SIZE]);
+                    }
                     self.bind_indices(id, row);
-                    self.trigram.insert(row, &slot.value);
                     self.set_live(row, true);
+                    self.chunks += rows - 1;
+                    if rows > 1 {
+                        self.long_values += 1;
+                    }
+                    let mut value = [0u8; MAX_VALUE_LEN];
+                    let len = self.assemble_from_arena(row, rows, &mut value);
+                    self.trigram.insert_value(row, rows, &value[..len]);
+                    skip_until = row + rows;
                 }
                 RowKind::Chunk => {
-                    // The engine writes a chunk only directly after the row
-                    // it continues, in the same commit. Nothing here can
-                    // continue it — this replay has not yet grown the
-                    // ability to attach one — so a chunk at this point is
-                    // evidence of damage or of a file we did not write.
+                    // Reached only when nothing in front of it claimed it:
+                    // every well-formed continuation is consumed with its
+                    // head, above.
                     if self.salvage {
                         self.quarantined += 1;
                         self.trigram.skip_row(row);
@@ -1244,7 +1402,9 @@ impl Engine {
                     // A deletion of something not live cannot be produced by
                     // the engine (it refuses `NotFound` before any I/O), so
                     // it is evidence of damage or of a file we did not write.
-                    let Some(record_row) = self.live_row_of(id) else {
+                    // Neither can a deletion that claims to continue.
+                    let record_row = self.live_row_of(id).filter(|_| !slot.more);
+                    let Some(record_row) = record_row else {
                         if self.salvage {
                             self.quarantined += 1;
                             self.trigram.skip_row(row);
@@ -1254,7 +1414,8 @@ impl Engine {
                             what: crate::defect::ORPHAN_TOMBSTONE,
                         });
                     };
-                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
+                    let off = (row as usize) * ROW_SIZE;
+                    self.arena[off..off + ROW_SIZE].copy_from_slice(&data[off..off + ROW_SIZE]);
                     self.set_live(record_row, false);
                     self.live_count -= 1;
                     self.retired += 1;
@@ -1366,7 +1527,7 @@ impl Engine {
             .expect("fixed slice");
         // Span 0: a single-row commit, the only kind these three paths
         // make. `Input::Batch` is where a span above 0 comes from.
-        encode_row(RowKind::Update, 0, VALUE_LEN as u8, id, &value, slot);
+        encode_row(RowKind::Update, 0, VALUE_LEN as u8, false, id, &value, slot);
         self.pending_update = Some((id, value, old_row));
         self.state = State::UpdateWriteRow;
         Output::Write {
@@ -1408,7 +1569,7 @@ impl Engine {
             .expect("fixed slice");
         // A tombstone carries no payload at all: len 0, so every byte of
         // its value field is padding the decoder will never hand back.
-        encode_row(RowKind::Tombstone, 0, 0, id, &[0u8; VALUE_LEN], slot);
+        encode_row(RowKind::Tombstone, 0, 0, false, id, &[0u8; VALUE_LEN], slot);
         self.pending_delete = Some((id, record_row));
         self.state = State::DeleteWriteRow;
         Output::Write {
@@ -1449,7 +1610,7 @@ impl Engine {
         let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
             .try_into()
             .expect("fixed slice");
-        encode_row(RowKind::Record, 0, VALUE_LEN as u8, id, &value, slot);
+        encode_row(RowKind::Record, 0, VALUE_LEN as u8, false, id, &value, slot);
         self.pending = Some((id, value));
         self.state = State::InsertWriteRow;
         Output::Write {
@@ -1511,11 +1672,11 @@ impl Engine {
     /// batch itself freed — while `insert 5; insert 5` has to be a
     /// duplicate. Validating each op against the committed state alone
     /// would get both backwards.
-    fn projected_live_row(&self, staged: usize, base_row: u64, id: u64) -> Option<u64> {
+    fn projected_live_row(&self, staged: usize, id: u64) -> Option<u64> {
         for i in (0..staged).rev() {
             let effect = self.batch[i];
             if effect.id() == id {
-                return effect.leaves_live().then_some(base_row + i as u64);
+                return effect.leaves_live().then_some(effect.at());
             }
         }
         self.live_row_of(id)
@@ -1545,7 +1706,7 @@ impl Engine {
             return Output::BatchDone {
                 rows: 0,
                 result: Err(BatchReject {
-                    at: MAX_COMMIT_ROWS as u8,
+                    at: MAX_COMMIT_ROWS as u16,
                     error: DbError::Full {
                         entity: "batch rows",
                         capacity: MAX_COMMIT_ROWS as u64,
@@ -1560,18 +1721,47 @@ impl Engine {
         // no partial work behind and needs no unwinding.
         let base = self.row_count;
         self.batch.clear();
+        let mut staged_rows = 0u16;
+        // One slice per STAGED effect, so the staging pass below can find
+        // each value's bytes without re-deciding which ops staged
+        // anything. A fixed-size stack array, not a `Vec`: the engine
+        // allocates once, at init, and never again.
+        let mut payloads: [&[u8]; MAX_COMMIT_ROWS] = [&[]; MAX_COMMIT_ROWS];
         for (i, op) in ops.iter().enumerate() {
-            // Slots are consumed by STAGED rows, not by ops: a `Remove` of
-            // an absent id stages nothing and costs nothing.
-            let row = base + self.batch.len() as u64;
             let reject = |at: usize, error: DbError| Output::BatchDone {
                 rows: 0,
                 result: Err(BatchReject {
-                    at: at as u8,
+                    at: at as u16,
                     error,
                 }),
             };
-            if row >= self.caps.rows {
+            // Slots are consumed by STAGED rows, not by ops: a `Remove` of
+            // an absent id stages nothing, and a long value stages several.
+            let row = base + staged_rows as u64;
+            let bytes = match *op {
+                BatchOp::Insert { value, .. }
+                | BatchOp::Update { value, .. }
+                | BatchOp::Put { value, .. } => value,
+                BatchOp::Delete { .. } | BatchOp::Remove { .. } => &[][..],
+            };
+            if bytes.len() > MAX_VALUE_LEN {
+                self.batch.clear();
+                return reject(
+                    i,
+                    DbError::ValueTooLong {
+                        len: bytes.len() as u32,
+                        max: MAX_VALUE_LEN as u32,
+                    },
+                );
+            }
+            // A value occupies one slot per row-width of bytes, and at
+            // least one slot even when empty: a zero-length value is still
+            // a value, and needs a row to say so.
+            let need = match *op {
+                BatchOp::Delete { .. } | BatchOp::Remove { .. } => 1u16,
+                _ => bytes.len().div_ceil(VALUE_LEN).max(1) as u16,
+            };
+            if row + need as u64 > self.caps.rows {
                 self.batch.clear();
                 return reject(
                     i,
@@ -1581,49 +1771,76 @@ impl Engine {
                     },
                 );
             }
+            // The whole commit, not just one value, is bounded by what the
+            // span byte can describe.
+            if staged_rows as usize + need as usize > MAX_COMMIT_ROWS {
+                self.batch.clear();
+                return reject(
+                    i,
+                    DbError::Full {
+                        entity: "batch rows",
+                        capacity: MAX_COMMIT_ROWS as u64,
+                    },
+                );
+            }
             let effect = match *op {
-                BatchOp::Insert { id, value } => {
-                    if self
-                        .projected_live_row(self.batch.len(), base, id)
-                        .is_some()
-                    {
+                BatchOp::Insert { id, .. } => {
+                    if self.projected_live_row(self.batch.len(), id).is_some() {
                         self.batch.clear();
                         return reject(i, DbError::DuplicateId { id });
                     }
-                    BatchEffect::Insert { id, value }
-                }
-                BatchOp::Update { id, value } => {
-                    match self.projected_live_row(self.batch.len(), base, id) {
-                        Some(old_row) => BatchEffect::Update { id, value, old_row },
-                        None => {
-                            self.batch.clear();
-                            return reject(i, DbError::NotFound { id });
-                        }
+                    BatchEffect::Store {
+                        id,
+                        at: row,
+                        rows: need,
+                        supersedes: None,
                     }
                 }
-                BatchOp::Put { id, value } => {
-                    match self.projected_live_row(self.batch.len(), base, id) {
-                        Some(old_row) => BatchEffect::Update { id, value, old_row },
-                        None => BatchEffect::Insert { id, value },
-                    }
-                }
-                BatchOp::Delete { id } => match self.projected_live_row(self.batch.len(), base, id)
-                {
-                    Some(record_row) => BatchEffect::Delete { id, record_row },
+                BatchOp::Update { id, .. } => match self.projected_live_row(self.batch.len(), id) {
+                    Some(old_row) => BatchEffect::Store {
+                        id,
+                        at: row,
+                        rows: need,
+                        supersedes: Some(old_row),
+                    },
                     None => {
                         self.batch.clear();
                         return reject(i, DbError::NotFound { id });
                     }
                 },
-                BatchOp::Remove { id } => match self.projected_live_row(self.batch.len(), base, id)
-                {
-                    Some(record_row) => BatchEffect::Delete { id, record_row },
-                    // Nothing to remove: stage no row at all. The batch
-                    // stays as long as it needs to be and no longer.
-                    None => continue,
+                BatchOp::Put { id, .. } => BatchEffect::Store {
+                    id,
+                    at: row,
+                    rows: need,
+                    supersedes: self.projected_live_row(self.batch.len(), id),
                 },
+                BatchOp::Delete { id } => match self.projected_live_row(self.batch.len(), id) {
+                    Some(record_row) => BatchEffect::Delete {
+                        id,
+                        at: row,
+                        record_row,
+                    },
+                    None => {
+                        self.batch.clear();
+                        return reject(i, DbError::NotFound { id });
+                    }
+                },
+                BatchOp::Remove { id } => {
+                    match self.projected_live_row(self.batch.len(), id) {
+                        Some(record_row) => BatchEffect::Delete {
+                            id,
+                            at: row,
+                            record_row,
+                        },
+                        // Nothing to remove: stage no row at all. The batch
+                        // stays as long as it needs to be and no longer.
+                        None => continue,
+                    }
+                }
             };
+            payloads[self.batch.len()] = bytes;
             self.batch.push(effect);
+            staged_rows += need;
         }
 
         // Every op turned out to be a no-op (a batch of `Remove`s for ids
@@ -1639,27 +1856,82 @@ impl Engine {
         // Stage every row in its arena slot, carrying the span that tells
         // recovery how many rows travel with it. They become visible only
         // when the superblock generation flips, all at once.
-        let n = self.batch.len();
-        for i in 0..n {
-            let (kind, len, id, value) = match self.batch[i] {
-                BatchEffect::Insert { id, value } => (RowKind::Record, VALUE_LEN as u8, id, value),
-                BatchEffect::Update { id, value, .. } => {
-                    (RowKind::Update, VALUE_LEN as u8, id, value)
+        let mut row = base;
+        for (effect, bytes) in self.batch.clone().iter().zip(payloads.iter()) {
+            match *effect {
+                BatchEffect::Store {
+                    id,
+                    at,
+                    rows,
+                    supersedes,
+                } => {
+                    debug_assert_eq!(at, row, "staging disagrees with validation");
+                    let head_kind = if supersedes.is_some() {
+                        RowKind::Update
+                    } else {
+                        RowKind::Record
+                    };
+                    for k in 0..rows as usize {
+                        let from = (k * VALUE_LEN).min(bytes.len());
+                        let n = (bytes.len() - from).min(VALUE_LEN);
+                        let mut value = [0u8; VALUE_LEN];
+                        value[..n].copy_from_slice(&bytes[from..from + n]);
+                        let kind = if k == 0 { head_kind } else { RowKind::Chunk };
+                        // The last row of the value says so; every earlier
+                        // one says the value continues.
+                        let more = k + 1 < rows as usize;
+                        self.stage_row(row, kind, staged_rows, base, n as u8, more, id, &value);
+                        row += 1;
+                    }
                 }
-                BatchEffect::Delete { id, .. } => (RowKind::Tombstone, 0, id, [0u8; VALUE_LEN]),
-            };
-            let off = (base as usize + i) * ROW_SIZE;
-            let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
-                .try_into()
-                .expect("fixed slice");
-            encode_row(kind, (n - 1 - i) as u8, len, id, &value, slot);
+                BatchEffect::Delete { id, at, .. } => {
+                    debug_assert_eq!(at, row, "staging disagrees with validation");
+                    // A tombstone carries no payload: len 0, so every byte
+                    // of its value field is padding.
+                    self.stage_row(
+                        row,
+                        RowKind::Tombstone,
+                        staged_rows,
+                        base,
+                        0,
+                        false,
+                        id,
+                        &[0; VALUE_LEN],
+                    );
+                    row += 1;
+                }
+            }
         }
+        debug_assert_eq!(row - base, staged_rows as u64, "staging lost a row");
+        self.batch_rows = staged_rows;
         self.state = State::BatchWriteRow { next: 0 };
         self.batch_row_write(0)
     }
 
+    /// Encode one staged row into its arena slot. `total` is the whole
+    /// commit's row count, from which the span counts down.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_row(
+        &mut self,
+        row: u64,
+        kind: RowKind,
+        total: u16,
+        base: u64,
+        len: u8,
+        more: bool,
+        id: u64,
+        value: &[u8; VALUE_LEN],
+    ) {
+        let span = (total as u64 - 1 - (row - base)) as u8;
+        let off = (row as usize) * ROW_SIZE;
+        let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
+            .try_into()
+            .expect("fixed slice");
+        encode_row(kind, span, len, more, id, value, slot);
+    }
+
     /// The write request for batch-relative row `next`.
-    fn batch_row_write(&self, next: u8) -> Output {
+    fn batch_row_write(&self, next: u16) -> Output {
         let off = (self.row_count as usize + next as usize) * ROW_SIZE;
         Output::Write {
             file: FileId::Rows,
@@ -1678,23 +1950,37 @@ impl Engine {
     /// creation is applied first.
     fn apply_batch(&mut self) {
         let base = self.row_count;
+        let mut row = base;
         for i in 0..self.batch.len() {
-            let row = base + i as u64;
             match self.batch[i] {
-                BatchEffect::Insert { id, value } => {
+                BatchEffect::Store {
+                    id,
+                    at,
+                    rows,
+                    supersedes,
+                } => {
+                    debug_assert_eq!(at, row, "commit disagrees with validation");
+                    if let Some(old_row) = supersedes {
+                        self.set_live(old_row, false);
+                        self.retired += 1;
+                    } else {
+                        self.live_count += 1;
+                    }
                     self.bind_indices(id, row);
-                    self.trigram.insert(row, &value);
                     self.set_live(row, true);
-                    self.live_count += 1;
+                    let mut value = [0u8; MAX_VALUE_LEN];
+                    let len = self.assemble_from_arena(row, rows as u64, &mut value);
+                    self.trigram.insert_value(row, rows as u64, &value[..len]);
+                    if rows > 1 {
+                        self.long_values += 1;
+                    }
+                    // Continuations are slots like any other and have to
+                    // be counted, or the accounting invariant is a lie.
+                    self.chunks += rows as u64 - 1;
+                    row += rows as u64;
                 }
-                BatchEffect::Update { id, value, old_row } => {
-                    self.set_live(old_row, false);
-                    self.bind_indices(id, row);
-                    self.trigram.insert(row, &value);
-                    self.set_live(row, true);
-                    self.retired += 1;
-                }
-                BatchEffect::Delete { record_row, .. } => {
+                BatchEffect::Delete { at, record_row, .. } => {
+                    debug_assert_eq!(at, row, "commit disagrees with validation");
                     self.set_live(record_row, false);
                     // Accounted for, never indexed: a deletion is not
                     // searchable content.
@@ -1702,11 +1988,14 @@ impl Engine {
                     self.live_count -= 1;
                     self.retired += 1;
                     self.tombstones += 1;
+                    row += 1;
                 }
             }
         }
-        self.row_count += self.batch.len() as u64;
+        debug_assert_eq!(row - base, self.batch_rows as u64, "commit lost a row");
+        self.row_count += self.batch_rows as u64;
         self.batch.clear();
+        self.batch_rows = 0;
     }
 
     fn on_write_done(&mut self, file: FileId) -> Output {
@@ -1768,7 +2057,7 @@ impl Engine {
             (State::BatchWriteRow { next }, FileId::Rows) => {
                 // One row durable-ish (not yet fsynced); write the next, or
                 // move to the single fsync that covers all of them.
-                let n = self.batch.len() as u8;
+                let n = self.batch_rows;
                 debug_assert!(next < n, "batch write past the staged rows");
                 if next + 1 < n {
                     self.state = State::BatchWriteRow { next: next + 1 };
@@ -1782,7 +2071,7 @@ impl Engine {
                 self.state = State::BatchWriteSb { copy: 1 };
                 Self::sb_copy_write(
                     self.generation + 1,
-                    self.row_count + self.batch.len() as u64,
+                    self.row_count + self.batch_rows as u64,
                     1,
                 )
             }
@@ -1912,13 +2201,13 @@ impl Engine {
                 self.state = State::BatchWriteSb { copy: 0 };
                 Self::sb_copy_write(
                     self.generation + 1,
-                    self.row_count + self.batch.len() as u64,
+                    self.row_count + self.batch_rows as u64,
                     0,
                 )
             }
             (State::BatchFsyncSb, FileId::Superblock) => {
                 // Commit point: every op in the batch is durable, together.
-                let rows = self.batch.len() as u64;
+                let rows = self.batch_rows as u64;
                 debug_assert!(rows > 0, "empty batch reached the commit point");
                 self.generation += 1;
                 self.apply_batch();
@@ -2032,6 +2321,7 @@ impl Engine {
                 // batch wrote is committed.
                 debug_assert!(!self.batch.is_empty(), "batch effects lost before failure");
                 self.batch.clear();
+                self.batch_rows = 0;
                 self.state = State::Failed(err);
                 Output::BatchDone {
                     rows: 0,
@@ -2045,14 +2335,21 @@ impl Engine {
     // ---- get ---------------------------------------------------------
 
     fn on_get(&mut self, id: u64) -> Output {
+        self.read_window(id, 0)
+    }
+
+    /// A value's first window, or a later one. One code path, because the
+    /// only difference between "read this row" and "read the rest of it"
+    /// is where you start.
+    fn read_window(&mut self, id: u64, offset: u32) -> Output {
         let result = match self.state {
-            State::Ready => Ok(self.lookup_value(id)),
+            State::Ready => Ok(self.window_of(id, offset)),
             // A HIT is checksum-verified and therefore exactly right, in
             // salvage mode as in any other. A MISS is the honest problem:
             // the id may have lived in a quarantined slot, so `None` would
             // be a confident answer we cannot justify. Refuse instead.
-            State::Degraded => match self.lookup_value(id) {
-                Some(value) => Ok(Some(value)),
+            State::Degraded => match self.window_of(id, offset) {
+                Some(window) => Ok(Some(window)),
                 None => Err(DbError::Degraded {
                     quarantined: self.quarantined,
                 }),
@@ -2168,47 +2465,63 @@ impl Engine {
     /// like the btree, the trigram index is updated at the commit point.
     fn find_page(&self, needle: &[u8], after: Option<u64>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
-        let n = self.trigram.find_page(needle, after, &mut rows, |row| {
-            // Postings survive their record's retirement (the trigram
-            // index is append-only); liveness filters them out here.
-            if !self.is_live(row) {
-                return false;
-            }
-            let off = (row as usize) * ROW_SIZE;
-            match decode_row(&self.arena[off..off + ROW_SIZE]) {
-                Some(slot) => match slot.record() {
-                    Some((_, value)) => {
-                        needle.is_empty() || value.windows(needle.len()).any(|w| w == needle)
-                    }
-                    // A tombstone indexes nothing and matches nothing.
-                    None => false,
-                },
-                // A quarantined slot holds no verified row, so it matches
-                // nothing. Short needles scan every row number, so this is
-                // reachable in salvage mode — and ONLY there: in every
-                // other mode an undecodable live row is a bug, and the
-                // assertion still says so.
-                None => {
-                    debug_assert!(
-                        self.quarantined > 0,
-                        "live arena row must decode outside salvage mode"
-                    );
-                    false
+        // Once any value spans more than one slot, the chain walk stops
+        // being the cheapest way to reach every candidate, so take the
+        // exhaustive path. It is bounded by the row count and exactly as
+        // correct — a cost, never a compromise (see `find_page` in the
+        // trigram index).
+        let exhaustive = self.long_values > 0;
+        let n = self
+            .trigram
+            .find_page(needle, after, &mut rows, exhaustive, |row| {
+                // Postings survive their record's retirement (the trigram
+                // index is append-only); liveness filters them out here.
+                if !self.is_live(row) {
+                    return false;
                 }
-            }
-        });
+                let off = (row as usize) * ROW_SIZE;
+                match decode_row(&self.arena[off..off + ROW_SIZE]) {
+                    Some(slot) if slot.record().is_some() => {
+                        if needle.is_empty() {
+                            return true;
+                        }
+                        // Match against the WHOLE value, not the head slot: a
+                        // substring may straddle a slot boundary, and a scan
+                        // that missed those would be quietly incomplete.
+                        let (rows, _) = self.value_extent(row);
+                        let mut value = [0u8; MAX_VALUE_LEN];
+                        let len = self.assemble_from_arena(row, rows, &mut value);
+                        value[..len].windows(needle.len()).any(|w| w == needle)
+                    }
+                    // A tombstone or a continuation indexes nothing and
+                    // matches nothing.
+                    Some(_) => false,
+                    // A quarantined slot holds no verified row, so it matches
+                    // nothing. Short needles scan every row number, so this is
+                    // reachable in salvage mode — and ONLY there: in every
+                    // other mode an undecodable live row is a bug, and the
+                    // assertion still says so.
+                    None => {
+                        debug_assert!(
+                            self.quarantined > 0,
+                            "live arena row must decode outside salvage mode"
+                        );
+                        false
+                    }
+                }
+            });
         let mut page = FindPage {
-            items: [(0, [0; VALUE_LEN]); FIND_PAGE],
+            items: [RowRef::EMPTY; FIND_PAGE],
             count: n as u8,
             next: None,
             incomplete: self.quarantined > 0,
         };
         for (slot, &row) in page.items.iter_mut().zip(rows.iter().take(n)) {
             let off = (row as usize) * ROW_SIZE;
-            let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])
+            let (id, _) = decode_row(&self.arena[off..off + ROW_SIZE])
                 .and_then(|r| r.record())
                 .expect("live arena row must decode");
-            *slot = (id, value);
+            *slot = self.row_ref(id, row);
         }
         if n == FIND_PAGE {
             page.next = Some(rows[n - 1]);
@@ -2221,7 +2534,7 @@ impl Engine {
     /// in-flight insert is never visible here (serializable, §5).
     fn scan_page(&self, lo: u64, hi: u64) -> RangePage {
         let mut page = RangePage {
-            items: [(0, [0; VALUE_LEN]); RANGE_PAGE],
+            items: [RowRef::EMPTY; RANGE_PAGE],
             count: 0,
             next: None,
             incomplete: self.quarantined > 0,
@@ -2250,14 +2563,7 @@ impl Engine {
             true
         });
         for (slot, &(key, row)) in page.items.iter_mut().zip(hits.iter().take(n)) {
-            let off = (row as usize) * ROW_SIZE;
-            let (rid, value) = decode_row(&self.arena[off..off + ROW_SIZE])
-                .and_then(|r| r.record())
-                .expect("live arena row must decode");
-            // Pair assertion: the ordered index must point at the row it
-            // claims, and pages must be strictly ascending.
-            debug_assert_eq!(rid, key);
-            *slot = (key, value);
+            *slot = self.row_ref(key, row);
         }
         for pair in hits[..n].windows(2) {
             debug_assert!(pair[0].0 < pair[1].0, "range page out of order");
@@ -2267,6 +2573,175 @@ impl Engine {
         page
     }
 
+    /// Read a value's whole run out of `data`, returning how many slots it
+    /// occupies — or `None` when the run does not end where its rows say
+    /// it should.
+    ///
+    /// A value is only ever written whole, in one commit, so a run that
+    /// stops short is not something this engine produced. Checking the
+    /// WHOLE run before trusting any of it is what stops a damaged
+    /// continuation from turning into a silently truncated value: the head
+    /// is never served on its own.
+    fn verify_run(
+        &self,
+        data: &[u8],
+        head_row: u64,
+        row_count: u64,
+        head: &RowSlot,
+    ) -> Option<u64> {
+        let mut rows = 1u64;
+        let mut more = head.more;
+        while more {
+            let r = head_row + rows;
+            if r >= row_count {
+                // The value promised a continuation the file does not
+                // have. Truncation, or a manifest that names fewer rows
+                // than the value needs.
+                return None;
+            }
+            let o = (r as usize) * ROW_SIZE;
+            let slot = decode_row(&data[o..o + ROW_SIZE])?;
+            if slot.kind != RowKind::Chunk || slot.id != head.id {
+                return None;
+            }
+            if rows as usize >= MAX_COMMIT_ROWS {
+                // Longer than any commit can be, so longer than anything
+                // this engine could have written.
+                return None;
+            }
+            more = slot.more;
+            rows += 1;
+        }
+        Some(rows)
+    }
+
+    /// How many slots a BROKEN run occupies, for quarantine purposes: the
+    /// head plus every readable continuation of it that did arrive. They
+    /// are unreadable together — the value they belong to cannot be
+    /// served — so they are quarantined together rather than left behind
+    /// as stranded chunks.
+    fn broken_run_len(&self, data: &[u8], head_row: u64, row_count: u64, head: &RowSlot) -> u64 {
+        let mut rows = 1u64;
+        let mut more = head.more;
+        while more && rows as usize <= MAX_COMMIT_ROWS {
+            let r = head_row + rows;
+            if r >= row_count {
+                break;
+            }
+            let o = (r as usize) * ROW_SIZE;
+            match decode_row(&data[o..o + ROW_SIZE]) {
+                Some(slot) if slot.kind == RowKind::Chunk && slot.id == head.id => {
+                    more = slot.more;
+                    rows += 1;
+                }
+                _ => break,
+            }
+        }
+        rows
+    }
+
+    /// Copy a value out of the arena into `out`, returning its length.
+    /// `rows` is the run's length, already known to the caller.
+    fn assemble_from_arena(
+        &self,
+        head_row: u64,
+        rows: u64,
+        out: &mut [u8; MAX_VALUE_LEN],
+    ) -> usize {
+        let mut at = 0usize;
+        for r in head_row..head_row + rows {
+            let off = (r as usize) * ROW_SIZE;
+            let slot = decode_row(&self.arena[off..off + ROW_SIZE])
+                .expect("a row already accepted into the arena must decode");
+            let n = slot.len as usize;
+            out[at..at + n].copy_from_slice(&slot.value[..n]);
+            at += n;
+        }
+        at
+    }
+
+    /// How many slots the value starting at `head_row` occupies, and how
+    /// long it is. The run ends at the first row that is not a
+    /// continuation — which is exactly how the file describes it, since a
+    /// value's chunks are written immediately after their head in the same
+    /// commit and nothing can be interleaved between them.
+    fn value_extent(&self, head_row: u64) -> (u64, u32) {
+        let off = (head_row as usize) * ROW_SIZE;
+        let head =
+            decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+        // Fast path: with no multi-slot value anywhere, there is nothing
+        // to look ahead for, and a point read touches one row.
+        if self.long_values == 0 {
+            return (1, head.len as u32);
+        }
+        let mut rows = 1u64;
+        let mut total = head.len as u32;
+        let mut r = head_row + 1;
+        while r < self.row_count {
+            let o = (r as usize) * ROW_SIZE;
+            match decode_row(&self.arena[o..o + ROW_SIZE]) {
+                Some(slot) if slot.kind == RowKind::Chunk && slot.id == head.id => {
+                    rows += 1;
+                    total += slot.len as u32;
+                    r += 1;
+                }
+                _ => break,
+            }
+        }
+        (rows, total)
+    }
+
+    /// One bounded window of `id`'s value, starting at `offset`.
+    ///
+    /// `offset` must be a slot boundary — the offsets `Get` and earlier
+    /// windows hand back — so a window is always exactly one row's
+    /// payload and never has to be stitched from two.
+    fn window_of(&self, id: u64, offset: u32) -> Option<ValueWindow> {
+        let head_row = self.live_row_of(id)?;
+        let (rows, total) = self.value_extent(head_row);
+        debug_assert!(
+            (offset as usize).is_multiple_of(VALUE_LEN),
+            "a window must start on a slot boundary"
+        );
+        let skip = offset as usize / VALUE_LEN;
+        if skip as u64 >= rows {
+            // Reading exactly at the end is an empty final window rather
+            // than an error; reading past it is the caller's mistake, and
+            // an empty window is still the honest answer.
+            return Some(ValueWindow {
+                total,
+                offset,
+                len: 0,
+                bytes: [0; VALUE_LEN],
+            });
+        }
+        let off = ((head_row as usize) + skip) * ROW_SIZE;
+        let slot =
+            decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+        debug_assert_eq!(slot.id, id, "the index must point at the row it claims");
+        Some(ValueWindow {
+            total,
+            offset,
+            len: slot.len,
+            bytes: slot.value,
+        })
+    }
+
+    /// A scan-result reference for the value living at `head_row`.
+    fn row_ref(&self, id: u64, head_row: u64) -> RowRef {
+        let (_, total) = self.value_extent(head_row);
+        let off = (head_row as usize) * ROW_SIZE;
+        let slot =
+            decode_row(&self.arena[off..off + ROW_SIZE]).expect("live arena row must decode");
+        debug_assert_eq!(slot.id, id);
+        RowRef {
+            id,
+            len: total,
+            head: slot.value,
+        }
+    }
+
+    /// `id`'s whole value, when it fits in one slot.
     fn lookup_value(&self, id: u64) -> Option<[u8; VALUE_LEN]> {
         let row = self.live_row_of(id)?;
         let off = (row as usize) * ROW_SIZE;
@@ -2437,6 +2912,16 @@ mod tests {
         [b; VALUE_LEN]
     }
 
+    /// The window a full-width value comes back in.
+    fn win(b: u8) -> ValueWindow {
+        ValueWindow {
+            total: VALUE_LEN as u32,
+            offset: 0,
+            len: VALUE_LEN as u8,
+            bytes: val(b),
+        }
+    }
+
     #[test]
     fn fresh_open_insert_get() {
         let mut h = MiniHost::new(Capacities { rows: 8 });
@@ -2455,7 +2940,7 @@ mod tests {
             h.drive(Input::Get { id: 1 }),
             Output::GetDone {
                 id: 1,
-                result: Ok(Some(val(7)))
+                result: Ok(Some(win(7)))
             }
         );
         // Negative space: an id never inserted must be absent.
@@ -2492,7 +2977,7 @@ mod tests {
             h.drive(Input::Get { id: 5 }),
             Output::GetDone {
                 id: 5,
-                result: Ok(Some(val(1)))
+                result: Ok(Some(win(1)))
             }
         );
     }
@@ -2548,7 +3033,7 @@ mod tests {
                 h2.drive(Input::Get { id: i * 10 }),
                 Output::GetDone {
                     id: i * 10,
-                    result: Ok(Some(val(i as u8)))
+                    result: Ok(Some(win(i as u8)))
                 }
             );
         }
@@ -2802,7 +3287,7 @@ mod tests {
                 h.drive(Input::Get { id }),
                 Output::GetDone {
                     id,
-                    result: Ok(Some(val(i as u8 + 1)))
+                    result: Ok(Some(win(i as u8 + 1)))
                 }
             );
         }

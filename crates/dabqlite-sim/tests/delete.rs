@@ -75,7 +75,8 @@ fn open_salvage(disk: SimDisk) -> (SimHost, u64) {
 
 fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, DbError> {
     match host.run_input(dabqlite_core::Input::Get { id }) {
-        Driven::Done(Output::GetDone { result, .. }) => result,
+        // These suites write full-width values, so one window is whole.
+        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| v.map(|w| w.bytes)),
         other => panic!("get: {other:?}"),
     }
 }

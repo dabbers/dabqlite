@@ -370,12 +370,44 @@ impl SimHost {
         self.drive(Input::Batch { ops })
     }
 
-    /// Convenience: get that must complete (pure in-memory, no I/O).
+    /// Convenience: get that must complete (pure in-memory, no I/O), for
+    /// the full-width values the fixed-slot write path produces.
     pub fn get(&mut self, id: u64) -> Option<[u8; VALUE_LEN]> {
-        match self.run(ClientOp::Get { id }) {
-            Driven::Done(Output::GetDone { result: Ok(v), .. }) => v,
+        let window = match self.run(ClientOp::Get { id }) {
+            Driven::Done(Output::GetDone { result: Ok(v), .. }) => v?,
             other => panic!("get({id}) did not complete cleanly: {other:?}"),
+        };
+        assert_eq!(
+            window.total as usize, VALUE_LEN,
+            "get() is for full-width values; use get_bytes for id {id}"
+        );
+        Some(window.bytes)
+    }
+
+    /// The WHOLE value of `id`, however many slots it occupies, assembled
+    /// from the bounded windows the protocol hands back.
+    pub fn get_bytes(&mut self, id: u64) -> Option<Vec<u8>> {
+        let first = match self.run(ClientOp::Get { id }) {
+            Driven::Done(Output::GetDone { result: Ok(v), .. }) => v?,
+            other => panic!("get({id}) did not complete cleanly: {other:?}"),
+        };
+        let mut out = Vec::with_capacity(first.total as usize);
+        out.extend_from_slice(first.payload());
+        let mut next = first.next_offset();
+        while let Some(offset) = next {
+            let window = match self.drive(Input::GetFrom { id, offset }) {
+                Driven::Done(Output::GetDone {
+                    result: Ok(Some(w)),
+                    ..
+                }) => w,
+                other => panic!("get_from({id}, {offset}): {other:?}"),
+            };
+            assert_eq!(window.total, first.total, "a value changed length mid-read");
+            out.extend_from_slice(window.payload());
+            next = window.next_offset();
         }
+        assert_eq!(out.len(), first.total as usize, "windows did not add up");
+        Some(out)
     }
 
     /// Full paged substring search, concatenated: a test convenience over
@@ -395,7 +427,13 @@ impl SimHost {
                 Driven::Done(Output::FindDone { result: Ok(p) }) => p,
                 other => panic!("find_all: {other:?}"),
             };
-            out.extend_from_slice(&page.items[..page.count as usize]);
+            out.extend(page.items[..page.count as usize].iter().map(|r| {
+                let value = r.value().expect("find_all is for values that fit one slot");
+                (
+                    r.id,
+                    <[u8; VALUE_LEN]>::try_from(value).expect("full-width value"),
+                )
+            }));
             match page.next {
                 Some(n) => after = Some(n),
                 None => return out,
@@ -413,7 +451,15 @@ impl SimHost {
                 Driven::Done(Output::RangeDone { result: Ok(p) }) => p,
                 other => panic!("range_all: {other:?}"),
             };
-            out.extend_from_slice(&page.items[..page.count as usize]);
+            out.extend(page.items[..page.count as usize].iter().map(|r| {
+                let value = r
+                    .value()
+                    .expect("range_all is for values that fit one slot");
+                (
+                    r.id,
+                    <[u8; VALUE_LEN]>::try_from(value).expect("full-width value"),
+                )
+            }));
             match page.next {
                 Some(n) => cursor = n,
                 None => return out,

@@ -352,7 +352,7 @@ fn full_database_serves_every_query_path() {
     }
     assert_eq!(seen.len() as u64, caps.rows);
     assert!(
-        seen.windows(2).all(|w| w[0].0 < w[1].0),
+        seen.windows(2).all(|w| w[0].id < w[1].id),
         "scan out of order"
     );
 

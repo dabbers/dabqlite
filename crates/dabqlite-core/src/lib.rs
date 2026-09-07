@@ -67,6 +67,12 @@ pub mod defect {
     /// misdirected write, a truncated file, or a file we did not write.
     pub const ORPHAN_CHUNK: &str =
         "value continuation with nothing to continue (reopen in salvage mode to read the rest)";
+    /// A value's continuations do not run to the end it promised: the
+    /// head says the value continues, and what follows is not a readable
+    /// continuation of it. Serving the head alone would serve a value
+    /// silently cut short, so the whole value goes instead.
+    pub const TRUNCATED_VALUE: &str =
+        "value continuation missing or damaged (reopen in salvage mode to read the rest)";
     /// Two committed rows claim the same primary key.
     pub const DUPLICATE_ID: &str =
         "duplicate id among committed rows (reopen in salvage mode to read the rest)";
@@ -80,7 +86,7 @@ pub mod trigram;
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{
     BatchOp, BatchReject, Capacities, DbError, Engine, FileId, FindPage, Input, Output, RangePage,
-    RecoveryReport, WriteBuf, FIND_PAGE, RANGE_PAGE,
+    RecoveryReport, RowRef, ValueWindow, WriteBuf, FIND_PAGE, MAX_VALUE_LEN, RANGE_PAGE,
 };
 pub use layout::{
     MAX_COMMIT_ROWS, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,

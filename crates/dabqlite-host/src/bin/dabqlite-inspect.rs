@@ -267,7 +267,7 @@ fn repair_to(src: &Path, dest: &Path, force_live: bool) -> Result<(u64, u64), St
         other => return Err(format!("unexpected open result: {other:?}")),
     }
     let dropped = source.engine.quarantined();
-    let rows: Vec<(u64, [u8; dabqlite_core::VALUE_LEN])> = source.engine.live_rows().collect();
+    let rows: Vec<(u64, Vec<u8>)> = source.engine.live_rows().collect();
     drop(source);
 
     let out =
@@ -280,9 +280,14 @@ fn repair_to(src: &Path, dest: &Path, force_live: bool) -> Result<(u64, u64), St
         Output::OpenDone { result: Ok(0) } => {}
         other => return Err(format!("destination is not empty: {other:?}")),
     }
-    for &(id, value) in &rows {
-        match target.insert(id, value) {
-            Output::InsertDone { result: Ok(()), .. } => {}
+    // One batch per value, through the general write path, so a value
+    // spanning several slots is rebuilt whole rather than as its head.
+    for (id, value) in &rows {
+        match target.batch(&[dabqlite_core::BatchOp::Insert {
+            id: *id,
+            value: value.as_slice(),
+        }]) {
+            Output::BatchDone { result: Ok(()), .. } => {}
             other => return Err(format!("writing row {id}: {other:?}")),
         }
     }

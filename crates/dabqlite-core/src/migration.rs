@@ -46,6 +46,9 @@ pub fn migrate_row(old: records_v1::RecordsRow) -> records::RecordsRow {
         // full-width value, and the migration widens it by zero-filling
         // the tail, so the migrated row carries the full new width too.
         len: records::RECORDS_LEN_MAX,
+        // A migrated row is a whole value in one slot: v1 had no
+        // continuations to bring across.
+        more: false,
         id: old.id,
         value,
     }
@@ -554,6 +557,7 @@ impl MigrationEngine {
             RowKind::Record,
             new.span,
             new.len,
+            new.more,
             new.id,
             &new.value,
             &mut out,

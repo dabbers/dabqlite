@@ -13,7 +13,7 @@ One directory per database (docs/DESIGN.md §4.4). Files:
 | file | purpose |
 |---|---|
 | `superblock.dabq` | the superblock copy set — the sole atomicity point |
-| `rows-5b3f0b9084f97598.dabq` | row slots for `records` under the current schema |
+| `rows-84ee7f59f027fa5f.dabq` | row slots for `records` under the current schema |
 | `rows-c4345b300a440058.dabq` | row slots under the legacy schema (inert once migrated) |
 | `lock.dabq` | single-writer flock target; always empty |
 
@@ -21,15 +21,15 @@ Rows files are NAMED by the schema hash that wrote them, so the
 superblock's stored hash is also the name of the live rows file;
 after a migration the legacy file is an orphan nothing references.
 
-## Row slot (32 bytes, table `records`, schema hash `0x5B3F0B9084F97598`)
+## Row slot (32 bytes, table `records`, schema hash `0x84EE7F59F027FA5F`)
 
 | offset | size | field | encoding |
 |---|---|---|---|
 | 0 | 8 | `id` (primary key) | u64, little-endian |
 | 8 | 16 | `value` | 16 raw bytes, fixed width |
 | 24 | 1 | kind | 0 = record, 1 = tombstone, 2 = update |
-| 25 | 1 | span | rows still to come in the same commit (0..=63) |
-| 26 | 1 | len | bytes of the final column this row carries (0..=16) |
+| 25 | 1 | span | rows still to come in the same commit (0..=127) |
+| 26 | 1 | len | bytes this row carries (0..=16), plus `0x80` when the value continues into the next row |
 | 27 | 4 | crc32 | IEEE, over bytes 0..27 |
 | 31 | 1 | padding | must be zero (validated on decode: no dead bytes) |
 
@@ -52,7 +52,7 @@ all three impossible to miss.
 | 0 | 8 | magic | `"DABQSB01"` |
 | 8 | 8 | generation | u64 LE, monotonic; the atomicity point |
 | 16 | 8 | row_count | u64 LE, authoritative committed rows |
-| 24 | 8 | schema_hash | u64 LE (`0x5B3F0B9084F97598` for this schema) |
+| 24 | 8 | schema_hash | u64 LE (`0x84EE7F59F027FA5F` for this schema) |
 | 32 | 4 | crc32 | IEEE, over bytes 0..32 |
 | 36 | 28 | padding | must be zero (validated) |
 
@@ -88,7 +88,7 @@ and 1 with span 0 and claim sizes 1 and 2 — so it means an
 acknowledged commit was rolled back by storage that lied about an
 fsync, and the open reports that loudly.
 
-## Migration (schema `0xC4345B300A440058` → `0x5B3F0B9084F97598`)
+## Migration (schema `0xC4345B300A440058` → `0x84EE7F59F027FA5F`)
 
 Offline, inside the new binary: read + verify every legacy row, write
 the new rows file completely, fsync it, then flip the superblock to

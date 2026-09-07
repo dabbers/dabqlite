@@ -62,8 +62,20 @@ fn open_ok<S: Storage>(host: &mut Host<S>) -> Result<u64, DbError> {
 }
 
 fn get_ok<S: Storage>(host: &mut Host<S>, id: u64) -> Option<[u8; VALUE_LEN]> {
+    // These suites write full-width values, so one window is the whole
+    // value; anything else means the backend handed back something the
+    // workload never wrote.
     match host.get(id) {
-        Output::GetDone { result: Ok(v), .. } => v,
+        Output::GetDone {
+            result: Ok(Some(w)),
+            ..
+        } => {
+            assert_eq!(w.total as usize, VALUE_LEN, "unexpected value length");
+            Some(w.bytes)
+        }
+        Output::GetDone {
+            result: Ok(None), ..
+        } => None,
         other => panic!("get returned {other:?}"),
     }
 }

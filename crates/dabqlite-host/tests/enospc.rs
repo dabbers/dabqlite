@@ -168,7 +168,7 @@ fn real_enospc_episode_loses_nothing() {
     for &(id, value) in &acked {
         assert!(matches!(
             host.get(id),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == value
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == value
         ));
     }
     // Still full: the next insert is refused with ENOSPC again.
@@ -202,7 +202,7 @@ fn real_enospc_episode_loses_nothing() {
     for &(id, value) in &acked {
         assert!(matches!(
             host.get(id),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == value
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == value
         ));
     }
     assert!(matches!(

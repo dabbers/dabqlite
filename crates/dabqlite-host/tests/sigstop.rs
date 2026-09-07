@@ -147,7 +147,7 @@ fn a_writer_frozen_mid_commit_resumes_and_completes_exactly() {
         let want = [(i as u8).wrapping_mul(37) % 251; VALUE_LEN];
         assert!(matches!(
             host.get(i),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == want
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == want
         ));
     }
     std::fs::remove_dir_all(&dir).ok();

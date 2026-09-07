@@ -102,7 +102,7 @@ fn real_files_migrate_and_match_the_simulator_byte_for_byte() {
         expect[..V1_VALUE_LEN].copy_from_slice(&v1_value(i));
         assert!(matches!(
             host.get(id),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == expect
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == expect
         ));
     }
     drop(host);

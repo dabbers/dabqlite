@@ -91,7 +91,7 @@ fn a_real_second_process_is_refused_while_the_database_is_open() {
     // The refused attempt harmed nothing: our handle still works.
     assert!(matches!(
         host.get(1),
-        Output::GetDone { result: Ok(Some(v)), .. } if v == [1; VALUE_LEN]
+        Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == [1; VALUE_LEN]
     ));
 
     // After we close, a second process succeeds.

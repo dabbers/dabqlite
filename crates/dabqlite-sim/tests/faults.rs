@@ -321,7 +321,7 @@ fn recovery_repairs_superblock_redundancy() {
     for &(id, value) in &ops {
         assert!(matches!(
             host.run(ClientOp::Get { id }),
-            Driven::Done(Output::GetDone { result: Ok(Some(v)), .. }) if v == value
+            Driven::Done(Output::GetDone { result: Ok(Some(v)), .. }) if v.payload() == value
         ));
     }
 

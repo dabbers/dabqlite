@@ -97,7 +97,7 @@ fn paging_walks_large_results_exactly() {
         Driven::Done(Output::FindDone { result: Ok(page) }) => {
             assert_eq!(page.count, 8);
             assert!(page.next.is_some());
-            let ids: Vec<u64> = page.items[..8].iter().map(|&(id, _)| id).collect();
+            let ids: Vec<u64> = page.items[..8].iter().map(|r| r.id).collect();
             assert_eq!(ids, (0..8u64).map(|i| i * 7 + 1).collect::<Vec<_>>());
         }
         other => panic!("{other:?}"),

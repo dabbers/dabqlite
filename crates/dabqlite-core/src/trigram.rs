@@ -38,8 +38,17 @@ use alloc::vec::Vec;
 
 use crate::layout::VALUE_LEN;
 
-/// Trigrams in one value: one per 3-byte window.
-pub const TRIGRAMS_PER_ROW: usize = VALUE_LEN - 2;
+/// Posting slots reserved per ROW.
+///
+/// A value of `VALUE_LEN` bytes has `VALUE_LEN - 2` trigram windows, so
+/// two slots per row go unused for a value that fits in one slot. They are
+/// reserved anyway because a value may SPAN rows: the trigram starting at
+/// value offset `o` lives in the slot `head * TRIGRAMS_PER_ROW + o`, and a
+/// window starting in the last two bytes of a slot runs into the next one.
+/// Reserving `VALUE_LEN` slots per row keeps that mapping a bijection for
+/// values of any length, which is what makes the pool bound arithmetic
+/// rather than an estimate.
+pub const TRIGRAMS_PER_ROW: usize = VALUE_LEN;
 
 const NIL: u32 = u32::MAX;
 /// Table entry sentinel: no trigram ever hashes to this packed form
@@ -188,25 +197,51 @@ impl TrigramIndex {
     /// inserted in row order (the engine's arena order) — pinned so the
     /// slot arithmetic (`row * TRIGRAMS_PER_ROW + k`) stays a bijection.
     pub fn insert(&mut self, row: u64, value: &[u8; VALUE_LEN]) {
+        self.insert_value(row, 1, value);
+    }
+
+    /// Index one value, which may occupy several consecutive rows.
+    ///
+    /// `head_row` is the row the value starts in and `rows` how many it
+    /// occupies; both are the caller's, because only the caller knows
+    /// where a value ends. Trigram windows are taken over the WHOLE value,
+    /// so a substring straddling a slot boundary is found like any other —
+    /// which is the entire reason the postings are addressed by value
+    /// offset rather than by row.
+    ///
+    /// Rows are append-only and must arrive in row order (the engine's
+    /// arena order), so that `row * TRIGRAMS_PER_ROW + k` stays a
+    /// bijection.
+    pub fn insert_value(&mut self, head_row: u64, rows: u64, value: &[u8]) {
         self.assert_invariants();
-        assert_eq!(row, self.len, "trigram index rows are append-only");
+        assert_eq!(head_row, self.len, "trigram index rows are append-only");
+        assert!(rows >= 1, "a value occupies at least one row");
+        let end = (head_row + rows) as usize;
         assert!(
-            ((row as usize) + 1) * TRIGRAMS_PER_ROW <= self.next.len(),
+            end * TRIGRAMS_PER_ROW <= self.next.len(),
             "trigram pool exhausted: capacity invariant violated"
         );
-        for k in 0..TRIGRAMS_PER_ROW {
-            let tri = tri_key(&value[k..k + 3]);
-            // One posting per DISTINCT trigram per row: a duplicate
-            // window (e.g. "aaaa") must not chain the same row twice.
-            let dup = (0..k).any(|j| tri_key(&value[j..j + 3]) == tri);
-            if dup {
+        assert!(
+            value.len() <= rows as usize * VALUE_LEN,
+            "value longer than the rows holding it"
+        );
+        let windows = value.len().saturating_sub(2);
+        for o in 0..windows {
+            let tri = tri_key(&value[o..o + 3]);
+            // One posting per DISTINCT trigram per VALUE: a duplicate
+            // window (e.g. "aaaa") must not chain the same row twice, and
+            // for a multi-row value "the same row" means the same value.
+            if (0..o).any(|j| tri_key(&value[j..j + 3]) == tri) {
                 continue;
             }
-            let slot = (row as usize) * TRIGRAMS_PER_ROW + k;
+            // The posting lives in the slot for the row the window STARTS
+            // in, so a candidate always resolves back to the value's head
+            // by way of that row.
+            let slot = (head_row as usize) * TRIGRAMS_PER_ROW + o;
             self.next[slot] = self.head(tri);
             self.set_head(tri, slot as u32);
         }
-        self.len = row + 1;
+        self.len = head_row + rows;
         self.assert_invariants();
     }
 
@@ -241,11 +276,20 @@ impl TrigramIndex {
     /// visits a superset of the answer; verification removes the rest.
     /// For shorter needles there is no trigram to look up: scan all
     /// rows (bounded by len; still exact).
+    /// `exhaustive` forces the scan path even for a long needle. The
+    /// caller asks for it when the index is no longer guaranteed to hold a
+    /// superset of the answer — the engine sets it once any value spans
+    /// more than one row, because such a value's postings all hang off its
+    /// head row and a chain walk would still be right, but the engine
+    /// would have to map every candidate back to a head to know it. The
+    /// scan is bounded by the row count and exact either way; taking it is
+    /// a cost, never a compromise.
     pub fn find_page<F: Fn(u64) -> bool>(
         &self,
         needle: &[u8],
         cursor: Option<u64>,
         page: &mut [u64],
+        exhaustive: bool,
         matches: F,
     ) -> usize {
         self.assert_invariants();
@@ -273,7 +317,7 @@ impl TrigramIndex {
             page[i] = row;
         };
 
-        if needle.len() < 3 {
+        if needle.len() < 3 || exhaustive {
             for row in lo..self.len {
                 consider(row, page, &mut found);
                 // Ascending scan: a full page of the smallest is final.
@@ -320,7 +364,7 @@ mod tests {
         let mut cursor = None;
         loop {
             let mut page = [0u64; 4];
-            let n = t.find_page(needle, cursor, &mut page, |row| {
+            let n = t.find_page(needle, cursor, &mut page, false, |row| {
                 contains(&values[row as usize], needle)
             });
             out.extend_from_slice(&page[..n]);
@@ -385,12 +429,46 @@ mod tests {
 
     #[test]
     fn pool_is_exactly_rows_times_trigrams() {
-        assert_eq!(TRIGRAMS_PER_ROW, 14);
+        // One slot per byte of a row, not per trigram window: a value may
+        // span rows, and a window starting in a row's last two bytes runs
+        // into the next one. Reserving the extra two keeps the posting
+        // address a pure function of the value offset.
+        assert_eq!(TRIGRAMS_PER_ROW, VALUE_LEN);
         let t = TrigramIndex::new(8);
-        assert_eq!(t.next.len(), 8 * 14);
+        assert_eq!(t.next.len(), 8 * VALUE_LEN);
         // Load <= 0.5 over worst-case distinct trigrams.
-        assert!(t.table.len() >= 2 * 8 * 14);
+        assert!(t.table.len() >= 2 * 8 * VALUE_LEN);
         assert!(t.table.len().is_power_of_two());
+    }
+
+    /// A value spanning several rows is searchable as ONE value, including
+    /// substrings that straddle a slot boundary. Without that, a long value
+    /// would be quietly unsearchable across its own seams.
+    #[test]
+    fn a_value_spanning_rows_is_searchable_across_its_seams() {
+        // 40 bytes: three rows, with "needle" placed so it crosses the
+        // boundary between the first row and the second.
+        let mut long = vec![b'.'; 40];
+        long[14..20].copy_from_slice(b"needle");
+        let mut t = TrigramIndex::new(8);
+        t.insert_value(0, 3, &long);
+
+        let mut page = [0u64; 4];
+        let n = t.find_page(b"needle", None, &mut page, false, |row| {
+            row == 0 && long.windows(6).any(|w| w == b"needle")
+        });
+        assert_eq!(
+            &page[..n],
+            &[0],
+            "a substring across a slot seam was missed"
+        );
+
+        // And the exhaustive path agrees, which is the guarantee the
+        // engine leans on once any value is long.
+        let n = t.find_page(b"needle", None, &mut page, true, |row| {
+            row == 0 && long.windows(6).any(|w| w == b"needle")
+        });
+        assert_eq!(&page[..n], &[0]);
     }
 
     #[test]
@@ -437,6 +515,6 @@ mod tests {
         assert_ne!(head, NIL);
         t.next[head as usize] = head;
         let mut page = [0u64; 4];
-        t.find_page(b"abc", None, &mut page, |_| true);
+        t.find_page(b"abc", None, &mut page, false, |_| true);
     }
 }

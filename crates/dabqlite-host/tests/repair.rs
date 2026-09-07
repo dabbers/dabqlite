@@ -140,7 +140,7 @@ fn a_damaged_database_is_rebuilt_clean_and_the_loss_is_reported() {
     assert_eq!(host.engine.quarantined(), 0);
     for i in 0..N {
         let got = match host.get(i) {
-            Output::GetDone { result: Ok(v), .. } => v,
+            Output::GetDone { result: Ok(v), .. } => v.map(|w| w.bytes),
             other => panic!("get {i}: {other:?}"),
         };
         if i == 7 {
@@ -348,7 +348,7 @@ fn gc_reclaims_the_legacy_file_only_after_migration_completed() {
     for i in 0..N {
         assert!(matches!(
             host.get(i),
-            Output::GetDone { result: Ok(Some(v)), .. } if v == value_for(i)
+            Output::GetDone { result: Ok(Some(v)), .. } if v.payload() == value_for(i)
         ));
     }
     std::fs::remove_dir_all(&pre).ok();
@@ -527,7 +527,7 @@ fn rebuilding_compacts_away_deleted_rows_and_their_tombstones() {
     );
     for i in 0..N {
         let got = match host.get(i) {
-            Output::GetDone { result: Ok(v), .. } => v,
+            Output::GetDone { result: Ok(v), .. } => v.map(|w| w.bytes),
             other => panic!("get {i}: {other:?}"),
         };
         if survivors.contains(&i) {

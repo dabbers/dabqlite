@@ -57,19 +57,23 @@ fn generated_encode_is_byte_identical_to_hand_written() {
         // zeroed the way a real encoder must leave them.
         let len = (round % (RECORDS_LEN_MAX as usize + 1)) as u8;
         value[len as usize..].fill(0);
+        // Both settings of the continuation bit, so the byte is covered
+        // whole rather than only in its low seven bits.
+        let more = round % 2 == 0;
 
         // Every legal span, cycled, so the commit-group byte is covered by
         // the equivalence exactly like the kind byte is.
         let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
 
         let mut hand_bytes = [0u8; ROW_SIZE];
-        hand::encode_row(kind, span, len, id, &value, &mut hand_bytes);
+        hand::encode_row(kind, span, len, more, id, &value, &mut hand_bytes);
         let mut gen_bytes = [0u8; RECORDS_ROW_SIZE];
         encode_records_row(
             &RecordsRow {
                 kind: kind_byte,
                 span,
                 len,
+                more,
                 id,
                 value,
             },
@@ -103,7 +107,8 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
             let span = (round % (RECORDS_SPAN_MAX as usize + 1)) as u8;
             let len = (round % (RECORDS_LEN_MAX as usize + 1)) as u8;
             value[len as usize..].fill(0);
-            hand::encode_row(kind, span, len, id, &value, &mut slot);
+            let more = round % 3 == 0;
+            hand::encode_row(kind, span, len, more, id, &value, &mut slot);
             if round % 4 == 0 {
                 // Corrupt a random byte with a random mask (sometimes 0 =
                 // no corruption; both decoders must still agree).
@@ -133,6 +138,11 @@ fn generated_decode_agrees_on_valid_and_corrupt_slots() {
                 assert_eq!(
                     hand_kind, row.kind,
                     "round {round}: row KIND diverged - a record and a deletion must never be confused"
+                );
+                assert_eq!(
+                    hand_slot.more, row.more,
+                    "round {round}: the CONTINUES bit diverged - the two codecs \
+                     would disagree about where a value ends"
                 );
                 assert_eq!(
                     hand_slot.len, row.len,
@@ -174,6 +184,7 @@ fn generated_codec_has_no_dead_bytes_either() {
             span: 0b0010_1010,
             // A mid-range length too, for the same reason.
             len: 0b0000_1010,
+            more: true,
             id: 0xDAB0_0001,
             value: *b"0123456789\0\0\0\0\0\0",
         };
@@ -208,7 +219,15 @@ fn both_codecs_refuse_a_span_the_format_does_not_define() {
         let mut slot = [0u8; RECORDS_ROW_SIZE];
         // Encode a legal row, then rewrite the span byte and re-checksum
         // by hand so the slot is impeccable except for that one field.
-        hand::encode_row(RowKind::Record, 0, 16, 7, b"................", &mut slot);
+        hand::encode_row(
+            RowKind::Record,
+            0,
+            16,
+            false,
+            7,
+            b"................",
+            &mut slot,
+        );
         slot[RECORDS_SPAN_OFFSET] = span as u8;
         let crc = crc32_ieee(&slot[0..RECORDS_SPAN_OFFSET + 1]);
         slot[RECORDS_SPAN_OFFSET + 1..RECORDS_SPAN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
@@ -235,6 +254,7 @@ fn both_codecs_round_trip_every_legal_span() {
             RowKind::Update,
             span,
             16,
+            false,
             99,
             b"abcdefghijklmnop",
             &mut slot,
@@ -268,22 +288,36 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 /// value claim bytes that are really its padding.
 #[test]
 fn both_codecs_refuse_a_len_longer_than_the_slot() {
-    for len in (RECORDS_LEN_MAX as u16 + 1)..=255 {
-        let mut slot = [0u8; RECORDS_ROW_SIZE];
-        hand::encode_row(RowKind::Record, 0, 16, 7, b"................", &mut slot);
-        slot[RECORDS_LEN_OFFSET] = len as u8;
-        let crc = crc32_ieee(&slot[0..RECORDS_LEN_OFFSET + 1]);
-        slot[RECORDS_LEN_OFFSET + 1..RECORDS_LEN_OFFSET + 5].copy_from_slice(&crc.to_le_bytes());
+    // Only the low seven bits are the length; the top bit is the
+    // CONTINUES flag and is legal at any length. Sweep both settings of it
+    // over every illegal length.
+    for raw in (RECORDS_LEN_MAX as u16 + 1)..0x80 {
+        for len in [raw, raw | 0x80] {
+            let mut slot = [0u8; RECORDS_ROW_SIZE];
+            hand::encode_row(
+                RowKind::Record,
+                0,
+                16,
+                false,
+                7,
+                b"................",
+                &mut slot,
+            );
+            slot[RECORDS_LEN_OFFSET] = len as u8;
+            let crc = crc32_ieee(&slot[0..RECORDS_LEN_OFFSET + 1]);
+            slot[RECORDS_LEN_OFFSET + 1..RECORDS_LEN_OFFSET + 5]
+                .copy_from_slice(&crc.to_le_bytes());
 
-        assert_eq!(
-            decode_records_row(&slot),
-            None,
-            "the generated codec accepted len {len}, longer than the slot"
-        );
-        assert!(
-            hand::decode_row(&slot).is_none(),
-            "the reference codec accepted len {len}, longer than the slot"
-        );
+            assert_eq!(
+                decode_records_row(&slot),
+                None,
+                "the generated codec accepted len {len}, longer than the slot"
+            );
+            assert!(
+                hand::decode_row(&slot).is_none(),
+                "the reference codec accepted len {len}, longer than the slot"
+            );
+        }
     }
 }
 
@@ -296,7 +330,7 @@ fn a_row_gives_back_exactly_the_bytes_its_len_claims() {
         let mut value = full;
         value[len as usize..].fill(0);
         let mut slot = [0u8; RECORDS_ROW_SIZE];
-        hand::encode_row(RowKind::Record, 0, len, 1, &value, &mut slot);
+        hand::encode_row(RowKind::Record, 0, len, false, 1, &value, &mut slot);
         let decoded = hand::decode_row(&slot).expect("legal len must decode");
         assert_eq!(decoded.len, len);
         assert_eq!(

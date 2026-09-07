@@ -77,7 +77,7 @@ fn million_row_database_end_to_end() {
                 result: Ok(Some(v)),
                 ..
             }) => {
-                assert_eq!(v, value_for(id), "id={id}");
+                assert_eq!(v.payload(), value_for(id), "id={id}");
             }
             other => panic!("get {id}: {other:?}"),
         }
@@ -102,10 +102,10 @@ fn million_row_database_end_to_end() {
         };
         assert!(page.count > 0, "window at {lo} empty");
         for w in page.items[..page.count as usize].windows(2) {
-            assert!(w[0].0 < w[1].0);
+            assert!(w[0].id < w[1].id);
         }
-        for &(k, v) in &page.items[..page.count as usize] {
-            assert_eq!(v, value_for(k));
+        for item in &page.items[..page.count as usize] {
+            assert_eq!(item.value(), Some(&value_for(item.id)[..]));
         }
     }
 

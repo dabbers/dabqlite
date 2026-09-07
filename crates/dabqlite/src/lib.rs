@@ -73,58 +73,82 @@ pub type SalvageDb = Db<ReadOnlyDir>;
 /// of row arena. Use [`Db::open_with`] or [`Db::in_memory_with`] to pick.
 pub const DEFAULT_ROWS: u64 = 65_536;
 
-/// A fixed-width value. Sixteen bytes, because that is what the compiled
-/// schema declares; [`Value::from_text`] and [`Value::from_bytes`] refuse
-/// anything longer rather than silently truncating it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Value(pub [u8; VALUE_LEN]);
+/// A stored value: any byte string up to [`MAX_VALUE_LEN`].
+///
+/// Values are exact. What you put in is what comes out, byte for byte,
+/// including trailing zeros — a value is stored with its length, not
+/// padded to a slot and guessed at on the way back.
+///
+/// A value longer than one row slot is stored across several, all written
+/// in a single commit, so a long value is as atomic and as crash-safe as a
+/// short one. [`Value::from_bytes`] refuses anything above the ceiling
+/// rather than truncating it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Value(Vec<u8>);
 
 impl Value {
-    /// Pack text into a value, zero-padded. Fails if it does not fit.
+    /// An empty value. Distinct from an absent row: a key can hold zero
+    /// bytes and still be present.
+    pub fn empty() -> Self {
+        Value(Vec::new())
+    }
+
+    /// Store text. Fails only if it is longer than [`MAX_VALUE_LEN`].
     pub fn from_text(text: &str) -> Result<Self, Error> {
         Self::from_bytes(text.as_bytes())
     }
 
-    /// Pack bytes into a value, zero-padded. Fails if they do not fit.
+    /// Store bytes. Fails only if they are longer than [`MAX_VALUE_LEN`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > VALUE_LEN {
+        if bytes.len() > MAX_VALUE_LEN {
             return Err(Error::ValueTooLong {
                 len: bytes.len(),
-                max: VALUE_LEN,
+                max: MAX_VALUE_LEN,
             });
         }
-        let mut v = [0u8; VALUE_LEN];
-        v[..bytes.len()].copy_from_slice(bytes);
-        Ok(Value(v))
+        Ok(Value(bytes.to_vec()))
     }
 
-    /// The bytes with the zero padding trimmed from the END.
-    ///
-    /// Interior zeros are preserved: `from_bytes(b"ab\0cd").as_bytes()`
-    /// is `b"ab\0cd"`, not `b"ab"`. (It used to stop at the first zero
-    /// anywhere, which silently truncated any binary payload — every
-    /// sample project built against this crate hit it, and two of them
-    /// abandoned `as_bytes` entirely in favour of [`Value::raw`].)
-    ///
-    /// A value whose own last byte is zero is still indistinguishable
-    /// from padding — that is inherent to a fixed-width slot, not a bug
-    /// to be fixed here. Binary payloads that can end in zero should
-    /// carry their own length, or use [`Value::raw`].
+    /// Take ownership of a byte vector as a value.
+    pub fn from_vec(bytes: Vec<u8>) -> Result<Self, Error> {
+        if bytes.len() > MAX_VALUE_LEN {
+            return Err(Error::ValueTooLong {
+                len: bytes.len(),
+                max: MAX_VALUE_LEN,
+            });
+        }
+        Ok(Value(bytes))
+    }
+
+    /// The bytes, exactly as stored. No trimming, no padding, no guessing.
     pub fn as_bytes(&self) -> &[u8] {
-        let end = self.0.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-        &self.0[..end]
+        &self.0
+    }
+
+    /// The bytes, taken.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// The value as text, lossily — invalid UTF-8 becomes replacement
     /// characters rather than an error, because a display path should not
     /// be able to fail.
     pub fn text(&self) -> alloc_string::String {
-        alloc_string::String::from_utf8_lossy(self.as_bytes()).into_owned()
+        alloc_string::String::from_utf8_lossy(&self.0).into_owned()
     }
+}
 
-    /// The raw, padded bytes.
-    pub fn raw(&self) -> [u8; VALUE_LEN] {
-        self.0
+impl AsRef<[u8]> for Value {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -132,9 +156,24 @@ mod alloc_string {
     pub use std::string::String;
 }
 
-impl From<[u8; VALUE_LEN]> for Value {
-    fn from(v: [u8; VALUE_LEN]) -> Self {
-        Value(v)
+impl TryFrom<&[u8]> for Value {
+    type Error = Error;
+    fn try_from(v: &[u8]) -> Result<Self, Error> {
+        Value::from_bytes(v)
+    }
+}
+
+impl TryFrom<Vec<u8>> for Value {
+    type Error = Error;
+    fn try_from(v: Vec<u8>) -> Result<Self, Error> {
+        Value::from_vec(v)
+    }
+}
+
+impl TryFrom<&str> for Value {
+    type Error = Error;
+    fn try_from(v: &str) -> Result<Self, Error> {
+        Value::from_text(v)
     }
 }
 
@@ -142,7 +181,7 @@ impl From<[u8; VALUE_LEN]> for Value {
 ///
 /// The constructors read better than the struct literals at a call site —
 /// `Op::put(id, v)` beside `Op::remove(id)` — so prefer them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// Add a row. Refuses the batch if the id is already there.
     Insert { id: u64, value: Value },
@@ -173,13 +212,22 @@ impl Op {
         Op::Remove { id }
     }
 
-    fn to_core(self) -> BatchOp {
+    fn to_core(&self) -> BatchOp<'_> {
         match self {
-            Op::Insert { id, value } => BatchOp::Insert { id, value: value.0 },
-            Op::Update { id, value } => BatchOp::Update { id, value: value.0 },
-            Op::Put { id, value } => BatchOp::Put { id, value: value.0 },
-            Op::Delete { id } => BatchOp::Delete { id },
-            Op::Remove { id } => BatchOp::Remove { id },
+            Op::Insert { id, value } => BatchOp::Insert {
+                id: *id,
+                value: value.as_bytes(),
+            },
+            Op::Update { id, value } => BatchOp::Update {
+                id: *id,
+                value: value.as_bytes(),
+            },
+            Op::Put { id, value } => BatchOp::Put {
+                id: *id,
+                value: value.as_bytes(),
+            },
+            Op::Delete { id } => BatchOp::Delete { id: *id },
+            Op::Remove { id } => BatchOp::Remove { id: *id },
         }
     }
 }
@@ -191,6 +239,14 @@ impl Op {
 /// (docs/FORMAT.md). Larger workloads split into several batches — each
 /// one still atomic in itself.
 pub const MAX_BATCH: usize = dabqlite_core::MAX_COMMIT_ROWS;
+
+/// The longest value this store will hold.
+///
+/// A value is written as a run of row slots inside ONE commit — that is
+/// what makes a long value atomic — so its ceiling is the longest commit
+/// the on-disk format can describe. Larger payloads belong in object
+/// storage, with a key or URL stored here.
+pub const MAX_VALUE_LEN: usize = dabqlite_core::MAX_VALUE_LEN;
 
 /// Everything that can go wrong, in the caller's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +369,10 @@ impl From<DbError> for Error {
             } => Error::CapacityTooSmall {
                 required,
                 asked: configured,
+            },
+            DbError::ValueTooLong { len, max } => Error::ValueTooLong {
+                len: len as usize,
+                max: max as usize,
             },
             DbError::IoFailed { file } => Error::Io {
                 detail: format!("{file:?}"),
@@ -509,9 +569,7 @@ impl Db<PosixStorage> {
         let _ = std::fs::remove_dir_all(&retired);
         {
             let mut fresh = Db::open_with(&staging, rows)?;
-            for (id, value) in live {
-                fresh.insert(id, value)?;
-            }
+            fresh.refill(live)?;
             // Drop to release the staging lock before the swap.
         }
         sync_dir(&staging)?;
@@ -632,37 +690,42 @@ impl<S: Storage> Db<S> {
 
     /// Add a row. Fails if the id is taken — use [`Db::put`] to overwrite.
     pub fn insert(&mut self, id: u64, value: Value) -> Result<(), Error> {
-        match self.host.insert(id, value.0) {
-            Output::InsertDone { result: Ok(()), .. } => Ok(()),
-            Output::InsertDone { result: Err(e), .. } => Err(e.into()),
-            other => unreachable!("insert returned {other:?}"),
-        }
+        self.one(Op::Insert { id, value })
     }
 
     /// Replace an existing row's value, atomically. Fails if it is absent.
     pub fn update(&mut self, id: u64, value: Value) -> Result<(), Error> {
-        match self.host.update(id, value.0) {
-            Output::UpdateDone { result: Ok(()), .. } => Ok(()),
-            Output::UpdateDone { result: Err(e), .. } => Err(e.into()),
-            other => unreachable!("update returned {other:?}"),
-        }
+        self.one(Op::Update { id, value })
     }
 
     /// Insert or replace, whichever applies — one atomic commit either way.
+    ///
+    /// Not insert-then-update-on-failure: the engine decides which it is
+    /// while the batch is being validated, so there is no window between
+    /// the decision and the write for anything to change underneath it.
     pub fn put(&mut self, id: u64, value: Value) -> Result<(), Error> {
-        match self.insert(id, value) {
-            Err(Error::AlreadyExists { .. }) => self.update(id, value),
-            other => other,
-        }
+        self.one(Op::Put { id, value })
     }
 
     /// Delete a row. Fails if it is absent; see [`Db::remove`] for the
     /// forgiving version.
     pub fn delete(&mut self, id: u64) -> Result<(), Error> {
-        match self.host.delete(id) {
-            Output::DeleteDone { result: Ok(()), .. } => Ok(()),
-            Output::DeleteDone { result: Err(e), .. } => Err(e.into()),
-            other => unreachable!("delete returned {other:?}"),
+        self.one(Op::Delete { id })
+    }
+
+    /// One write, as a one-operation batch.
+    ///
+    /// Every write goes through the same path, so a value spanning
+    /// several row slots is handled identically whether it arrives alone
+    /// or in company — and a single write costs exactly what it always
+    /// did, two fsyncs.
+    fn one(&mut self, op: Op) -> Result<(), Error> {
+        match self.batch(core::slice::from_ref(&op)) {
+            // A one-op batch can only be refused at operation 0, and the
+            // caller asked for one operation: give them its error, not a
+            // wrapper around it.
+            Err(Error::BatchRejected { cause, .. }) => Err(*cause),
+            other => other,
         }
     }
 
@@ -728,12 +791,40 @@ impl<S: Storage> Db<S> {
     }
 
     /// Read one row.
+    ///
+    /// A value longer than one row slot is reassembled here from the
+    /// bounded windows the engine hands back — the core never allocates,
+    /// and the caller never sees a partial value.
     pub fn get(&mut self, id: u64) -> Result<Option<Value>, Error> {
-        match self.host.get(id) {
-            Output::GetDone { result: Ok(v), .. } => Ok(v.map(Value)),
-            Output::GetDone { result: Err(e), .. } => Err(e.into()),
+        use dabqlite_core::Input;
+        let first = match self.host.get(id) {
+            Output::GetDone { result: Ok(v), .. } => v,
+            Output::GetDone { result: Err(e), .. } => return Err(e.into()),
             other => unreachable!("get returned {other:?}"),
+        };
+        let Some(first) = first else { return Ok(None) };
+        let mut bytes = Vec::with_capacity(first.total as usize);
+        bytes.extend_from_slice(first.payload());
+        let mut next = first.next_offset();
+        while let Some(offset) = next {
+            let window = match self.host.run(Input::GetFrom { id, offset }) {
+                Output::GetDone {
+                    result: Ok(Some(w)),
+                    ..
+                } => w,
+                Output::GetDone {
+                    result: Ok(None), ..
+                } => {
+                    unreachable!("a value vanished between windows of one read")
+                }
+                Output::GetDone { result: Err(e), .. } => return Err(e.into()),
+                other => unreachable!("get returned {other:?}"),
+            };
+            bytes.extend_from_slice(window.payload());
+            next = window.next_offset();
         }
+        debug_assert_eq!(bytes.len(), first.total as usize);
+        Ok(Some(Value(bytes)))
     }
 
     /// Is this id present?
@@ -762,16 +853,32 @@ impl<S: Storage> Db<S> {
     pub fn range_page(&mut self, lo: u64, hi: u64) -> Result<Page, Error> {
         use dabqlite_core::Input;
         match self.host.run(Input::Range { lo, hi }) {
-            Output::RangeDone { result: Ok(page) } => Ok((
-                page.items[..page.count as usize]
-                    .iter()
-                    .map(|&(k, v)| (k, Value(v)))
-                    .collect(),
-                page.next,
-            )),
+            Output::RangeDone { result: Ok(page) } => {
+                let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+                let next = page.next;
+                Ok((self.rows_from(&items)?, next))
+            }
             Output::RangeDone { result: Err(e) } => Err(e.into()),
             other => unreachable!("range returned {other:?}"),
         }
+    }
+
+    /// Turn a page of scan references into rows, reading back any value
+    /// too long to travel in the page itself. A page carries the whole
+    /// value when it fits and its LENGTH when it does not, so a long
+    /// value costs an extra read rather than arriving silently truncated.
+    fn rows_from(&mut self, items: &[dabqlite_core::RowRef]) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item.value() {
+                Some(bytes) => out.push((item.id, Value(bytes.to_vec()))),
+                None => {
+                    let value = self.get(item.id)?.ok_or(Error::NotFound { id: item.id })?;
+                    out.push((item.id, value));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every row, ascending by id.
@@ -803,12 +910,10 @@ impl<S: Storage> Db<S> {
                 Output::FindDone { result: Err(e) } => return Err(e.into()),
                 other => unreachable!("find returned {other:?}"),
             };
-            out.extend(
-                page.items[..page.count as usize]
-                    .iter()
-                    .map(|&(k, v)| (k, Value(v))),
-            );
-            match page.next {
+            let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+            let next = page.next;
+            out.extend(self.rows_from(&items)?);
+            match next {
                 Some(n) => after = Some(n),
                 None => return Ok(out),
             }
@@ -879,9 +984,43 @@ impl<S: Storage> Db<S> {
     pub fn compact_to_memory(&mut self) -> Result<Db<MemoryStorage>, Error> {
         let rows = self.all()?;
         let mut out = Db::in_memory_with(self.stats().capacity)?;
-        for (id, value) in rows {
-            out.insert(id, value)?;
-        }
+        out.refill(rows)?;
         Ok(out)
+    }
+
+    /// Write `rows` into an empty database, batched.
+    ///
+    /// Deliberately not a loop of `insert`: rebuilding a 60,000-row
+    /// database one commit at a time is 120,000 fsyncs where a few hundred
+    /// will do, and a library that does not use its own batch API to move
+    /// its own data is not making a serious offer.
+    ///
+    /// Batches are packed by ROW cost, not by operation count, because a
+    /// value spanning several slots takes several of the commit's rows.
+    fn refill(&mut self, rows: Vec<Row>) -> Result<(), Error> {
+        let mut ops: Vec<Op> = Vec::with_capacity(MAX_BATCH);
+        let mut staged = 0usize;
+        for (id, value) in rows {
+            let cost = value.len().div_ceil(VALUE_LEN).max(1);
+            if cost > MAX_BATCH {
+                // Unreachable while MAX_VALUE_LEN is bounded by the commit
+                // length, but stated rather than assumed.
+                return Err(Error::ValueTooLong {
+                    len: value.len(),
+                    max: MAX_VALUE_LEN,
+                });
+            }
+            if staged + cost > MAX_BATCH {
+                self.batch(&ops)?;
+                ops.clear();
+                staged = 0;
+            }
+            staged += cost;
+            ops.push(Op::Insert { id, value });
+        }
+        if !ops.is_empty() {
+            self.batch(&ops)?;
+        }
+        Ok(())
     }
 }

@@ -32,7 +32,9 @@ fn insert_ok(host: &mut SimHost, id: u64, value: [u8; VALUE_LEN]) {
 
 fn get_result(host: &mut SimHost, id: u64) -> Result<Option<[u8; VALUE_LEN]>, DbError> {
     match host.run_input(get_record(id)) {
-        Driven::Done(Output::GetDone { result, .. }) => result,
+        // This surface writes full-width values, so one window is the
+        // whole value.
+        Driven::Done(Output::GetDone { result, .. }) => result.map(|v| v.map(|w| w.bytes)),
         other => panic!("get_record({id}) did not complete: {other:?}"),
     }
 }
@@ -356,7 +358,12 @@ fn scan_all(host: &mut SimHost, lo: u64, hi: u64) -> Vec<(u64, [u8; VALUE_LEN])>
         pages += 1;
         assert!(pages <= 1 << 20, "paging did not terminate");
         let page = range_page(host, cursor, hi);
-        for &(k, v) in &page.items[..page.count as usize] {
+        for item in &page.items[..page.count as usize] {
+            let k = item.id;
+            let v = <[u8; VALUE_LEN]>::try_from(
+                item.value().expect("this surface writes full-width values"),
+            )
+            .expect("full-width value");
             if let Some(&(pk, _)) = out.last() {
                 assert!(k > pk, "scan not strictly ascending: {pk} then {k}");
             }
@@ -446,7 +453,13 @@ fn large_paged_scan_with_interruptions_between_pages() {
     let mut cursor = 0u64;
     for _ in 0..256 {
         let page = range_page(&mut host, cursor, u64::MAX);
-        first_half.extend_from_slice(&page.items[..page.count as usize]);
+        first_half.extend(page.items[..page.count as usize].iter().map(|r| {
+            (
+                r.id,
+                <[u8; VALUE_LEN]>::try_from(r.value().expect("full-width value"))
+                    .expect("full-width value"),
+            )
+        }));
         cursor = page.next.expect("mid-table page must have a continuation");
     }
     let disk = std::mem::take(&mut host.disk);
