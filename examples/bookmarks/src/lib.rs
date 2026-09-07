@@ -65,7 +65,7 @@ const F_TAG: u64 = 4;
 
 /// The store header lives on the reserved entity 0, so bookmark ids start
 /// at 1 and `all()` yields the header first.
-const HEADER_KEY: u64 = 0;
+const HEADER_KEY: u64 = key(0, F_HEADER, 0);
 const HEADER_MAGIC: &[u8; 4] = b"BMK1";
 
 /// Longest URL or title this crate accepts. Nothing in the library imposes

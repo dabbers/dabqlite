@@ -455,3 +455,41 @@ mod tests {
         assert!(matches!(err, KvError::ValueTooLong { .. }), "{err:?}");
     }
 }
+
+/// A tolerant [`scan`] for salvage: records this layout cannot read are
+/// skipped and counted instead of failing the whole listing.
+pub fn scan_recovered(rows: &Rows, now: u64) -> (Vec<Entry>, u64) {
+    let mut out = Vec::new();
+    let mut lost = 0u64;
+    for (&id, raw) in rows.iter() {
+        if chunk_of(id) != 0 {
+            continue;
+        }
+        let Ok(header) = Header::decode(raw) else {
+            lost += 1;
+            continue;
+        };
+        if !header.is_live() {
+            continue;
+        }
+        let rec = record_of(id);
+        match read_payload(rows, rec, &header) {
+            Ok(mut payload) => {
+                let value = payload.split_off(header.key_len);
+                match String::from_utf8(payload) {
+                    Ok(key) => out.push(Entry {
+                        key,
+                        value,
+                        expires_at: header.expires_at,
+                        record: rec,
+                    }),
+                    Err(_) => lost += 1,
+                }
+            }
+            Err(_) => lost += 1,
+        }
+    }
+    out.retain(|e| e.expires_at == 0 || e.expires_at > now);
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    (out, lost)
+}

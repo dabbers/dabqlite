@@ -398,39 +398,54 @@ pub struct RunReport {
     pub drained: bool,
     pub last_committed: u64,
     pub checksum: u64,
+    pub stats_fill: f64,
 }
 
 /// Run the worker until the queue is drained, `max_steps` is reached, or
 /// something goes wrong. Safe to kill at any instant and re-run.
+///
+/// # Why this is one long function
+///
+/// Every piece of queue logic that touches the database lives inside this
+/// body, as a closure. It is not a style choice. `dabqlite` exports
+/// `Db<S: Storage>` but exports neither the `Storage` trait nor
+/// `PosixStorage` nor `MemoryStorage`, so **`Db<PosixStorage>` is not a
+/// nameable type outside the crate**. A helper `fn` would have to write
+/// that type in its signature, and cannot. It cannot be stored in a
+/// struct field, returned from a function, put in a `Box<dyn _>`, or
+/// bounded by a trait of our own. A *closure* parameter can be written
+/// `&mut _` and inferred at the first call site, so closures are the only
+/// way to factor this code at all.
 pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError> {
     let layout = Layout::new(&cfg.root);
     layout.recover()?;
 
     let mut db = Db::open_with(layout.live(), cfg.capacity)?;
-    let report = db.recovery_report();
-    if report.rollback_evidence {
-        return Err(QueueError::RollbackEvidence(report));
+    let opened = db.recovery_report();
+    if opened.rollback_evidence {
+        return Err(QueueError::RollbackEvidence(opened));
     }
-    journal.record(&format!("S pid={} rows={}", std::process::id(), report.row_count))?;
+    journal.record(&format!(
+        "S pid={} rows={} orphans={}",
+        std::process::id(),
+        opened.row_count,
+        opened.orphan_valid_rows
+    ))?;
 
-    // ---- helpers -------------------------------------------------------
-    //
-    // These are closures, not functions, for one reason: the public crate
-    // exports `Db<S: Storage>` but exports neither `Storage` nor
-    // `PosixStorage` nor `MemoryStorage`, so `Db<PosixStorage>` is not a
-    // nameable type outside the crate. A free `fn` would have to write the
-    // type in its signature and cannot. A closure can say `&mut _` and let
-    // inference do it. See the review for why this is the single biggest
-    // usability problem in the API.
+    // ---- helpers, as closures (see the doc comment above) --------------
     let read_meta = |db: &mut _, id: u64| -> Result<(u64, u64), QueueError> {
-        match Db::get(db, id)? {
-            Some(v) => Ok(decode_meta(v)),
-            None => Ok((0, 0)),
-        }
+        Ok(Db::get(db, id)?.map(decode_meta).unwrap_or((0, 0)))
     };
     let put_meta = |db: &mut _, id: u64, a: u64, b: u64| -> Result<(), QueueError> {
         Db::put(db, id, encode_meta(a, b))?;
         Ok(())
+    };
+    // The head of the queue: the lowest-id job row. `range_page` gives a
+    // bounded page, which is the only way to ask "what is the first row
+    // at or after k" without collecting the whole range.
+    let head = |db: &mut _| -> Result<Option<(u64, JobRow)>, QueueError> {
+        let (page, _) = Db::range_page(db, FIRST_JOB_ID, MAX_JOB_ID)?;
+        Ok(page.first().map(|&(id, v)| (id, JobRow::decode(v))))
     };
 
     // Bootstrap the meta rows on a fresh database.
@@ -447,21 +462,22 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
         if rep.steps >= cfg.max_steps {
             break;
         }
+        rep.steps += 1;
 
         // ---- capacity management --------------------------------------
         //
-        // Every insert, update AND delete consumes a slot forever. A
-        // long-running queue therefore runs out of room even at constant
-        // size, and there is no background reclaim: the application has to
-        // watch `fill()` and rebuild. Worse, `delete` itself needs a free
-        // slot, so a database allowed to reach `Full` cannot be emptied —
-        // see `wedged_at_capacity` in tests/capacity.rs.
+        // Every insert, update AND delete consumes a slot forever, and
+        // nothing is ever reclaimed in place. A queue that stays the same
+        // size still runs out of room. The application has to watch
+        // `fill()` and rebuild before it hits the wall, because `delete`
+        // itself needs a free slot: a database allowed to reach `Full`
+        // cannot even be emptied (see tests/capacity.rs).
         if db.stats().fill() >= cfg.compact_at {
             journal.record("X begin")?;
             drop(db); // release the flock; there is no `close()`
             let c = layout.compact(cfg.capacity)?;
             journal.record(&format!(
-                "X end slots {} -> {} live {}",
+                "X end slots={}->{} live={}",
                 c.slots_before, c.slots_after, c.live_rows
             ))?;
             rep.compactions += 1;
@@ -470,12 +486,14 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
             if r.rollback_evidence {
                 return Err(QueueError::RollbackEvidence(r));
             }
-            if db.stats().fill() >= cfg.compact_at {
+            let s = db.stats();
+            if s.fill() >= cfg.compact_at {
                 return Err(QueueError::Wedged(format!(
-                    "compaction left fill at {:.2} with {} live rows in {} slots",
-                    db.stats().fill(),
-                    db.stats().live,
-                    db.stats().capacity
+                    "compaction left fill at {:.2}: {} live rows, {} slots, capacity {}",
+                    s.fill(),
+                    s.live,
+                    s.slots,
+                    s.capacity
                 )));
             }
             continue;
@@ -485,78 +503,192 @@ pub fn run(cfg: &Config, journal: &mut Journal) -> Result<RunReport, QueueError>
         let live_jobs = db.stats().live.saturating_sub(2);
 
         let progressed = if enqueue_next <= cfg.jobs && live_jobs < cfg.window {
-            enqueue(&mut db, journal, enqueue_next, &put_meta, &mut rep)?
+            // ---- ENQUEUE ----------------------------------------------
+            //
+            // Two writes that cannot be one: insert the job, then advance
+            // the watermark. The window between them is closed by making
+            // the insert idempotent -- `AlreadyExists` means a previous
+            // incarnation got the row in and died before the watermark
+            // moved. The journal `E` record is written ONLY when the
+            // insert genuinely succeeded, so a second `E` for the same id
+            // would prove an acknowledged insert had vanished.
+            let id = enqueue_next;
+            let row = JobRow {
+                state: PENDING,
+                attempts: 0,
+                payload: work_of(id),
+            };
+            match db.insert(id, row.encode()) {
+                Ok(()) => {
+                    journal.record(&format!("E {id}"))?;
+                    rep.enqueued += 1;
+                }
+                Err(DbErr::AlreadyExists { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            put_meta(&mut db, ROW_ENQUEUE_WATERMARK, id + 1, 0)?;
+            true
         } else {
-            step(&mut db, journal, cfg, &read_meta, &put_meta, &mut rep)?
+            // ---- DRAIN ------------------------------------------------
+            match head(&mut db)? {
+                None => false,
+                Some((id, job)) => match job.state {
+                    PENDING => {
+                        // Claim: PENDING -> CLAIMED. Safe because dabqlite
+                        // is single-writer by construction, so a
+                        // read-then-write needs no compare-and-swap. With
+                        // more than one worker there would be no way to do
+                        // this at all -- there is no conditional update.
+                        db.update(
+                            id,
+                            JobRow {
+                                state: CLAIMED,
+                                attempts: job.attempts.saturating_add(1),
+                                payload: job.payload,
+                            }
+                            .encode(),
+                        )?;
+                        journal.record(&format!("C {id}"))?;
+                        rep.claimed += 1;
+                        true
+                    }
+                    CLAIMED => {
+                        // Do the work, then record that it is done. The
+                        // effect is at-least-once: a crash here re-does it.
+                        let produced = work_of(id);
+                        if produced != job.payload {
+                            return Err(QueueError::Protocol(format!(
+                                "job {id} payload {:#x} != {produced:#x}",
+                                job.payload
+                            )));
+                        }
+                        journal.record(&format!("W {id}"))?;
+                        rep.work_performed += 1;
+                        db.update(
+                            id,
+                            JobRow {
+                                state: DONE,
+                                attempts: job.attempts,
+                                payload: job.payload,
+                            }
+                            .encode(),
+                        )?;
+                        true
+                    }
+                    DONE => {
+                        // ---- the commit ---------------------------------
+                        //
+                        // "Advance the aggregate AND retire the job" is two
+                        // row writes and there is no transaction, so it is
+                        // made idempotent by hand: the aggregate is a
+                        // MONOTONIC WATERMARK, not a counter. Committing
+                        // job `k` requires `k == last + 1`; if a crash
+                        // lands between the watermark write and the
+                        // delete, the restart sees `k <= last` and skips
+                        // straight to the delete. A plain counter would be
+                        // impossible to keep correct here.
+                        let (last, checksum) = read_meta(&mut db, ROW_COMMIT_WATERMARK)?;
+                        if id > last {
+                            if id != last + 1 {
+                                return Err(QueueError::Protocol(format!(
+                                    "commit watermark is {last}, head of queue is {id}"
+                                )));
+                            }
+                            put_meta(&mut db, ROW_COMMIT_WATERMARK, id, fold(checksum, id))?;
+                            journal.record(&format!("K {id}"))?;
+                            rep.committed += 1;
+                        }
+                        if cfg.reap {
+                            if db.remove(id)? {
+                                journal.record(&format!("R {id}"))?;
+                                rep.reaped += 1;
+                            }
+                        } else {
+                            // Not reaping: park the row out of the queue's
+                            // way. There is no secondary index and no
+                            // "where state = ?", so the ONLY way to keep
+                            // the head-of-queue scan cheap is to move the
+                            // row to a different id -- which dabqlite
+                            // cannot do either (no rename), so we delete
+                            // and re-insert, at two more slots.
+                            let archived = MAX_JOB_ID - id;
+                            db.remove(id)?;
+                            db.put(archived, JobRow { state: DONE, ..job }.encode())?;
+                            journal.record(&format!("A {id}"))?;
+                        }
+                        true
+                    }
+                    other => {
+                        return Err(QueueError::Protocol(format!(
+                            "job {id} has unknown state {other}"
+                        )))
+                    }
+                },
+            }
         };
 
-        rep.steps += 1;
         if cfg.delay_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(cfg.delay_us));
         }
 
         if !progressed {
-            let (committed, checksum) = read_meta(&mut db, ROW_COMMIT_WATERMARK)?;
-            rep.last_committed = committed;
-            rep.checksum = checksum;
-            rep.drained = enqueue_next > cfg.jobs && committed >= cfg.jobs;
             break;
         }
     }
 
     let (committed, checksum) = read_meta(&mut db, ROW_COMMIT_WATERMARK)?;
+    let (enqueue_next, _) = read_meta(&mut db, ROW_ENQUEUE_WATERMARK)?;
     rep.last_committed = committed;
     rep.checksum = checksum;
+    rep.drained = enqueue_next > cfg.jobs && committed >= cfg.jobs;
+    rep.stats_fill = db.stats().fill();
     Ok(rep)
 }
 
-/// Enqueue one job, then advance the enqueue watermark.
-///
-/// Two separate writes, because there is no way to make them one. The
-/// crash window between them is closed by making the insert idempotent:
-/// `AlreadyExists` means a previous incarnation got the insert in and died
-/// before the watermark moved.
-///
-/// The journal `E` record is written only when the insert genuinely
-/// succeeded, so a *second* `E` for the same id would prove that an
-/// acknowledged insert had vanished.
-fn enqueue<D, P>(
-    db: &mut D,
-    journal: &mut Journal,
-    id: u64,
-    put_meta: &P,
-    rep: &mut RunReport,
-) -> Result<bool, QueueError>
-where
-    P: Fn(&mut D, u64, u64, u64) -> Result<(), QueueError>,
-{
-    // `db` is generic-with-no-bounds here purely so this function can be
-    // written at all; every operation on it goes through a closure passed
-    // in from `run`, where the type is inferable.
-    let _ = db;
-    let _ = id;
-    let _ = journal;
-    let _ = put_meta;
-    let _ = rep;
-    unreachable!("replaced below")
+/// Read the queue's committed state without running it. Opens the
+/// database, so it needs the writer lock.
+pub fn inspect(cfg: &Config) -> Result<Inspection, QueueError> {
+    let layout = Layout::new(&cfg.root);
+    layout.recover()?;
+    let mut db = Db::open_with(layout.live(), cfg.capacity)?;
+    let rec = db.recovery_report();
+    let stats = db.stats();
+    let (enqueue_next, _) = Db::get(&mut db, ROW_ENQUEUE_WATERMARK)?
+        .map(decode_meta)
+        .unwrap_or((FIRST_JOB_ID, 0));
+    let (committed, checksum) = Db::get(&mut db, ROW_COMMIT_WATERMARK)?
+        .map(decode_meta)
+        .unwrap_or((0, 0));
+    let mut outstanding = Vec::new();
+    for (id, v) in db.range(FIRST_JOB_ID, MAX_JOB_ID)? {
+        outstanding.push((id, JobRow::decode(v)));
+    }
+    Ok(Inspection {
+        enqueue_next,
+        committed,
+        checksum,
+        outstanding,
+        live: stats.live,
+        slots: stats.slots,
+        dead: stats.dead,
+        capacity: stats.capacity,
+        rollback_evidence: rec.rollback_evidence,
+        orphan_valid_rows: rec.orphan_valid_rows,
+    })
 }
 
-/// Placeholder to keep the module compiling; the real bodies live in
-/// `run` via closures.
-fn step<D, R, P>(
-    db: &mut D,
-    journal: &mut Journal,
-    cfg: &Config,
-    read_meta: &R,
-    put_meta: &P,
-    rep: &mut RunReport,
-) -> Result<bool, QueueError>
-where
-    R: Fn(&mut D, u64) -> Result<(u64, u64), QueueError>,
-    P: Fn(&mut D, u64, u64, u64) -> Result<(), QueueError>,
-{
-    let _ = (db, journal, cfg, read_meta, put_meta, rep);
-    unreachable!("replaced below")
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub enqueue_next: u64,
+    pub committed: u64,
+    pub checksum: u64,
+    pub outstanding: Vec<(u64, JobRow)>,
+    pub live: u64,
+    pub slots: u64,
+    pub dead: u64,
+    pub capacity: u64,
+    pub rollback_evidence: bool,
+    pub orphan_valid_rows: u64,
 }
 
 // ---------------------------------------------------------------------------
