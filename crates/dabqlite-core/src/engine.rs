@@ -928,6 +928,13 @@ impl Engine {
         self.quarantined
     }
 
+    /// The largest id this database has ever held, live or since
+    /// deleted — the number an auto-increment would hand out next.
+    /// `None` when nothing has ever been inserted.
+    pub fn max_id(&self) -> Option<u64> {
+        self.ordered.max_key()
+    }
+
     /// Rows verified by substring search since open. See the field.
     pub fn find_verifications(&self) -> u64 {
         self.find_verifications.get()

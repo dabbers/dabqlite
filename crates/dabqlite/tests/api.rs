@@ -952,3 +952,44 @@ fn readers_run_alongside_the_writer_and_never_see_a_half_commit() {
     drop(writer);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `max_id` answers "what id comes next" without a scan.
+///
+/// A sample application needed it and had no way to ask: it scanned every
+/// row for the maximum, then cached the answer in a row of its own, which
+/// every insert then rewrote — 49,999 dead slots after 50,000 inserts, 9%
+/// of its arena, to store a number the index already knew.
+#[test]
+fn the_largest_id_is_a_question_you_can_ask() {
+    let mut db = Db::in_memory_with(256).expect("open");
+    assert_eq!(db.max_id(), None, "an empty database has no largest id");
+
+    for id in [5u64, 100, 42] {
+        db.put(id, Value::from_text("x").unwrap()).unwrap();
+    }
+    assert_eq!(db.max_id(), Some(100));
+
+    // It is the largest id EVER used, not the largest live one: an
+    // allocator that reused 100 after it was deleted would collide with
+    // rows that still remember it.
+    db.remove(100).unwrap();
+    assert_eq!(db.get(100).unwrap(), None);
+    assert_eq!(
+        db.max_id(),
+        Some(100),
+        "a deleted id must not be handed out again"
+    );
+
+    // It survives a restart, because the tree is rebuilt from the rows.
+    let snapshot = db.snapshot().unwrap();
+    let reloaded = Db::load(&snapshot).expect("reload");
+    assert_eq!(reloaded.max_id(), Some(100));
+
+    // And it tracks growth across enough inserts to span several tree
+    // levels, so the descent is exercised rather than a single leaf.
+    let mut db = Db::in_memory_with(1024).expect("open");
+    for id in 0..500u64 {
+        db.put(id * 7, Value::from_text("x").unwrap()).unwrap();
+        assert_eq!(db.max_id(), Some(id * 7), "after inserting {}", id * 7);
+    }
+}

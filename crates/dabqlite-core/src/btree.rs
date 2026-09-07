@@ -212,6 +212,33 @@ impl BTreeIndex {
     /// In-order visit of every `(key, row)` with `key >= start`, until the
     /// callback returns `false`. Bounded work per call is the caller's job
     /// (the engine pages); termination here is the leaf chain's finiteness.
+    /// The largest key the tree holds, or `None` if it is empty.
+    ///
+    /// The tree keeps an entry for every id ever inserted, so this is the
+    /// largest id the database has ever used — live or since deleted —
+    /// which is exactly the question "what id comes next" is asking.
+    /// Answering it without this meant scanning every row, and then
+    /// materializing the answer into a counter row that burned a slot on
+    /// every insert: one sample application measured 49,999 dead slots
+    /// after 50,000 inserts, 9% of its arena, doing precisely that.
+    ///
+    /// O(depth): descend right, take the last key of the rightmost leaf.
+    pub fn max_key(&self) -> Option<u64> {
+        let mut id = self.root;
+        let mut steps = 0u32;
+        loop {
+            assert!(steps <= self.used, "btree descent cycle");
+            steps += 1;
+            let n = self.node(id);
+            if n.leaf {
+                let len = n.len as usize;
+                // A non-root leaf is never empty; the root can be.
+                return (len > 0).then(|| n.keys[len - 1]);
+            }
+            id = n.children[n.len as usize];
+        }
+    }
+
     pub fn for_each_from(&self, start: u64, mut f: impl FnMut(u64, u64) -> bool) {
         // Descend to the leaf that could contain `start`.
         let mut id = self.root;
@@ -735,5 +762,35 @@ mod tests {
             }
         }
         t.for_each_from(0, |_, _| true);
+    }
+    /// `max_key` against the oracle, over random insertion orders and
+    /// every tree shape they produce. A descent that took the wrong child
+    /// would be right on a single leaf and wrong the moment the tree
+    /// splits, which is exactly what this covers.
+    #[test]
+    fn max_key_matches_the_oracle_at_every_size() {
+        use alloc::collections::BTreeMap;
+        for seed in 0..16u64 {
+            let mut t = BTreeIndex::new(600);
+            let mut oracle: BTreeMap<u64, u64> = BTreeMap::new();
+            assert_eq!(t.max_key(), None, "an empty tree has no largest key");
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for row in 0..500u64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let key = x % 10_000;
+                if oracle.contains_key(&key) {
+                    continue;
+                }
+                t.insert(key, row);
+                oracle.insert(key, row);
+                assert_eq!(
+                    t.max_key(),
+                    oracle.keys().next_back().copied(),
+                    "seed {seed} after inserting {key}"
+                );
+            }
+        }
     }
 }

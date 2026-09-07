@@ -1035,6 +1035,18 @@ impl<S: Storage> Db<S> {
         Ok(Some(Value(bytes)))
     }
 
+    /// The largest id this database has ever held, live or since
+    /// deleted — the number to hand out next if you are allocating ids.
+    /// `None` when nothing has ever been inserted.
+    ///
+    /// Constant-ish time, not a scan. Without it the only way to ask was
+    /// to read every row and take the maximum, and then to cache the
+    /// answer in a row of its own — which one sample application did, and
+    /// measured at 49,999 dead slots after 50,000 inserts.
+    pub fn max_id(&self) -> Option<u64> {
+        self.h().engine.max_id()
+    }
+
     /// Is this id present?
     pub fn contains(&mut self, id: u64) -> Result<bool, Error> {
         Ok(self.get(id)?.is_some())
