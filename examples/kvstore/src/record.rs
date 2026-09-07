@@ -12,28 +12,55 @@
 //! that is gone. A record is:
 //!
 //! ```text
-//! 0      magic
-//! 1      flags (bit 0: live)
-//! 2..4   key length, u16 LE
-//! 4..12  expiry, unix seconds, u64 LE; 0 means never
-//! 12..   key bytes, then value bytes
+//! 0..k   key bytes (NUL is not a legal key byte)
+//! k      0x00, the key terminator
+//! k+1    magic
+//! k+2    flags (bit 0: live)
+//! k+3..  expiry, unix seconds, u64 LE; 0 means never
+//! k+11.. value bytes
 //! ```
 //!
 //! and the id is the key's hash. Nothing about the layout is a commit
 //! protocol any more; the library's commit is the commit.
+//!
+//! ## Why the key comes FIRST
+//!
+//! The header used to lead, with the key at byte 12. That put the key
+//! where nothing could order by it, and `list` was a full scan and a sort
+//! because the library's one ordering was by id and an id is a hash.
+//!
+//! The library now offers a scan in VALUE order — byte-lexicographic over
+//! the stored bytes — so a record whose key is its first bytes is a
+//! record the library can sort, page and prefix-scan directly. Moving the
+//! key to the front is the entire cost of that, and `Db::prefix` answers
+//! "everything under `session/`" off an index instead of by reading the
+//! whole database.
+//!
+//! The terminator is what makes byte order KEY order: without it `ab`
+//! would sort between `a` and `a!`, because the header byte following a
+//! short key would be compared against the next key byte of a longer one.
+//! `0x00` is below every legal key byte, so `a\0…` sorts before `ab\0…`
+//! exactly as `a` sorts before `ab`. Keys are rejected at the door if
+//! they contain one — see `store::validate_key`.
 
 use dabqlite::{Value, MAX_VALUE_LEN};
 
 use crate::KvError;
 
-/// Bytes in front of `key ++ value`.
-pub const HEADER: usize = 12;
+/// Bytes between the key's terminator and the value: magic, flags and the
+/// expiry. The terminator itself is counted separately, so a record is
+/// `key.len() + 1 + HEADER + value.len()` bytes.
+pub const HEADER: usize = 10;
+
+/// The byte that ends the key. Below every legal key byte, which is what
+/// makes byte order key order.
+pub const KEY_END: u8 = 0x00;
 
 const MAGIC: u8 = 0xD5;
 const F_LIVE: u8 = 0b0000_0001;
 
 /// Bytes a record can hold, key and value together.
-pub const MAX_PAYLOAD: usize = MAX_VALUE_LEN - HEADER;
+pub const MAX_PAYLOAD: usize = MAX_VALUE_LEN - HEADER - 1;
 /// Keys are capped well below that so a key always leaves room for a value.
 pub const MAX_KEY: usize = 256;
 /// How far a lookup probes past a colliding record before giving up.
@@ -93,44 +120,55 @@ pub fn encode(key: &str, value: &[u8], expires_at: u64) -> Result<Value, KvError
             max: MAX_PAYLOAD - key.len(),
         });
     }
-    let mut b = Vec::with_capacity(HEADER + payload);
+    debug_assert!(
+        !key.as_bytes().contains(&KEY_END),
+        "validate_key must reject a key holding the terminator"
+    );
+    let mut b = Vec::with_capacity(HEADER + 1 + payload);
+    b.extend_from_slice(key.as_bytes());
+    b.push(KEY_END);
     b.push(MAGIC);
     b.push(F_LIVE);
-    b.extend_from_slice(&(key.len() as u16).to_le_bytes());
     b.extend_from_slice(&expires_at.to_le_bytes());
-    b.extend_from_slice(key.as_bytes());
     b.extend_from_slice(value);
-    // `from_vec` cannot fail here: HEADER + MAX_PAYLOAD is MAX_VALUE_LEN.
+    // `from_vec` cannot fail here: HEADER + 1 + MAX_PAYLOAD is
+    // MAX_VALUE_LEN.
     Value::from_vec(b).map_err(KvError::from)
 }
 
 /// A chain link with nothing in it.
+///
+/// It has an empty key, so it sorts at the very front of the value order
+/// — where a scan skips it like any other record that is not visible.
 pub fn tombstone() -> Value {
-    let mut b = vec![0u8; HEADER];
-    b[0] = MAGIC;
-    Value::from_vec(b).expect("a tombstone is twelve bytes")
+    let mut b = vec![0u8; HEADER + 1];
+    b[0] = KEY_END;
+    b[1] = MAGIC;
+    Value::from_vec(b).expect("a tombstone is eleven bytes")
 }
 
 /// Decode a stored value. Fails only when the bytes are not a record this
 /// crate wrote.
 pub fn decode(v: &Value) -> Result<Record, KvError> {
     let b = v.as_bytes();
-    if b.len() < HEADER || b[0] != MAGIC {
+    // The key runs to the first terminator; everything after it is fixed
+    // width, so a record is well formed exactly when both are present.
+    let Some(key_len) = b.iter().position(|&c| c == KEY_END) else {
+        return Err(KvError::Layout(format!(
+            "a {} byte row is not a kvstore record: no key terminator",
+            b.len()
+        )));
+    };
+    let after = key_len + 1;
+    if b.len() < after + HEADER || b[after] != MAGIC {
         return Err(KvError::Layout(format!(
             "a {} byte row is not a kvstore record",
             b.len()
         )));
     }
-    let key_len = u16::from_le_bytes([b[2], b[3]]) as usize;
-    let expires_at = u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"));
-    let live = b[1] & F_LIVE != 0;
-    if HEADER + key_len > b.len() {
-        return Err(KvError::Layout(format!(
-            "record declares a {key_len} byte key but holds {} payload bytes",
-            b.len() - HEADER
-        )));
-    }
-    let (key, value) = b[HEADER..].split_at(key_len);
+    let live = b[after + 1] & F_LIVE != 0;
+    let expires_at = u64::from_le_bytes(b[after + 2..after + 10].try_into().expect("8 bytes"));
+    let (key, value) = (&b[..key_len], &b[after + HEADER..]);
     let key = String::from_utf8(key.to_vec())
         .map_err(|e| KvError::Layout(format!("record has a non-UTF-8 key: {e}")))?;
     Ok(Record {
@@ -180,11 +218,14 @@ mod tests {
     /// there is no half-applied state for a spare bank to protect.
     #[test]
     fn a_whole_record_is_one_value_over_a_run_of_slots() {
-        let v = encode("k", &vec![b'x'; 300], 0).unwrap();
-        assert_eq!(v.len(), HEADER + 1 + 300);
+        let key = "k";
+        let v = encode(key, &vec![b'x'; 300], 0).unwrap();
+        // key, terminator, header, value — the whole record, in that order.
+        let expect = key.len() + 1 + HEADER + 300;
+        assert_eq!(v.len(), expect);
         assert_eq!(
             dabqlite::Op::put(1, v).rows(),
-            (HEADER + 1 + 300_usize).div_ceil(dabqlite::VALUE_LEN)
+            expect.div_ceil(dabqlite::VALUE_LEN)
         );
     }
 

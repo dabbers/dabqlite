@@ -173,16 +173,10 @@ fn read<S: dabqlite::Storage>(
             Some(e) => Outcome::Info(e),
             None => Outcome::Missing { key: key.clone() },
         },
-        Command::List { prefix, values } => {
-            let mut entries = store.entries(now)?;
-            if let Some(p) = prefix {
-                entries.retain(|e| e.key.starts_with(p.as_str()));
-            }
-            Outcome::Entries {
-                entries,
-                values: *values,
-            }
-        }
+        Command::List { prefix, values } => Outcome::Entries {
+            entries: store.under(prefix.as_deref().unwrap_or(""), now)?,
+            values: *values,
+        },
         Command::Search { needle, keys } => Outcome::Entries {
             entries: store.search(needle, *keys, now)?,
             values: true,

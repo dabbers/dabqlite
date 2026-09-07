@@ -21,11 +21,17 @@
 //!
 //! ## What the library still makes us do
 //!
-//! - **String keys are ours.** The table is keyed by `u64`, so a key is
-//!   hashed and collisions are probed past. That means our own tombstones
-//!   (a removed row is indistinguishable from one that never existed, so
-//!   `Db::remove` would cut a probe chain), and it means `list` is a full
-//!   scan and a sort, because id order is hash order.
+//! - **String keys are ours, but their ORDER is not any more.** The table
+//!   is keyed by `u64`, so a key is still hashed and collisions are still
+//!   probed past, and we still keep our own tombstones (a removed row is
+//!   indistinguishable from one that never existed, so `Db::remove` would
+//!   cut a probe chain). What has gone is the listing cost: `list` used
+//!   to be a full scan and a sort, because id order is hash order. The
+//!   library now scans in VALUE order, so a record whose first bytes are
+//!   its key is a record the library can sort. Moving the key to the
+//!   front of the record (see [`record`]) was the whole price, and
+//!   "everything under `session/`" is now a prefix scan off an index
+//!   rather than a read of the entire database.
 //! - **Expiry is ours.** There is no TTL and no expression that can be
 //!   evaluated at read time, so every record carries a timestamp and every
 //!   read compares it.

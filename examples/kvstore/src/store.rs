@@ -59,6 +59,17 @@ pub fn validate_key(key: &str) -> Result<(), KvError> {
             max: MAX_KEY,
         });
     }
+    // The key is the front of the record and a NUL ends it, which is what
+    // makes byte order key order (see `record`). A key holding one would
+    // decode as a shorter key with garbage behind it, so it is refused at
+    // the door rather than stored and misread later.
+    if key.as_bytes().contains(&record::KEY_END) {
+        return Err(KvError::BadKey(
+            "a key may not contain a NUL byte: it terminates the key inside \
+             the record"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -210,22 +221,41 @@ impl<S: Storage> Store<S> {
 
     /// Every live, unexpired entry, ordered by key.
     ///
-    /// A full scan and a sort, every time: ids are hashes, so the
-    /// library's one ordering (`u64` ascending) is not key order and
-    /// there is no second index to ask.
+    /// This used to be a full scan and a sort, every time: ids are
+    /// hashes, so the library's one ordering (`u64` ascending) was not key
+    /// order and there was no second index to ask. The key is now the
+    /// front of the record and the library scans in VALUE order, so this
+    /// is that scan — already in key order, with nothing to sort.
     pub fn entries(&mut self, now: u64) -> Result<Vec<Entry>, KvError> {
+        self.under("", now)
+    }
+
+    /// Every live, unexpired entry whose key starts with `prefix`, in key
+    /// order.
+    ///
+    /// The one that used to hurt. "List everything under `session/`" was
+    /// a scan of the whole database, a sort, and then a filter; it is now
+    /// a prefix scan off the index, which reads the matching rows and
+    /// stops.
+    pub fn under(&mut self, prefix: &str, now: u64) -> Result<Vec<Entry>, KvError> {
         let mut out = Vec::new();
-        self.for_each(|id, r| {
-            if r.visible(now) {
-                out.push(Entry {
-                    key: r.key,
-                    value: r.value,
-                    expires_at: r.expires_at,
-                    id,
-                });
+        for (id, value) in self.db.prefix(prefix.as_bytes())? {
+            let r = record::decode(&value)?;
+            if !r.visible(now) {
+                continue;
             }
-        })?;
-        out.sort_by(|a, b| a.key.cmp(&b.key));
+            // A prefix over RECORD bytes is a prefix over key bytes only
+            // because the key leads. Checked rather than assumed: a
+            // record whose key merely started with the prefix and then
+            // ended would still match the byte scan.
+            debug_assert!(r.key.starts_with(prefix));
+            out.push(Entry {
+                key: r.key,
+                value: r.value,
+                expires_at: r.expires_at,
+                id,
+            });
+        }
         Ok(out)
     }
 

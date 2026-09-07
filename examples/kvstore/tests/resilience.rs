@@ -297,3 +297,96 @@ fn a_directory_can_be_asked_whether_it_holds_a_database() {
     assert!(Db::exists(&dir));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **Listing under a prefix reads the prefix, not the database.**
+///
+/// The limitation this replaces was the sharpest one in the crate's own
+/// review: "`list` is a full scan and a sort, because id order is hash
+/// order". A key/value store's most ordinary query — everything under
+/// `session/` — read every record and sorted them, at every call.
+///
+/// The key is the front of the record now, and the library scans in value
+/// order, so the query reads the matching rows. Timed rather than
+/// asserted, against a budget wide enough that only the SHAPE can fail
+/// it: a hundredth of the database, so a full scan is ~100x and the
+/// budget is 10x.
+#[test]
+fn a_prefix_listing_costs_the_prefix_and_not_the_database() {
+    use kvstore::store::Store;
+    let mut s = Store::in_memory(65_536).expect("open");
+    for i in 0..1000u32 {
+        let key = if i % 100 == 0 {
+            format!("session/{i:04}")
+        } else {
+            format!("other/{i:04}")
+        };
+        s.set(&key, b"v", 0, 0).expect("set");
+    }
+    let all = std::time::Instant::now();
+    let everything = s.entries(0).expect("entries");
+    let all = all.elapsed();
+    assert_eq!(everything.len(), 1000);
+
+    let some = std::time::Instant::now();
+    let sessions = s.under("session/", 0).expect("under");
+    let some = some.elapsed();
+    assert_eq!(sessions.len(), 10);
+
+    let ratio = all.as_secs_f64() / some.as_secs_f64().max(1e-9);
+    assert!(
+        ratio > 10.0,
+        "listing 1% of the keys took 1/{ratio:.1} of listing all of them; \
+         a prefix scan that still reads the whole database would be ~1"
+    );
+}
+
+/// And the order is the KEY's order, everywhere — not id order, not
+/// insertion order.
+#[test]
+fn listings_come_back_in_key_order_without_a_sort() {
+    use kvstore::store::Store;
+    let mut s = Store::in_memory(4096).expect("open");
+    let keys = [
+        "session/z",
+        "a",
+        "session/a",
+        "session",
+        "session/",
+        "b/c",
+        "session0",
+        "aa",
+    ];
+    for k in keys {
+        s.set(k, k.as_bytes(), 0, 0).expect("set");
+    }
+    let mut sorted: Vec<&str> = keys.to_vec();
+    sorted.sort_unstable();
+    let got: Vec<String> = s.entries(0).unwrap().into_iter().map(|e| e.key).collect();
+    assert_eq!(got, sorted);
+
+    // A prefix takes exactly the keys under it — "session" and
+    // "session0" are NOT under "session/", and the terminator is what
+    // keeps them out.
+    let under: Vec<String> = s
+        .under("session/", 0)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key)
+        .collect();
+    assert_eq!(under, vec!["session/", "session/a", "session/z"]);
+}
+
+/// The key terminator has to be refused as a key byte, or a key holding
+/// one would decode as a shorter key with garbage behind it — silently.
+#[test]
+fn a_key_holding_the_terminator_is_refused_at_the_door() {
+    use kvstore::store::{validate_key, Store};
+    assert!(validate_key("ok/key").is_ok());
+    let bad = "bad\0key";
+    let err = validate_key(bad).unwrap_err();
+    assert!(format!("{err}").contains("NUL"), "{err}");
+
+    let mut s = Store::in_memory(256).expect("open");
+    assert!(s.set(bad, b"v", 0, 0).is_err(), "and the store agrees");
+    assert_eq!(s.entries(0).unwrap().len(), 0, "nothing was written");
+}
