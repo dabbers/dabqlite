@@ -486,16 +486,10 @@ fn substring_search_crosses_slot_seams_and_stays_exact() {
 
 /// Every match, in ascending id order. Pages arrive newest-first.
 fn find_ids(host: &mut SimHost, needle: &[u8]) -> Vec<u64> {
-    let mut padded = [0u8; VALUE_LEN];
-    padded[..needle.len()].copy_from_slice(needle);
     let mut out = Vec::new();
     let mut after = None;
     loop {
-        let page = match host.run_input(Input::Find {
-            needle: padded,
-            needle_len: needle.len() as u8,
-            after,
-        }) {
+        let page = match host.run_input(Input::Find { needle, after }) {
             Driven::Done(Output::FindDone { result: Ok(p) }) => p,
             other => panic!("find: {other:?}"),
         };

@@ -353,7 +353,7 @@ impl SimHost {
 
     /// Drive a client input produced by the generated query surface
     /// (`dabqlite_core::generated::queries`) to completion.
-    pub fn run_input(&mut self, input: Input<'static>) -> Driven {
+    pub fn run_input(&mut self, input: Input<'_>) -> Driven {
         assert!(
             matches!(
                 input,
@@ -441,17 +441,10 @@ impl SimHost {
     /// [`SimHost::find_all`] for values of ANY length: every match, in row
     /// order, each value whole.
     pub fn find_all_bytes(&mut self, needle: &[u8]) -> Vec<(u64, Vec<u8>)> {
-        assert!(needle.len() <= VALUE_LEN);
-        let mut padded = [0u8; VALUE_LEN];
-        padded[..needle.len()].copy_from_slice(needle);
         let mut refs = Vec::new();
         let mut after = None;
         loop {
-            let page = match self.run_input(Input::Find {
-                needle: padded,
-                needle_len: needle.len() as u8,
-                after,
-            }) {
+            let page = match self.run_input(Input::Find { needle, after }) {
                 Driven::Done(Output::FindDone { result: Ok(p) }) => p,
                 other => panic!("find_all_bytes: {other:?}"),
             };
@@ -492,16 +485,10 @@ impl SimHost {
     /// by scanning forwards want the forward order.
     pub fn find_all(&mut self, needle: &[u8]) -> Vec<(u64, [u8; VALUE_LEN])> {
         assert!(needle.len() <= VALUE_LEN);
-        let mut padded = [0u8; VALUE_LEN];
-        padded[..needle.len()].copy_from_slice(needle);
         let mut out = Vec::new();
         let mut after = None;
         loop {
-            let page = match self.run_input(Input::Find {
-                needle: padded,
-                needle_len: needle.len() as u8,
-                after,
-            }) {
+            let page = match self.run_input(Input::Find { needle, after }) {
                 Driven::Done(Output::FindDone { result: Ok(p) }) => p,
                 other => panic!("find_all: {other:?}"),
             };

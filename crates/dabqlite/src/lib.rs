@@ -37,10 +37,19 @@
 //!
 //! ## The v1 shape, stated plainly
 //!
-//! One table of `(id: u64, value: [u8; 16])`, a declared row capacity
-//! fixed at open, and one writer at a time. Values are 16 bytes because
-//! the schema says so ([`VALUE_LEN`]); [`Value`] helps you pack text into
-//! them and tells you when it does not fit rather than truncating.
+//! One table of `(id: u64, value: bytes)`, a declared capacity fixed at
+//! open, and one writer at a time.
+//!
+//! Capacity is declared in ROW SLOTS, and that is the unit everything
+//! about space is quoted in. A value occupies one slot per
+//! [`VALUE_LEN`] bytes of it, and at least one — [`Op::rows`] says how
+//! many a given write will take, [`Stats::free`] says how many are left,
+//! and a value may be up to [`MAX_VALUE_LEN`] bytes long. A deletion
+//! takes a slot too, because it is recorded by appending a tombstone
+//! rather than by erasing anything.
+//!
+//! [`Value`] carries the bytes; it never truncates, and never pads —
+//! what you store is what you read back, trailing zero bytes included.
 
 use dabqlite_core::{BatchOp, Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
 use dabqlite_host::Host;
@@ -249,15 +258,41 @@ impl Op {
             Op::Remove { id } => BatchOp::Remove { id: *id },
         }
     }
+
+    /// Row slots this operation will consume.
+    ///
+    /// A batch is bounded by [`MAX_COMMIT_ROWS`] SLOTS and a database by
+    /// its capacity in slots, so this is the number a caller adds up when
+    /// packing a batch or deciding whether the next write fits
+    /// ([`Stats::free`]). Every consumer was otherwise re-deriving
+    /// `len.div_ceil(VALUE_LEN).max(1)` by hand.
+    ///
+    /// A [`Op::Remove`] of an id that is already gone stages nothing and
+    /// costs nothing, but that cannot be known without the database, so
+    /// this reports the slot it would take if the row is there — the
+    /// bound a caller can plan against.
+    pub fn rows(&self) -> usize {
+        match self {
+            Op::Insert { value, .. } | Op::Update { value, .. } | Op::Put { value, .. } => {
+                value.len().div_ceil(CORE_VALUE_LEN).max(1)
+            }
+            Op::Delete { .. } | Op::Remove { .. } => 1,
+        }
+    }
 }
 
-/// The most operations one [`Db::batch`] may carry.
+/// The most ROW SLOTS one [`Db::batch`] may carry.
+///
+/// Not operations: a delete takes one slot, and a value takes one per
+/// [`VALUE_LEN`] bytes, so two operations can be too long for a batch
+/// while a hundred short ones fit. [`Op::rows`] is what a caller should
+/// add up when packing a batch.
 ///
 /// Fixed by the on-disk format: each row of a commit records how many
 /// rows follow it in the same commit, and that field has a range
 /// (docs/FORMAT.md). Larger workloads split into several batches — each
 /// one still atomic in itself.
-pub const MAX_BATCH: usize = dabqlite_core::MAX_COMMIT_ROWS;
+pub const MAX_COMMIT_ROWS: usize = dabqlite_core::MAX_COMMIT_ROWS;
 
 /// The longest value this store will hold.
 ///
@@ -295,8 +330,12 @@ pub enum Error {
     /// deliberately NOT an [`Error::Io`]: contention is a normal
     /// condition, a failing disk is not.
     Locked { detail: String },
-    /// The value is longer than a row can hold.
+    /// The value is longer than any value may be.
     ValueTooLong { len: usize, max: usize },
+    /// The search needle is longer than any value may be, so nothing
+    /// could contain it. Distinct from [`Error::ValueTooLong`] because
+    /// the thing that is too long is the question, not the data.
+    NeedleTooLong { len: usize, max: usize },
     /// The database is open in salvage mode with unreadable rows, and this
     /// question cannot be answered honestly. Rebuild to clear it.
     Degraded { quarantined: u64 },
@@ -357,8 +396,13 @@ impl core::fmt::Display for Error {
             ),
             Error::Locked { detail } => write!(f, "database is open by another writer: {detail}"),
             Error::ValueTooLong { len, max } => {
-                write!(f, "value is {len} bytes; the row holds {max}")
+                write!(f, "value is {len} bytes; the maximum is {max}")
             }
+            Error::NeedleTooLong { len, max } => write!(
+                f,
+                "search needle is {len} bytes; no value may exceed {max}, \
+                 so nothing could contain it"
+            ),
             Error::Degraded { quarantined } => write!(
                 f,
                 "database is degraded: {quarantined} unreadable row(s); \
@@ -467,6 +511,21 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Slots still available. A write fits exactly when [`Op::rows`] for
+    /// it is no greater than this — which is the question `fill()` cannot
+    /// answer once values span more than one slot, because a database at
+    /// 60% fill still refuses a value that needs more room than the
+    /// remaining 40% holds.
+    pub fn free(&self) -> u64 {
+        self.capacity.saturating_sub(self.slots)
+    }
+
+    /// Slots a rebuild would return: [`Stats::dead`] plus what is already
+    /// free. The honest answer to "how much room could I have".
+    pub fn reclaimable(&self) -> u64 {
+        self.free() + self.dead
+    }
+
     /// Fraction of capacity consumed, 0.0..=1.0. Watch this rather than
     /// waiting for [`Error::Full`].
     pub fn fill(&self) -> f64 {
@@ -965,7 +1024,7 @@ impl<S: Storage> Db<S> {
     /// If any operation is refused, the batch is refused whole with
     /// [`Error::BatchRejected`] naming which one and why, and NOTHING is
     /// written — not even the operations before it. Batches are limited to
-    /// [`MAX_BATCH`] operations.
+    /// [`MAX_COMMIT_ROWS`] operations.
     ///
     /// ```no_run
     /// # use dabqlite::{MemDb, Op, Value};
@@ -1147,19 +1206,17 @@ impl<S: Storage> Db<S> {
         after: Option<FindCursor>,
     ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
         use dabqlite_core::Input;
-        if needle.len() > VALUE_LEN {
-            return Err(Error::ValueTooLong {
+        if needle.len() > MAX_VALUE_LEN {
+            // The only ceiling left is the one no value can exceed
+            // either. A needle used to be capped at one ROW — 16 bytes —
+            // which made searching for anything a person would type
+            // impossible for reasons that had nothing to do with search.
+            return Err(Error::NeedleTooLong {
                 len: needle.len(),
-                max: VALUE_LEN,
+                max: MAX_VALUE_LEN,
             });
         }
-        let mut padded = [0u8; VALUE_LEN];
-        padded[..needle.len()].copy_from_slice(needle);
-        let page = match self.hm().run(Input::Find {
-            needle: padded,
-            needle_len: needle.len() as u8,
-            after,
-        }) {
+        let page = match self.hm().run(Input::Find { needle, after }) {
             Output::FindDone { result: Ok(p) } => p,
             Output::FindDone { result: Err(e) } => return Err(e.into()),
             other => unreachable!("find returned {other:?}"),
@@ -1247,25 +1304,29 @@ impl<S: Storage> Db<S> {
     /// Batches are packed by ROW cost, not by operation count, because a
     /// value spanning several slots takes several of the commit's rows.
     fn refill(&mut self, rows: Vec<Row>) -> Result<(), Error> {
-        let mut ops: Vec<Op> = Vec::with_capacity(MAX_BATCH);
+        let mut ops: Vec<Op> = Vec::with_capacity(MAX_COMMIT_ROWS);
         let mut staged = 0usize;
         for (id, value) in rows {
-            let cost = value.len().div_ceil(VALUE_LEN).max(1);
-            if cost > MAX_BATCH {
+            let len = value.len();
+            let op = Op::Insert { id, value };
+            // The same arithmetic every consumer needs, taken from the
+            // same place they take it from.
+            let cost = op.rows();
+            if cost > MAX_COMMIT_ROWS {
                 // Unreachable while MAX_VALUE_LEN is bounded by the commit
                 // length, but stated rather than assumed.
                 return Err(Error::ValueTooLong {
-                    len: value.len(),
+                    len,
                     max: MAX_VALUE_LEN,
                 });
             }
-            if staged + cost > MAX_BATCH {
+            if staged + cost > MAX_COMMIT_ROWS {
                 self.batch(&ops)?;
                 ops.clear();
                 staged = 0;
             }
             staged += cost;
-            ops.push(Op::Insert { id, value });
+            ops.push(op);
         }
         if !ops.is_empty() {
             self.batch(&ops)?;

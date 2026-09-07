@@ -1388,20 +1388,18 @@ pub fn emit_queries_rust(schema: &Schema, queries: &[Query], source_name: &str) 
                     ColType::FixedBytes(n) => n as usize,
                     ColType::BigInt => unreachable!("trigram is BYTEA-only"),
                 };
+                let _ = width;
                 o.push_str(&format!(
                     "/// `-- name: {} :find` — substring SELECT over `{}.{}` bytes\n\
                      /// (trigram-accelerated, verification-exact). Answered by `FindDone`\n\
                      /// with one bounded page in insertion order; continue with\n\
-                     /// `after = page.next`. Panics if the needle exceeds the value width.\n\
-                     pub fn {}(needle: &[u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'static> {{\n\
-                     \x20   assert!(needle.len() <= {width}, \"needle exceeds the value width\");\n\
-                     \x20   let mut padded = [0u8; {width}];\n\
-                     \x20   padded[..needle.len()].copy_from_slice(needle);\n\
-                     \x20   crate::engine::Input::Find {{\n\
-                     \x20       needle: padded,\n\
-                     \x20       needle_len: needle.len() as u8,\n\
-                     \x20       after,\n\
-                     \x20   }}\n\
+                     /// `after = page.next`.\n\
+                     ///\n\
+                     /// The needle is borrowed, not padded into a slot: a value may be\n\
+                     /// longer than one row, so a needle may be too. The engine refuses\n\
+                     /// one longer than any value could be.\n\
+                     pub fn {}<'a>(needle: &'a [u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'a> {{\n\
+                     \x20   crate::engine::Input::Find {{ needle, after }}\n\
                      }}\n\n",
                     q.name, schema.table, tc.name, q.name
                 ));

@@ -29,15 +29,12 @@ pub fn list_records(lo: u64, hi: u64) -> crate::engine::Input<'static> {
 /// `-- name: find_records :find` — substring SELECT over `records.value` bytes
 /// (trigram-accelerated, verification-exact). Answered by `FindDone`
 /// with one bounded page in insertion order; continue with
-/// `after = page.next`. Panics if the needle exceeds the value width.
-pub fn find_records(needle: &[u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'static> {
-    assert!(needle.len() <= 16, "needle exceeds the value width");
-    let mut padded = [0u8; 16];
-    padded[..needle.len()].copy_from_slice(needle);
-    crate::engine::Input::Find {
-        needle: padded,
-        needle_len: needle.len() as u8,
-        after,
-    }
+/// `after = page.next`.
+///
+/// The needle is borrowed, not padded into a slot: a value may be
+/// longer than one row, so a needle may be too. The engine refuses
+/// one longer than any value could be.
+pub fn find_records<'a>(needle: &'a [u8], after: Option<crate::trigram::FindCursor>) -> crate::engine::Input<'a> {
+    crate::engine::Input::Find { needle, after }
 }
 

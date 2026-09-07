@@ -167,16 +167,13 @@ fn steady_state_performs_zero_heap_allocations() {
             None => break,
         }
     }
-    let needle_owner = [37u8.wrapping_mul(1); VALUE_LEN];
-    let mut needle = [0u8; VALUE_LEN];
-    needle.copy_from_slice(&needle_owner);
+    let needle = [37u8; VALUE_LEN];
     match drive(
         &mut engine,
         &mut sb,
         &mut rows,
         Input::Find {
-            needle,
-            needle_len: 3,
+            needle: &needle[..3],
             after: None,
         },
     ) {

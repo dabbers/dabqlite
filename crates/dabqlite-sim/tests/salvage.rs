@@ -197,11 +197,9 @@ fn scans_in_salvage_mode_declare_themselves_incomplete() {
         }
         other => panic!("range: {other:?}"),
     }
-    let mut needle = [0u8; VALUE_LEN];
-    needle[..3].copy_from_slice(&ops[0].1[..3]);
+    let needle = ops[0].1[..3].to_vec();
     match host.run_input(Input::Find {
-        needle,
-        needle_len: 3,
+        needle: &needle,
         after: None,
     }) {
         Driven::Done(Output::FindDone { result: Ok(page) }) => {

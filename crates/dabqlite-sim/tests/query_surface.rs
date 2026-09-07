@@ -61,31 +61,31 @@ fn operation_space_is_closed_and_maps_to_engine_inputs() {
     );
     assert_eq!(get_record(7), Input::Get { id: 7 });
     assert_eq!(list_records(3, 9), Input::Range { lo: 3, hi: 9 });
-    // The find wrapper pads and measures the needle itself.
-    let mut padded = [0u8; VALUE_LEN];
-    padded[..5].copy_from_slice(b"hello");
+    // The find wrapper borrows the needle: a value may be longer than a
+    // row, so a needle may be too.
     assert_eq!(
         find_records(b"hello", Some(dabqlite_core::FindCursor::below(4))),
         Input::Find {
-            needle: padded,
-            needle_len: 5,
+            needle: b"hello",
             after: Some(dabqlite_core::FindCursor::below(4)),
         }
     );
     assert_eq!(
         find_records(b"", None),
         Input::Find {
-            needle: [0u8; VALUE_LEN],
-            needle_len: 0,
+            needle: b"",
             after: None,
         }
     );
-}
-
-#[test]
-#[should_panic(expected = "needle exceeds the value width")]
-fn generated_find_wrapper_refuses_oversized_needles() {
-    find_records(&[0u8; VALUE_LEN + 1], None);
+    let long = [b'x'; VALUE_LEN * 4 + 1];
+    assert_eq!(
+        find_records(&long, None),
+        Input::Find {
+            needle: &long,
+            after: None,
+        },
+        "a needle longer than a row is a needle, not an error"
+    );
 }
 
 #[test]

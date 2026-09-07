@@ -409,12 +409,16 @@ pub enum Input<'a> {
     /// call. Continue by re-issuing with `lo = page.next`.
     Range { lo: u64, hi: u64 },
     /// Client: substring search over `value` bytes (trigram-accelerated,
-    /// verification-exact). One bounded page per call, in insertion
-    /// (row) order; continue by re-issuing with `after = page.next`.
-    /// `needle_len` bytes of `needle` are the pattern (<= VALUE_LEN).
+    /// verification-exact). One bounded page per call, newest row first;
+    /// continue by re-issuing with `after = page.next`.
+    ///
+    /// The needle is BORROWED rather than padded into a row-width buffer.
+    /// It used to be the latter, which quietly capped a search at
+    /// `VALUE_LEN` bytes — 16 — while a value may be `MAX_VALUE_LEN`. A
+    /// needle longer than any value could be is refused; an empty one
+    /// matches everything.
     Find {
-        needle: [u8; VALUE_LEN],
-        needle_len: u8,
+        needle: &'a [u8],
         after: Option<FindCursor>,
     },
 }
@@ -1157,11 +1161,7 @@ impl Engine {
             Input::Get { id } => self.on_get(id),
             Input::GetFrom { id, offset } => self.read_window(id, offset),
             Input::Range { lo, hi } => self.on_range(lo, hi),
-            Input::Find {
-                needle,
-                needle_len,
-                after,
-            } => self.on_find(needle, needle_len, after),
+            Input::Find { needle, after } => self.on_find(needle, after),
         }
     }
 
@@ -2561,20 +2561,20 @@ impl Engine {
         Output::RangeDone { result }
     }
 
-    fn on_find(
-        &mut self,
-        needle: [u8; VALUE_LEN],
-        needle_len: u8,
-        after: Option<FindCursor>,
-    ) -> Output {
-        assert!(
-            (needle_len as usize) <= VALUE_LEN,
-            "needle exceeds the value width"
-        );
+    fn on_find(&mut self, needle: &[u8], after: Option<FindCursor>) -> Output {
+        if needle.len() > MAX_VALUE_LEN {
+            // Longer than any value can be, so it cannot match anything.
+            // Saying so is more useful than an empty page that looks like
+            // a real answer.
+            return Output::FindDone {
+                result: Err(DbError::ValueTooLong {
+                    len: needle.len() as u32,
+                    max: MAX_VALUE_LEN as u32,
+                }),
+            };
+        }
         let result = match self.state {
-            State::Ready | State::Degraded => {
-                Ok(self.find_page(&needle[..needle_len as usize], after))
-            }
+            State::Ready | State::Degraded => Ok(self.find_page(needle, after)),
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb

@@ -23,14 +23,8 @@ fn oracle(ops: &[(u64, [u8; VALUE_LEN])], needle: &[u8]) -> Vec<(u64, [u8; VALUE
         .collect()
 }
 
-fn find_input(needle: &[u8], after: Option<dabqlite_core::FindCursor>) -> Input<'static> {
-    let mut padded = [0u8; VALUE_LEN];
-    padded[..needle.len()].copy_from_slice(needle);
-    Input::Find {
-        needle: padded,
-        needle_len: needle.len() as u8,
-        after,
-    }
+fn find_input<'a>(needle: &'a [u8], after: Option<dabqlite_core::FindCursor>) -> Input<'a> {
+    Input::Find { needle, after }
 }
 
 #[test]

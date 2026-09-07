@@ -5,7 +5,7 @@
 //! test here needs a helper that feels like plumbing, that is a signal the
 //! library is missing something, not that the test needs more code.
 
-use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_BATCH, MAX_VALUE_LEN, VALUE_LEN};
+use dabqlite::{Db, Error, Op, Snapshot, Value, MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("dabqlite-api-{}-{tag}", std::process::id()));
@@ -149,6 +149,136 @@ fn a_file_backed_database_persists_and_shares_bytes_with_memory() {
 /// only matters once a value is longer than one slot, and matters a great
 /// deal then: a store watching `dead` to decide when to rebuild would
 /// under-read an eight-slot value's retirement by a factor of eight.
+/// A needle may be as long as a value. It used to be capped at ONE ROW —
+/// sixteen bytes — which meant `find_text("developer.mozilla.org")` was
+/// refused by a store that could hold the whole URL comfortably. Nothing
+/// about search required that; it was the shape of the buffer the needle
+/// travelled in.
+#[test]
+fn a_needle_may_be_as_long_as_a_value() {
+    let mut db = Db::in_memory_with(64).expect("open");
+    let url = "https://developer.mozilla.org/en-US/docs/Web/API/FileSystemSyncAccessHandle";
+    db.insert(1, Value::from_text(url).unwrap()).unwrap();
+    db.insert(2, Value::from_text("https://example.com/other").unwrap())
+        .unwrap();
+
+    // Needles far longer than a row, matching across slot boundaries.
+    for needle in [
+        "developer.mozilla.org",
+        "/en-US/docs/Web/API/FileSystemSyncAccessHandle",
+        url,
+    ] {
+        let hits = db.find_text(needle).expect("find");
+        assert_eq!(hits.len(), 1, "{needle}");
+        assert_eq!(hits[0].0, 1);
+    }
+    assert_eq!(db.find_text("https://").unwrap().len(), 2);
+
+    // The only ceiling left is the one no value can exceed either, and it
+    // says so in its own words rather than borrowing the value's.
+    let huge = vec![b'z'; MAX_VALUE_LEN + 1];
+    match db.find(&huge) {
+        Err(Error::NeedleTooLong { len, max }) => {
+            assert_eq!((len, max), (MAX_VALUE_LEN + 1, MAX_VALUE_LEN));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(db
+        .find(&huge)
+        .unwrap_err()
+        .to_string()
+        .contains("nothing could contain it"));
+}
+
+/// Space is quoted in ROW SLOTS everywhere, and the API says how many a
+/// write will take before it is attempted. Without that, "will this fit"
+/// is unanswerable: a database at 40% fill legitimately refuses a value
+/// that needs more room than the other 60% holds.
+#[test]
+fn slot_arithmetic_is_answerable_before_the_write() {
+    assert_eq!(Op::insert(1, Value::from_text("hi").unwrap()).rows(), 1);
+    assert_eq!(
+        Op::insert(1, Value::empty()).rows(),
+        1,
+        "empty still needs a row"
+    );
+    assert_eq!(
+        Op::put(1, Value::from_bytes(&[0u8; VALUE_LEN]).unwrap()).rows(),
+        1
+    );
+    assert_eq!(
+        Op::update(1, Value::from_bytes(&[0u8; VALUE_LEN + 1]).unwrap()).rows(),
+        2
+    );
+    assert_eq!(
+        Op::insert(1, Value::from_bytes(&[0u8; MAX_VALUE_LEN]).unwrap()).rows(),
+        MAX_COMMIT_ROWS,
+        "a maximum-length value fills a commit by itself"
+    );
+    assert_eq!(Op::delete(1).rows(), 1, "a tombstone is a slot");
+    assert_eq!(Op::remove(1).rows(), 1);
+
+    let mut db = Db::in_memory_with(10).expect("open");
+    assert_eq!(db.stats().free(), 10);
+    let five = Op::insert(1, Value::from_bytes(&[b'a'; 5 * VALUE_LEN]).unwrap());
+    assert_eq!(five.rows(), 5);
+    db.batch(std::slice::from_ref(&five)).unwrap();
+    assert_eq!(db.stats().free(), 5);
+
+    // `free` answers what `fill` cannot: this database is at 50% and
+    // still cannot take a six-slot value.
+    let six = Op::insert(2, Value::from_bytes(&[b'b'; 6 * VALUE_LEN]).unwrap());
+    assert!(db.stats().fill() < 0.6);
+    assert!(six.rows() > db.stats().free() as usize);
+    match db.batch(std::slice::from_ref(&six)) {
+        Err(Error::BatchRejected { at: 0, cause }) => {
+            assert!(matches!(*cause, Error::Full { .. }), "{cause:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the one that does fit, does.
+    let five_more = Op::insert(2, Value::from_bytes(&[b'b'; 5 * VALUE_LEN]).unwrap());
+    assert_eq!(five_more.rows(), db.stats().free() as usize);
+    db.batch(&[five_more]).unwrap();
+    assert_eq!(db.stats().free(), 0);
+
+    // Rebuilding gives back the dead weight, and `reclaimable` says how
+    // much that is before you spend the time.
+    db.remove(1).ok();
+    let s = db.stats();
+    assert_eq!(s.reclaimable(), s.free() + s.dead);
+}
+
+/// A batch is bounded in SLOTS, not operations — the constant is named
+/// for what it counts, and two operations can be too long for one.
+#[test]
+fn a_batch_is_bounded_in_slots_not_operations() {
+    let mut db = Db::in_memory_with(1024).expect("open");
+    let half = Value::from_bytes(&[b'x'; (MAX_COMMIT_ROWS / 2) * VALUE_LEN]).unwrap();
+    let ops = [
+        Op::insert(1, half.clone()),
+        Op::insert(2, half.clone()),
+        Op::insert(3, Value::from_text("one more slot").unwrap()),
+    ];
+    assert_eq!(ops.iter().map(Op::rows).sum::<usize>(), MAX_COMMIT_ROWS + 1);
+    // Refused, and it names the operation the commit overflowed at —
+    // which an op-count limit could not have told anyone, because the
+    // count was never the thing that overflowed.
+    match db.batch(&ops) {
+        Err(Error::BatchRejected { at: 2, cause }) => match *cause {
+            Error::BatchTooLong { rows, max } => {
+                assert_eq!(max, MAX_COMMIT_ROWS);
+                assert_eq!(rows, MAX_COMMIT_ROWS + 1);
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("three operations, {} slots: {other:?}", MAX_COMMIT_ROWS + 1),
+    }
+    // Drop the last one and the same two operations fit exactly.
+    db.batch(&ops[..2]).unwrap();
+    assert_eq!(db.stats().slots, MAX_COMMIT_ROWS as u64);
+}
+
 #[test]
 fn dead_weight_counts_the_slots_a_long_value_held_not_the_value() {
     let mut db = Db::in_memory_with(64).expect("open");
@@ -386,7 +516,11 @@ fn errors_are_all_displayable_and_say_something_useful() {
         },
         Error::BatchTooLong {
             rows: 200,
-            max: MAX_BATCH,
+            max: MAX_COMMIT_ROWS,
+        },
+        Error::NeedleTooLong {
+            len: 4096,
+            max: MAX_VALUE_LEN,
         },
     ];
     // Every variant must appear above. This match exists to break the
@@ -399,6 +533,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
         "CapacityTooSmall",
         "Locked",
         "ValueTooLong",
+        "NeedleTooLong",
         "Degraded",
         "Corrupt",
         "SchemaMismatch",
@@ -414,6 +549,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             Error::CapacityTooSmall { .. } => "CapacityTooSmall",
             Error::Locked { .. } => "Locked",
             Error::ValueTooLong { .. } => "ValueTooLong",
+            Error::NeedleTooLong { .. } => "NeedleTooLong",
             Error::Degraded { .. } => "Degraded",
             Error::Corrupt { .. } => "Corrupt",
             Error::SchemaMismatch { .. } => "SchemaMismatch",
@@ -736,17 +872,17 @@ fn a_batch_sees_its_own_earlier_operations() {
 #[test]
 fn an_over_long_batch_is_refused_rather_than_silently_split() {
     let mut db = Db::in_memory().expect("open");
-    let ops: Vec<Op> = (0..MAX_BATCH as u64 + 1)
+    let ops: Vec<Op> = (0..MAX_COMMIT_ROWS as u64 + 1)
         .map(|i| Op::put(i, Value::from_text("x").unwrap()))
         .collect();
     // The refusal must not claim the DATABASE is full: it is empty, and
-    // its capacity is not MAX_BATCH. Three separate sample applications
+    // its capacity is not MAX_COMMIT_ROWS. Three separate sample applications
     // reported the old message as stating the reverse of the truth.
     match db.batch(&ops) {
         Err(Error::BatchRejected { cause, .. }) => match *cause {
             Error::BatchTooLong { rows, max } => {
-                assert_eq!(max, MAX_BATCH);
-                assert_eq!(rows, MAX_BATCH + 1);
+                assert_eq!(max, MAX_COMMIT_ROWS);
+                assert_eq!(rows, MAX_COMMIT_ROWS + 1);
                 let msg = cause.to_string();
                 assert!(!msg.contains("full"), "this database is not full: {msg}");
                 assert!(msg.contains("atomic"), "{msg}");
@@ -757,17 +893,17 @@ fn an_over_long_batch_is_refused_rather_than_silently_split() {
     }
     assert!(db.is_empty(), "an over-long batch wrote rows anyway");
     assert!(
-        db.stats().capacity > MAX_BATCH as u64,
+        db.stats().capacity > MAX_COMMIT_ROWS as u64,
         "the test needs a database bigger than one commit to be meaningful"
     );
 
     // Exactly at the limit is fine.
-    let ops: Vec<Op> = (0..MAX_BATCH as u64)
+    let ops: Vec<Op> = (0..MAX_COMMIT_ROWS as u64)
         .map(|i| Op::put(i, Value::from_text("x").unwrap()))
         .collect();
     db.batch(&ops)
         .expect("a batch at the limit must be accepted");
-    assert_eq!(db.len(), MAX_BATCH as u64);
+    assert_eq!(db.len(), MAX_COMMIT_ROWS as u64);
 }
 
 #[test]
