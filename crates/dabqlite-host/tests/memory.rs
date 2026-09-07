@@ -327,7 +327,8 @@ fn corruption_containment_works_in_memory_too() {
 
         let mut rescue = Host::new(CAPS, store);
         match rescue.open_salvage().expect("probe") {
-            Output::OpenDone { result: Ok(count) } => assert_eq!(count, n as u64),
+            // The count is LIVE RECORDS: the quarantined slot is not one.
+            Output::OpenDone { result: Ok(count) } => assert_eq!(count, n as u64 - 1),
             other => panic!("victim={victim}: salvage: {other:?}"),
         }
         assert_eq!(rescue.engine.quarantined(), 1, "victim={victim}");

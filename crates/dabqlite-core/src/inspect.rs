@@ -17,7 +17,9 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::layout::{decode_row, decode_sb_any, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SCHEMA_HASH};
+use crate::layout::{
+    decode_row, decode_sb_any, RowKind, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SCHEMA_HASH,
+};
 use crate::migration::V1_SCHEMA_HASH;
 
 /// At most this many example offsets/ids are collected per defect class;
@@ -65,6 +67,12 @@ pub struct RowScan {
     pub committed_corrupt: u64,
     /// Sample offsets of corrupt committed rows.
     pub corrupt_offsets: Vec<u64>,
+    /// Committed rows that are deletions rather than records.
+    pub tombstones: u64,
+    /// Deletions referring to an id that was not live at that point in the
+    /// commit order — impossible for the engine to write, so evidence of
+    /// damage or of a file we did not produce.
+    pub orphan_tombstones: u64,
     /// Distinct ids seen more than once among committed rows — recovery
     /// refuses the file if nonzero.
     pub duplicate_ids: u64,
@@ -184,19 +192,36 @@ pub fn inspect(superblock: &[u8], rows: &[u8]) -> InspectReport {
     // that is the whole point of a forensics tool.
     let mut first_defect: Option<&'static str> = None;
     let live_bytes = (committed as usize).saturating_mul(ROW_SIZE);
+    // Independently of the engine, replay the commit order: `seen` holds
+    // the ids that are LIVE right now, so a record for a live id is a
+    // duplicate, a record for a retired one is the id being reused, and a
+    // deletion of something not live is damage.
     for row in 0..committed {
         let off = (row as usize) * ROW_SIZE;
         match rows.get(off..off + ROW_SIZE).and_then(decode_row) {
             Some(slot) => {
                 let id = slot.id;
-                if seen.insert(id) {
-                    scan.committed_valid += 1;
-                } else {
-                    scan.duplicate_ids += 1;
-                    if scan.duplicate_samples.len() < SAMPLE_CAP {
-                        scan.duplicate_samples.push(id);
+                match slot.kind {
+                    RowKind::Record => {
+                        if seen.insert(id) {
+                            scan.committed_valid += 1;
+                        } else {
+                            scan.duplicate_ids += 1;
+                            if scan.duplicate_samples.len() < SAMPLE_CAP {
+                                scan.duplicate_samples.push(id);
+                            }
+                            first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
+                        }
                     }
-                    first_defect.get_or_insert(crate::defect::DUPLICATE_ID);
+                    RowKind::Tombstone => {
+                        if seen.remove(&id) {
+                            scan.committed_valid += 1;
+                            scan.tombstones += 1;
+                        } else {
+                            scan.orphan_tombstones += 1;
+                            first_defect.get_or_insert(crate::defect::ORPHAN_TOMBSTONE);
+                        }
+                    }
                 }
             }
             None => {

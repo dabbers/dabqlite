@@ -139,9 +139,10 @@ pub fn parse_schema(sql: &str) -> Result<Schema, ParseError> {
             if n == 0 || n > CURRENT_ROW_FORMAT {
                 return Err(err(
                     lineno,
-                    &format!(
+                    format!(
                         "unknown row format {n}; this generator emits 1..={CURRENT_ROW_FORMAT}"
-                    ),
+                    )
+                    .as_str(),
                 ));
             }
             format = n;

@@ -77,6 +77,10 @@ pub enum DbError {
     Full { entity: &'static str, capacity: u64 },
     /// A row with this id already exists.
     DuplicateId { id: u64 },
+    /// No row with this id exists, so there is nothing to delete. Deleting
+    /// an absent row is a caller mistake, not a silent no-op: the engine
+    /// says so rather than burning a slot on a tombstone for nothing.
+    NotFound { id: u64 },
     /// An operation is already in flight; v1 serializes all access.
     Busy,
     /// The engine has not completed `open()` yet.
@@ -176,6 +180,15 @@ pub enum Input<'a> {
     IoFailed { file: FileId },
     /// Client: insert a row.
     Insert { id: u64, value: [u8; VALUE_LEN] },
+    /// Client: delete a row by primary key.
+    ///
+    /// Recorded by APPENDING a tombstone, never by overwriting the record
+    /// it removes: the rows file stays append-only, so a crash mid-delete
+    /// resolves all-or-nothing exactly like a crash mid-insert. The cost
+    /// is that a delete consumes a row slot like an insert does; a rebuild
+    /// (`dabqlite-inspect --repair-to`) compacts both the tombstone and
+    /// the record it retired.
+    Delete { id: u64 },
     /// Client: fetch a row by primary key.
     Get { id: u64 },
     /// Client: range scan by primary key, `lo..=hi`, one bounded page per
@@ -210,6 +223,11 @@ pub enum Output {
     OpenDone { result: Result<u64, DbError> },
     /// Insert finished (durably committed if `Ok`).
     InsertDone {
+        id: u64,
+        result: Result<(), DbError>,
+    },
+    /// Delete finished (durably committed if `Ok`).
+    DeleteDone {
         id: u64,
         result: Result<(), DbError>,
     },
@@ -322,6 +340,15 @@ enum State {
     InsertWriteSb { copy: u8 },
     /// Insert: superblock fsync in flight (the commit point).
     InsertFsyncSb,
+    /// Delete: tombstone-slot write in flight.
+    DeleteWriteRow,
+    /// Delete: rows-file fsync in flight (durability point for the
+    /// tombstone).
+    DeleteFsyncRows,
+    /// Delete: superblock-copy write in flight (copy 0 or 1 of the pair).
+    DeleteWriteSb { copy: u8 },
+    /// Delete: superblock fsync in flight (the commit point).
+    DeleteFsyncSb,
     /// Open in SALVAGE mode with quarantined rows: READ-ONLY, and honest.
     /// Verified rows are served exactly; anything the quarantine makes
     /// unanswerable returns `DbError::Degraded`.
@@ -384,6 +411,23 @@ pub struct Engine {
     /// state like the btree — rebuilt at every recovery, updated at the
     /// commit point.
     trigram: TrigramIndex,
+    /// The delete in flight: the id, and the row slot holding the record
+    /// it retires (cleared at the commit point).
+    pending_delete: Option<(u64, u64)>,
+    /// One bit per row slot: set when that slot holds a LIVE record.
+    /// Cleared when a tombstone retires it, and never set for a tombstone
+    /// slot itself. Derived state, sized at init like every other arena —
+    /// this is what lets deletes work without removing anything from the
+    /// indices, which stay append-only and keep pointing at slots whose
+    /// liveness is decided here.
+    live_bits: Vec<u64>,
+    /// Live records — `row_count` counts SLOTS (records + tombstones).
+    live_count: u64,
+    /// Record slots whose row has since been deleted or superseded: dead
+    /// weight a rebuild would compact away.
+    retired: u64,
+    /// Deletion slots. Also dead weight, and also compacted by a rebuild.
+    tombstones: u64,
     /// Salvage mode was requested at open: verification failures quarantine
     /// a row instead of failing the whole database.
     salvage: bool,
@@ -422,6 +466,11 @@ impl Engine {
             opened_rows_len: 0,
             orphan_valid_rows: 0,
             pending_repair: None,
+            pending_delete: None,
+            live_bits: vec![0u64; (caps.rows as usize).div_ceil(64)],
+            live_count: 0,
+            retired: 0,
+            tombstones: 0,
             salvage: false,
             quarantined: 0,
             arena,
@@ -482,6 +531,9 @@ impl Engine {
     pub fn live_rows(&self) -> impl Iterator<Item = (u64, [u8; VALUE_LEN])> + '_ {
         (0..self.row_count).filter_map(move |row| {
             let off = (row as usize) * ROW_SIZE;
+            if !self.is_live(row) {
+                return None;
+            }
             let (id, value) = decode_row(&self.arena[off..off + ROW_SIZE])?.record()?;
             // Quarantined slots were never copied into the arena, so they
             // hold zeros — which `decode_row` rejects, since the checksum
@@ -498,6 +550,21 @@ impl Engine {
         let out = self.tick_inner(input);
         self.assert_invariants();
         out
+    }
+
+    /// Live records — distinct from `usage()`, which counts SLOTS. A
+    /// deletion consumes a slot (it is appended, never overwritten), so
+    /// these diverge as soon as anything is deleted; a rebuild compacts.
+    pub fn live_count(&self) -> u64 {
+        self.live_count
+    }
+
+    /// Slots that hold neither a live record nor useful history: retired
+    /// records plus the deletions that retired them. This is the dead
+    /// weight a rebuild (`dabqlite-inspect --repair-to`) compacts away,
+    /// and the number a host should watch to decide when to do it.
+    pub fn dead_slots(&self) -> u64 {
+        self.retired + self.tombstones
     }
 
     fn assert_invariants(&self) {
@@ -523,14 +590,24 @@ impl Engine {
                 | State::InsertWriteSb { .. }
                 | State::InsertFsyncSb
         ) {
-            debug_assert_eq!(self.ordered.len(), self.row_count);
+            // Every SLOT is accounted for in the trigram cursor, records
+            // indexed and tombstones skipped, so row numbers stay true.
             debug_assert_eq!(self.trigram.len(), self.row_count);
+            // The ordered tree holds one entry per distinct id ever
+            // inserted: at least the live ones, at most one per slot.
+            debug_assert!(self.live_count <= self.ordered.len());
+            debug_assert!(self.ordered.len() <= self.row_count);
+            // Slots are records plus deletions, exactly.
+            debug_assert_eq!(
+                self.live_count + self.retired + self.tombstones,
+                self.row_count
+            );
         }
         // In salvage mode the manifest still counts the damaged slots, so
         // the indices are short by exactly the quarantine.
         if matches!(self.state, State::Degraded) {
             // The ordered index holds only rows that verified...
-            debug_assert_eq!(self.ordered.len() + self.quarantined, self.row_count);
+            debug_assert!(self.ordered.len() + self.quarantined <= self.row_count);
             // ...while the trigram's cursor accounts for every slot,
             // indexed or skipped, so row numbers stay true.
             debug_assert_eq!(self.trigram.len(), self.row_count);
@@ -544,6 +621,36 @@ impl Engine {
                 | State::InsertFsyncSb
         );
         debug_assert_eq!(self.pending.is_some(), inserting);
+        let deleting = matches!(
+            self.state,
+            State::DeleteWriteRow
+                | State::DeleteFsyncRows
+                | State::DeleteWriteSb { .. }
+                | State::DeleteFsyncSb
+        );
+        debug_assert_eq!(self.pending_delete.is_some(), deleting);
+        // Never both.
+        debug_assert!(!(inserting && deleting));
+        // Live records are a subset of the slots, and of the keys the
+        // ordered index holds (one per distinct id ever inserted). Only
+        // meaningful once open has published `row_count`: during recovery
+        // the replay is still counting.
+        if matches!(
+            self.state,
+            State::Ready
+                | State::Degraded
+                | State::InsertWriteRow
+                | State::InsertFsyncRows
+                | State::InsertWriteSb { .. }
+                | State::InsertFsyncSb
+                | State::DeleteWriteRow
+                | State::DeleteFsyncRows
+                | State::DeleteWriteSb { .. }
+                | State::DeleteFsyncSb
+        ) {
+            debug_assert!(self.live_count <= self.row_count);
+            debug_assert!(self.live_count <= self.ordered.len());
+        }
     }
 
     fn tick_inner(&mut self, input: Input<'_>) -> Output {
@@ -564,6 +671,7 @@ impl Engine {
             Input::FsyncDone { file } => self.on_fsync_done(file),
             Input::IoFailed { file } => self.on_io_failed(file),
             Input::Insert { id, value } => self.on_insert(id, value),
+            Input::Delete { id } => self.on_delete(id),
             Input::Get { id } => self.on_get(id),
             Input::Range { lo, hi } => self.on_range(lo, hi),
             Input::Find {
@@ -779,6 +887,14 @@ impl Engine {
         // row. Either way a row is only ever SERVED after it verifies —
         // "never wrong" is not traded away for availability.
         self.quarantined = 0;
+        self.live_count = 0;
+        self.retired = 0;
+        self.tombstones = 0;
+        self.live_bits.fill(0);
+        // The rows file IS the commit order — one slot appended per commit,
+        // records and deletions alike — so replaying it in order replays
+        // history exactly. An id may be inserted, deleted, and inserted
+        // again; the last word wins because it is last.
         for row in 0..row_count {
             let off = (row as usize) * ROW_SIZE;
             let chunk = &data[off..off + ROW_SIZE];
@@ -796,23 +912,54 @@ impl Engine {
                     what: crate::defect::ROW_CHECKSUM,
                 });
             };
-            let (id, value) = (slot.id, slot.value);
-            if self.index_lookup(id).is_some() {
-                if self.salvage {
-                    // Keep the first occurrence; the later duplicate is the
-                    // damaged one as far as anyone can tell.
-                    self.quarantined += 1;
-                    self.trigram.skip_row(row);
-                    continue;
+            let id = slot.id;
+            match slot.kind {
+                RowKind::Record => {
+                    // A second record for an id that is CURRENTLY live is a
+                    // duplicate. One whose record was retired is simply the
+                    // id being used again, which is ordinary history.
+                    if self.live_row_of(id).is_some() {
+                        if self.salvage {
+                            // Keep the first occurrence; the later duplicate
+                            // is the damaged one as far as anyone can tell.
+                            self.quarantined += 1;
+                            self.trigram.skip_row(row);
+                            continue;
+                        }
+                        return self.fail_open(DbError::Corrupt {
+                            what: crate::defect::DUPLICATE_ID,
+                        });
+                    }
+                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
+                    self.bind_indices(id, row);
+                    self.trigram.insert(row, &slot.value);
+                    self.set_live(row, true);
+                    self.live_count += 1;
                 }
-                return self.fail_open(DbError::Corrupt {
-                    what: crate::defect::DUPLICATE_ID,
-                });
+                RowKind::Tombstone => {
+                    // A deletion of something not live cannot be produced by
+                    // the engine (it refuses `NotFound` before any I/O), so
+                    // it is evidence of damage or of a file we did not write.
+                    let Some(record_row) = self.live_row_of(id) else {
+                        if self.salvage {
+                            self.quarantined += 1;
+                            self.trigram.skip_row(row);
+                            continue;
+                        }
+                        return self.fail_open(DbError::Corrupt {
+                            what: crate::defect::ORPHAN_TOMBSTONE,
+                        });
+                    };
+                    self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
+                    self.set_live(record_row, false);
+                    self.live_count -= 1;
+                    self.retired += 1;
+                    self.tombstones += 1;
+                    // Accounted for, never indexed: a deletion is not
+                    // searchable content.
+                    self.trigram.skip_row(row);
+                }
             }
-            self.arena[off..off + ROW_SIZE].copy_from_slice(chunk);
-            self.index_insert(id, row);
-            self.ordered.insert(id, row);
-            self.trigram.insert(row, &value);
         }
         // Rollback-evidence scan: checksum-valid rows beyond the manifest.
         // ONE is the normal artifact of an in-flight, never-acknowledged
@@ -868,7 +1015,7 @@ impl Engine {
             State::Ready
         };
         Output::OpenDone {
-            result: Ok(row_count),
+            result: Ok(self.live_count),
         }
     }
 
@@ -878,6 +1025,96 @@ impl Engine {
     }
 
     // ---- insert ----------------------------------------------------------
+
+    /// Does row slot `row` hold a live record?
+    fn is_live(&self, row: u64) -> bool {
+        let (word, bit) = ((row / 64) as usize, row % 64);
+        self.live_bits
+            .get(word)
+            .is_some_and(|w| w & (1u64 << bit) != 0)
+    }
+
+    fn set_live(&mut self, row: u64, live: bool) {
+        let (word, bit) = ((row / 64) as usize, row % 64);
+        let mask = 1u64 << bit;
+        if live {
+            self.live_bits[word] |= mask;
+        } else {
+            self.live_bits[word] &= !mask;
+        }
+    }
+
+    /// The slot holding `id`'s LIVE record, if it has one.
+    ///
+    /// The indices are append-only and keep pointing at a slot after its
+    /// record is retired; liveness is decided here, in one place, so no
+    /// read path can forget to ask.
+    fn live_row_of(&self, id: u64) -> Option<u64> {
+        let row = self.index_lookup(id)?;
+        self.is_live(row).then_some(row)
+    }
+
+    fn on_delete(&mut self, id: u64) -> Output {
+        let err = match self.state {
+            State::Ready => None,
+            State::New
+            | State::InitWriteSb { .. }
+            | State::InitFsyncSb
+            | State::RecoverReadSb
+            | State::RecoverReadRows { .. }
+            | State::RecoverFsyncRows { .. }
+            | State::RecoverRepairSb { .. }
+            | State::RecoverFsyncSb { .. } => Some(DbError::NotOpen),
+            State::InsertWriteRow
+            | State::InsertFsyncRows
+            | State::InsertWriteSb { .. }
+            | State::InsertFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Some(DbError::Busy),
+            State::Degraded => Some(DbError::Degraded {
+                quarantined: self.quarantined,
+            }),
+            State::Failed(e) => Some(e),
+        };
+        if let Some(e) = err {
+            return Output::DeleteDone { id, result: Err(e) };
+        }
+        let Some(record_row) = self.live_row_of(id) else {
+            return Output::DeleteDone {
+                id,
+                result: Err(DbError::NotFound { id }),
+            };
+        };
+        if self.row_count == self.caps.rows {
+            // A tombstone needs a slot like any other row, so a database at
+            // its ceiling cannot record a deletion. Refused before any I/O,
+            // naming the ceiling; a rebuild compacts and frees the space.
+            return Output::DeleteDone {
+                id,
+                result: Err(DbError::Full {
+                    entity: "records",
+                    capacity: self.caps.rows,
+                }),
+            };
+        }
+
+        // Stage the tombstone in its own slot. Like an insert, it becomes
+        // visible only when the superblock generation flips.
+        let off = (self.row_count as usize) * ROW_SIZE;
+        let slot: &mut [u8; ROW_SIZE] = (&mut self.arena[off..off + ROW_SIZE])
+            .try_into()
+            .expect("fixed slice");
+        encode_row(RowKind::Tombstone, id, &[0u8; VALUE_LEN], slot);
+        self.pending_delete = Some((id, record_row));
+        self.state = State::DeleteWriteRow;
+        Output::Write {
+            file: FileId::Rows,
+            offset: off as u64,
+            data: WriteBuf::from_slice(&self.arena[off..off + ROW_SIZE]),
+        }
+    }
 
     fn on_insert(&mut self, id: u64, value: [u8; VALUE_LEN]) -> Output {
         let err = match self.state {
@@ -893,7 +1130,11 @@ impl Engine {
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb => Some(DbError::Busy),
+            | State::InsertFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Some(DbError::Busy),
             // Salvage is strictly read-only: appending to a file we know is
             // damaged, and flipping the manifest over it, could only make a
             // recoverable situation worse.
@@ -905,7 +1146,9 @@ impl Engine {
         if let Some(e) = err {
             return Output::InsertDone { id, result: Err(e) };
         }
-        if self.index_lookup(id).is_some() {
+        // A DELETED id may be inserted again: the index still points at the
+        // retired slot, but that slot is no longer live, so the id is free.
+        if self.live_row_of(id).is_some() {
             return Output::InsertDone {
                 id,
                 result: Err(DbError::DuplicateId { id }),
@@ -967,6 +1210,20 @@ impl Engine {
                     file: FileId::Superblock,
                 }
             }
+            (State::DeleteWriteRow, FileId::Rows) => {
+                self.state = State::DeleteFsyncRows;
+                Output::Fsync { file: FileId::Rows }
+            }
+            (State::DeleteWriteSb { copy: 0 }, FileId::Superblock) => {
+                self.state = State::DeleteWriteSb { copy: 1 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 1)
+            }
+            (State::DeleteWriteSb { copy: 1 }, FileId::Superblock) => {
+                self.state = State::DeleteFsyncSb;
+                Output::Fsync {
+                    file: FileId::Superblock,
+                }
+            }
             (State::InsertWriteRow, FileId::Rows) => {
                 self.state = State::InsertFsyncRows;
                 Output::Fsync { file: FileId::Rows }
@@ -1024,6 +1281,33 @@ impl Engine {
                 },
                 FileId::Superblock,
             ) => self.finish_open(generation, row_count),
+            (State::DeleteFsyncRows, FileId::Rows) => {
+                // The tombstone is durable; now flip the manifest over it.
+                self.state = State::DeleteWriteSb { copy: 0 };
+                Self::sb_copy_write(self.generation + 1, self.row_count + 1, 0)
+            }
+            (State::DeleteFsyncSb, FileId::Superblock) => {
+                // Commit point: the deletion is durable.
+                let (id, record_row) = self
+                    .pending_delete
+                    .take()
+                    .expect("pending delete at commit");
+                self.generation += 1;
+                // The record's slot stops being live. Nothing is removed
+                // from any index: they keep pointing at the retired slot,
+                // and every read path asks `is_live` before trusting it.
+                self.set_live(record_row, false);
+                // The tombstone slot is accounted for but never indexed.
+                self.trigram.skip_row(self.row_count);
+                self.row_count += 1;
+                self.live_count -= 1;
+                self.retired += 1;
+                self.tombstones += 1;
+                self.state = State::Ready;
+                // Pair assertion: the deleted row must now be unreadable.
+                debug_assert_eq!(self.lookup_value(id), None);
+                Output::DeleteDone { id, result: Ok(()) }
+            }
             (State::InsertFsyncRows, FileId::Rows) => {
                 // The row is durable; now flip the superblock. The new
                 // generation goes to the *other* pair of slots, so the live
@@ -1035,10 +1319,14 @@ impl Engine {
                 // Commit point: the new generation is durable.
                 let (id, value) = self.pending.take().expect("pending insert at commit");
                 self.generation += 1;
-                self.index_insert(id, self.row_count);
-                self.ordered.insert(id, self.row_count);
+                // `bind`, not blind insert: this id may have been deleted
+                // earlier, in which case both indices still hold an entry
+                // for it pointing at the retired slot.
+                self.bind_indices(id, self.row_count);
                 self.trigram.insert(self.row_count, &value);
+                self.set_live(self.row_count, true);
                 self.row_count += 1;
+                self.live_count += 1;
                 self.state = State::Ready;
                 // Pair assertion: the committed row must now be readable.
                 debug_assert_eq!(self.lookup_value(id), Some(value));
@@ -1068,6 +1356,8 @@ impl Engine {
             State::RecoverRepairSb { .. } | State::RecoverFsyncSb { .. } => FileId::Superblock,
             State::InsertWriteRow | State::InsertFsyncRows => FileId::Rows,
             State::InsertWriteSb { .. } | State::InsertFsyncSb => FileId::Superblock,
+            State::DeleteWriteRow | State::DeleteFsyncRows => FileId::Rows,
+            State::DeleteWriteSb { .. } | State::DeleteFsyncSb => FileId::Superblock,
             state => panic!("protocol violation: IoFailed({file:?}) in state {state:?}"),
         };
         assert!(
@@ -1082,6 +1372,20 @@ impl Engine {
                 let (id, _) = self.pending.take().expect("pending insert on failure");
                 self.state = State::Failed(err);
                 Output::InsertDone {
+                    id,
+                    result: Err(err),
+                }
+            }
+            State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => {
+                let (id, _) = self
+                    .pending_delete
+                    .take()
+                    .expect("pending delete on failure");
+                self.state = State::Failed(err);
+                Output::DeleteDone {
                     id,
                     result: Err(err),
                 }
@@ -1116,7 +1420,11 @@ impl Engine {
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb => Err(DbError::Busy),
+            | State::InsertFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::GetDone { id, result }
@@ -1140,7 +1448,11 @@ impl Engine {
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb => Err(DbError::Busy),
+            | State::InsertFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::RangeDone { result }
@@ -1166,7 +1478,11 @@ impl Engine {
             State::InsertWriteRow
             | State::InsertFsyncRows
             | State::InsertWriteSb { .. }
-            | State::InsertFsyncSb => Err(DbError::Busy),
+            | State::InsertFsyncSb
+            | State::DeleteWriteRow
+            | State::DeleteFsyncRows
+            | State::DeleteWriteSb { .. }
+            | State::DeleteFsyncSb => Err(DbError::Busy),
             State::Failed(e) => Err(e),
         };
         Output::FindDone { result }
@@ -1181,6 +1497,11 @@ impl Engine {
     fn find_page(&self, needle: &[u8], after: Option<u64>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
         let n = self.trigram.find_page(needle, after, &mut rows, |row| {
+            // Postings survive their record's retirement (the trigram
+            // index is append-only); liveness filters them out here.
+            if !self.is_live(row) {
+                return false;
+            }
             let off = (row as usize) * ROW_SIZE;
             match decode_row(&self.arena[off..off + ROW_SIZE]) {
                 Some(slot) => match slot.record() {
@@ -1243,6 +1564,11 @@ impl Engine {
             if key > hi {
                 return false;
             }
+            // The tree keeps an entry for every id ever inserted, including
+            // ones whose record has since been retired. Liveness decides.
+            if !self.is_live(row) {
+                return true;
+            }
             if n == RANGE_PAGE {
                 next = Some(key);
                 return false;
@@ -1270,7 +1596,7 @@ impl Engine {
     }
 
     fn lookup_value(&self, id: u64) -> Option<[u8; VALUE_LEN]> {
-        let row = self.index_lookup(id)?;
+        let row = self.live_row_of(id)?;
         let off = (row as usize) * ROW_SIZE;
         let (row_id, value) = decode_row(&self.arena[off..off + ROW_SIZE])
             .and_then(|r| r.record())
@@ -1325,19 +1651,40 @@ impl Engine {
         }
     }
 
-    fn index_insert(&mut self, id: u64, row: u64) {
-        debug_assert!(
-            self.index_lookup(id).is_none(),
-            "index insert must be fresh"
-        );
+    /// Point `id` at `row`, whether or not the id is already in the table.
+    ///
+    /// An id whose record was retired keeps its index entry (the indices
+    /// are append-only; liveness is tracked separately), so inserting that
+    /// id again must REPOINT the existing entry rather than add a second
+    /// one — two entries for one id would make lookups depend on probe
+    /// order, which is exactly the kind of quiet wrongness this codebase
+    /// does not tolerate.
+    fn index_bind(&mut self, id: u64, row: u64) {
         let mut slot = self.hash_slot(id);
         let mut probes = 0usize;
-        while self.index[slot] != 0 {
-            slot = self.probe_next(slot, &mut probes);
+        loop {
+            match self.index[slot] {
+                0 => {
+                    self.index[slot] = row + 1;
+                    break;
+                }
+                entry if self.row_id_at(entry - 1) == id => {
+                    self.index[slot] = row + 1;
+                    break;
+                }
+                _ => slot = self.probe_next(slot, &mut probes),
+            }
         }
-        self.index[slot] = row + 1;
-        // Pair assertion: inserted entry must be findable.
         debug_assert_eq!(self.index_lookup(id), Some(row));
+    }
+
+    /// Bind `id` in both keyed indices — the hash table and the ordered
+    /// tree — to the slot that now holds its record.
+    fn bind_indices(&mut self, id: u64, row: u64) {
+        self.index_bind(id, row);
+        if !self.ordered.repoint(id, row) {
+            self.ordered.insert(id, row);
+        }
     }
 
     fn row_id_at(&self, row: u64) -> u64 {

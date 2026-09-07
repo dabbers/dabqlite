@@ -155,6 +155,38 @@ impl BTreeIndex {
     }
 
     /// Point lookup (used only by assertions; the hash index serves gets).
+    /// Repoint an existing key at a different row, returning whether the
+    /// key was present.
+    ///
+    /// Needed because a deleted id can be inserted again: the record moves
+    /// to a new slot, but the KEY is the same one already in the tree, and
+    /// `insert` refuses duplicates by design. Only the stored row changes —
+    /// the tree's shape, occupancy and ordering are untouched, so none of
+    /// the structural invariants can be disturbed by it.
+    pub fn repoint(&mut self, key: u64, row: u64) -> bool {
+        let mut id = self.root;
+        loop {
+            let n = self.node(id);
+            let len = n.len as usize;
+            if n.leaf {
+                let Some(i) = n.keys[..len].iter().position(|&k| k == key) else {
+                    return false;
+                };
+                self.node_mut(id).vals[i] = row;
+                debug_assert_eq!(self.get(key), Some(row));
+                return true;
+            }
+            let mut child = len;
+            for (i, &k) in n.keys[..len].iter().enumerate() {
+                if key < k {
+                    child = i;
+                    break;
+                }
+            }
+            id = n.children[child];
+        }
+    }
+
     pub fn get(&self, key: u64) -> Option<u64> {
         let mut id = self.root;
         loop {

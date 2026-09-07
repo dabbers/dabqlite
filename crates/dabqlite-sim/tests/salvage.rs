@@ -81,7 +81,8 @@ fn corrupting_any_single_row_costs_exactly_that_row() {
 
             // Salvage open contains it.
             let (mut host, salvaged) = open_salvage(disk);
-            assert_eq!(salvaged, Ok(n as u64), "[{ctx}] salvage open");
+            // The count is LIVE RECORDS, so it is short by the quarantine.
+            assert_eq!(salvaged, Ok(n as u64 - 1), "[{ctx}] salvage open");
             assert!(host.engine.is_degraded(), "[{ctx}] should report degraded");
             assert_eq!(host.engine.quarantined(), 1, "[{ctx}] quarantine count");
             assert_eq!(
@@ -128,7 +129,7 @@ fn every_byte_of_every_row_is_contained() {
             disk.corrupt(FileId::Rows, off, 0x80);
 
             let (mut host, salvaged) = open_salvage(disk);
-            assert_eq!(salvaged, Ok(n as u64), "[{ctx}]");
+            assert_eq!(salvaged, Ok(n as u64 - 1), "[{ctx}]");
             let quarantined = host.engine.quarantined();
             // A flip in the padding or checksum still fails verification;
             // there are no dead bytes (layout.rs pins that separately).
@@ -160,7 +161,7 @@ fn many_corrupt_rows_cost_exactly_themselves() {
         disk.corrupt(FileId::Rows, (v * ROW_SIZE + 3) as u64, 0x11);
     }
     let (mut host, salvaged) = open_salvage(disk);
-    assert_eq!(salvaged, Ok(n as u64));
+    assert_eq!(salvaged, Ok((n - victims.len()) as u64));
     assert_eq!(host.engine.quarantined(), victims.len() as u64);
     for (row, &(id, value)) in ops.iter().enumerate() {
         if victims.contains(&row) {
@@ -315,7 +316,7 @@ fn duplicate_ids_are_quarantined_not_fatal() {
     );
 
     let (mut host, salvaged) = open_salvage(disk);
-    assert_eq!(salvaged, Ok(n as u64));
+    assert_eq!(salvaged, Ok(n as u64 - 1));
     assert_eq!(host.engine.quarantined(), 1, "the later duplicate");
     // The surviving copy still answers, exactly.
     assert_eq!(get_result(&mut host, ops[1].0), Ok(Some(ops[1].1)));
@@ -425,7 +426,7 @@ fn an_io_failure_during_salvage_fail_stops_at_every_boundary() {
             }) => {}
             // Reaching the end before the injected failure is fine too.
             Driven::Done(Output::OpenDone { result: Ok(rows) }) => {
-                assert_eq!(rows, n as u64, "[{ctx}]");
+                assert_eq!(rows, n as u64 - 1, "[{ctx}]");
             }
             other => panic!("[{ctx}] salvage must fail-stop cleanly: {other:?}"),
         }
@@ -436,7 +437,7 @@ fn an_io_failure_during_salvage_fail_stops_at_every_boundary() {
     // After the failing volume settles, a retry still contains the damage
     // exactly as before — a failed rescue costs nothing.
     let (mut host, salvaged) = open_salvage(damaged);
-    assert_eq!(salvaged, Ok(n as u64));
+    assert_eq!(salvaged, Ok(n as u64 - 1));
     assert_eq!(host.engine.quarantined(), 1);
     for (row, &(id, value)) in ops.iter().enumerate() {
         if row == 2 {

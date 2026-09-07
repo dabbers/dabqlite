@@ -126,6 +126,14 @@ impl<S: Storage> Host<S> {
         self.drive(Input::Insert { id, value })
     }
 
+    /// Delete a row. Recorded by appending a tombstone (never by
+    /// overwriting the record), so a crash mid-delete resolves
+    /// all-or-nothing exactly like a crash mid-insert. Costs a row slot;
+    /// a rebuild compacts both the tombstone and the record it retired.
+    pub fn delete(&mut self, id: u64) -> Output {
+        self.drive(Input::Delete { id })
+    }
+
     pub fn get(&mut self, id: u64) -> Output {
         self.drive(Input::Get { id })
     }

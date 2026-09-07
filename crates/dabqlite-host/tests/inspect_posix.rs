@@ -11,6 +11,26 @@ use dabqlite_core::{Capacities, SCHEMA_HASH, VALUE_LEN};
 use dabqlite_host::posix::rows_file_name;
 use dabqlite_host::{Host, PosixStorage};
 
+/// Tests here both SPAWN processes and hold the single-writer lock, and
+/// those two things interact badly in parallel: `Command::spawn` forks,
+/// and between fork and exec the child holds duplicates of every parent
+/// fd — including a flock'd lock file another test in this binary is
+/// using. flock is held by the open file description, so the lock appears
+/// taken until the child execs and its O_CLOEXEC copies close, and a
+/// concurrent `open_dir` sees a phantom `WouldBlock`.
+///
+/// The same guard `locking.rs` carries, for the same reason. (Found as a
+/// flaky failure at roughly one run in three — and a flaky suite makes
+/// every mutation-testing kill meaningless, which is why it is worth
+/// fixing rather than retrying.)
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const CAPS: Capacities = Capacities { rows: 8 };
 
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -33,6 +53,7 @@ fn build_db(dir: &Path, n: u64) {
 
 #[test]
 fn output_is_deterministic_and_names_the_right_things() {
+    let _serial = serial();
     let dir = scratch_dir("golden");
     build_db(&dir, 3);
 
@@ -64,6 +85,7 @@ fn output_is_deterministic_and_names_the_right_things() {
 
 #[test]
 fn inspection_changes_zero_bytes() {
+    let _serial = serial();
     let dir = scratch_dir("readonly");
     build_db(&dir, 5);
     let files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -92,6 +114,7 @@ fn inspection_changes_zero_bytes() {
 
 #[test]
 fn inspects_while_a_writer_holds_the_lock() {
+    let _serial = serial();
     let dir = scratch_dir("live");
     let mut host = Host::new(CAPS, PosixStorage::open_dir(&dir).expect("open dir"));
     host.open().expect("probe");
@@ -111,6 +134,7 @@ fn inspects_while_a_writer_holds_the_lock() {
 
 #[test]
 fn verify_flags_a_damaged_database_via_exit_code() {
+    let _serial = serial();
     let dir = scratch_dir("damaged");
     build_db(&dir, 4);
     // Flip one bit inside a committed row, at rest.

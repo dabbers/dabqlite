@@ -433,7 +433,9 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
             let mut rescue = SimHost::new(cfg.caps, damaged, None);
             match rescue.open_salvage() {
                 Driven::Done(Output::OpenDone { result: Ok(n) }) => {
-                    assert_eq!(n, used, "[{ctx}] salvage row count");
+                    // The count is LIVE RECORDS, so it is short by exactly
+                    // the quarantined slot.
+                    assert_eq!(n, used - 1, "[{ctx}] salvage live count");
                 }
                 other => panic!("[{ctx}] salvage open failed: {other:?}"),
             }

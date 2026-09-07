@@ -11,6 +11,26 @@ use dabqlite_core::{Capacities, FileId, Output, VALUE_LEN};
 use dabqlite_host::{Host, PosixStorage, Storage};
 use dabqlite_sim::SimDisk;
 
+/// Tests here both SPAWN processes and hold the single-writer lock, and
+/// those two things interact badly in parallel: `Command::spawn` forks,
+/// and between fork and exec the child holds duplicates of every parent
+/// fd — including a flock'd lock file another test in this binary is
+/// using. flock is held by the open file description, so the lock appears
+/// taken until the child execs and its O_CLOEXEC copies close, and a
+/// concurrent `open_dir` sees a phantom `WouldBlock`.
+///
+/// The same guard `locking.rs` carries, for the same reason. (Found as a
+/// flaky failure at roughly one run in three — and a flaky suite makes
+/// every mutation-testing kill meaningless, which is why it is worth
+/// fixing rather than retrying.)
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const N: u64 = 100_000;
 
 struct SimStorage(SimDisk);
@@ -51,6 +71,7 @@ fn scratch_dir() -> PathBuf {
     ignore = "scale suite runs in release (assertions stay on); CI runs it explicitly"
 )]
 fn hundred_thousand_rows_on_real_files() {
+    let _serial = serial();
     let caps = Capacities { rows: N };
 
     let mut sim = Host::new(caps, SimStorage(SimDisk::new()));
@@ -119,6 +140,7 @@ fn hundred_thousand_rows_on_real_files() {
     ignore = "scale suite runs in release (assertions stay on); CI runs it explicitly"
 )]
 fn salvage_and_repair_at_a_hundred_thousand_rows() {
+    let _serial = serial();
     use dabqlite_host::rows_file_name;
     let caps = Capacities { rows: N };
     // Its own directory: these tests run in parallel in one process, so a
