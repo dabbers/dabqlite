@@ -372,6 +372,7 @@ error now names the remedy, and `Host::open_salvage()` is the remedy.
 | Duplicate ids (two valid rows, one key — checksums cannot catch this) | targeted | `salvage.rs` | the later duplicate is quarantined, the first still answers exactly; strict open still refuses |
 | Scans under quarantine | pinned | `salvage.rs` | every range/find page carries `incomplete: true` |
 | Salvage inertness | byte + counter pin | `salvage.rs` | zero writes, zero fsyncs, files byte-identical after a full read workload; writes refused with `Degraded` |
+| Salvage of a BLOB, not a directory | targeted | `api.rs` | `Db::load_salvaged` quarantines the damaged rows of a snapshot and serves the rest; `compact_to_memory` rebuilds a healthy database from the survivors in one call. A database held in memory and snapshotted into IndexedDB is the browser deployment, and it has no directory to salvage from |
 | Salvage of a **healthy** database | seeds | `salvage.rs` | identical to an ordinary open: not degraded, fully writable, recovery fsyncs performed, pages not flagged. Salvage is a fallback, not a downgrade |
 | Unreadable **manifest** (all superblock copies destroyed) | targeted | `salvage.rs` | salvage agrees with strict open and refuses — it widens what can be READ, never what can be BELIEVED |
 | Containment under the full fault schedule | every cycle of every lifetime (floor-asserted) | `lifetime.rs`, `vopr` | a committed row is damaged on a COPY of each cycle's disk and salvaged: ~2,300 episodes per 40 lifetimes, every survivor checked against the insertion log |

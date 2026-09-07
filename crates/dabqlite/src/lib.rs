@@ -694,12 +694,46 @@ impl Db<MemoryStorage> {
 
     /// As [`Db::load`], with a chosen row capacity.
     pub fn load_with(snapshot: &Snapshot, rows: u64) -> Result<Self, Error> {
-        let storage = MemoryStorage::from_images(
+        Self::start(Host::new(caps(rows), Self::images(snapshot)))
+    }
+
+    /// Load a DAMAGED snapshot in salvage mode: rows that fail
+    /// verification are quarantined, and everything else is served
+    /// exactly (docs/FAULTS.md, "corruption containment").
+    ///
+    /// [`Db::salvage`] does this for a directory. Without the same door
+    /// for a snapshot, one flipped byte anywhere in a blob cost the whole
+    /// database — with an error advising a salvage open that could not be
+    /// performed, because the bytes were not on a filesystem and the
+    /// rows file's name is not part of the public API. That is the
+    /// browser deployment: a database held in memory and snapshotted into
+    /// IndexedDB has no directory to salvage from, and it is exactly the
+    /// deployment where "corruption is contained, not fatal" needs to
+    /// hold.
+    ///
+    /// Read-only and honest about its damage: [`Db::is_degraded`] says
+    /// whether anything was quarantined, [`Db::recovery_report`] says how
+    /// much, and a question that cannot be answered truthfully comes back
+    /// as [`Error::Degraded`] rather than a confident wrong answer. Take
+    /// what survives out with [`Db::all`] and rebuild.
+    pub fn load_salvaged(snapshot: &Snapshot) -> Result<Self, Error> {
+        let rows = recorded_capacity(&snapshot.superblock).unwrap_or(DEFAULT_ROWS);
+        Self::load_salvaged_with(snapshot, rows)
+    }
+
+    /// As [`Db::load_salvaged`], with a chosen row capacity — for a
+    /// snapshot damaged in the superblock itself, where the recorded
+    /// capacity may be unreadable.
+    pub fn load_salvaged_with(snapshot: &Snapshot, rows: u64) -> Result<Self, Error> {
+        Self::start_salvaged(Host::new(caps(rows), Self::images(snapshot)))
+    }
+
+    fn images(snapshot: &Snapshot) -> MemoryStorage {
+        MemoryStorage::from_images(
             snapshot.superblock.clone(),
             snapshot.rows.clone(),
             Vec::new(),
-        );
-        Self::start(Host::new(caps(rows), storage))
+        )
     }
 }
 
@@ -952,6 +986,20 @@ const _: () = assert!(VALUE_LEN == CORE_VALUE_LEN);
 impl<S: Storage> Db<S> {
     fn start(mut host: Host<S>) -> Result<Self, Error> {
         match host.open().map_err(io_err::<S>)? {
+            Output::OpenDone { result: Ok(_) } => Ok(Db {
+                host: Some(host),
+                #[cfg(unix)]
+                origin: None,
+            }),
+            Output::OpenDone { result: Err(e) } => Err(e.into()),
+            other => unreachable!("open returned {other:?}"),
+        }
+    }
+
+    /// The same, in salvage mode: damaged rows are quarantined rather
+    /// than failing the whole database, and the result is read-only.
+    fn start_salvaged(mut host: Host<S>) -> Result<Self, Error> {
+        match host.open_salvage().map_err(io_err::<S>)? {
             Output::OpenDone { result: Ok(_) } => Ok(Db {
                 host: Some(host),
                 #[cfg(unix)]

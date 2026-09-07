@@ -941,6 +941,78 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A damaged BLOB is salvageable, not fatal.
+///
+/// `Db::salvage` opens a damaged directory. A snapshot had no equivalent,
+/// so one flipped byte anywhere in a blob cost the whole database — and
+/// the error said to reopen in salvage mode, which was advice that could
+/// not be taken: there was no directory, and the rows file's name is not
+/// part of the API. That is precisely the browser deployment, where a
+/// database lives in memory and is snapshotted into IndexedDB, and
+/// precisely where "corruption is contained, not fatal" has to hold.
+#[test]
+fn a_damaged_snapshot_is_salvageable_rather_than_fatal() {
+    let mut db = Db::in_memory_with(64).expect("open");
+    for i in 0..8u64 {
+        db.insert(i, Value::from_text(&format!("row-{i}")).unwrap())
+            .unwrap();
+    }
+    // One long value too, so the salvage covers a multi-slot run.
+    db.insert(100, Value::from_bytes(&[b'L'; 100]).unwrap())
+        .unwrap();
+    let clean = db.snapshot().expect("snapshot");
+
+    // A snapshot round-trips as a blob and back, undamaged.
+    let bytes = clean.to_bytes();
+    assert_eq!(
+        Db::load(&Snapshot::from_bytes(&bytes).unwrap())
+            .unwrap()
+            .len(),
+        9
+    );
+
+    // Flip one bit inside a committed row. Strict load refuses the whole
+    // database — detection over availability, unchanged.
+    // The rows image starts after the 24-byte header and the superblock.
+    let mut damaged = bytes.clone();
+    let sb_len = u64::from_le_bytes(damaged[8..16].try_into().unwrap()) as usize;
+    let rows_at = 24 + sb_len;
+    damaged[rows_at + 3 * 32 + 5] ^= 0x40;
+    let damaged = Snapshot::from_bytes(&damaged).expect("still a snapshot");
+    assert!(
+        matches!(Db::load(&damaged), Err(Error::Corrupt { .. })),
+        "a strict load must refuse a damaged blob"
+    );
+
+    // Salvage load: the damage is contained, everything else is served.
+    let mut rescued = Db::load_salvaged(&damaged).expect("salvage load");
+    assert!(rescued.is_degraded());
+    assert_eq!(rescued.recovery_report().quarantined_rows, 1);
+    let survivors = rescued.all().expect("scan what survived");
+    assert_eq!(survivors.len(), 8, "one row lost, the rest readable");
+    assert!(
+        !survivors.iter().any(|(id, _)| *id == 3),
+        "the damaged row must not be served"
+    );
+    // The long value came through whole.
+    assert_eq!(
+        rescued.get(100).unwrap().unwrap().as_bytes(),
+        &[b'L'; 100][..]
+    );
+    // And it is read-only, like every salvage.
+    assert!(rescued.insert(500, Value::empty()).is_err());
+
+    // Rebuild from what survived, in one call, and the result is a
+    // healthy database that can be snapshotted straight back out.
+    let mut rebuilt = rescued.compact_to_memory().expect("rebuild");
+    assert_eq!(rebuilt.len(), 8);
+    assert!(!rebuilt.is_degraded());
+    assert_eq!(rebuilt.recovery_report().quarantined_rows, 0);
+    assert_eq!(rebuilt.all().unwrap(), survivors);
+    let healthy = rebuilt.snapshot().expect("snapshot");
+    assert_eq!(Db::load(&healthy).expect("load").len(), 8);
+}
+
 /// Looking at a database must not change it — including the one thing
 /// that only exists until someone looks.
 ///

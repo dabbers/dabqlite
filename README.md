@@ -181,7 +181,11 @@ dabqlite-inspect <dir> --repair-to <newdir> # rebuild clean from what verifies
 dabqlite-inspect <dir> --gc                 # reclaim a migration's dead file
 ```
 
-Programmatically, `Host::open_salvage()` opens a damaged database
+Programmatically, `Db::salvage` opens a damaged directory and
+`Db::load_salvaged` a damaged snapshot — the browser case, where the
+database is bytes in IndexedDB and there is no directory to point at.
+Both are read-only; `compact_to_memory` rebuilds a healthy database from
+what survived. Underneath, `Host::open_salvage()` opens a damaged database
 read-only with the unverifiable rows quarantined. Verified rows are served
 exactly; anything the quarantine makes unanswerable returns `Degraded`
 rather than a confident wrong answer, and scans flag themselves
