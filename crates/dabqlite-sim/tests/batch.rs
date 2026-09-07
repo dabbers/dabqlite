@@ -617,7 +617,9 @@ fn a_crash_at_every_boundary_of_a_batch_is_all_or_nothing() {
                         BatchOp::Insert { id, value } => {
                             got(&mut host, id) == applied.then(|| value.to_vec())
                         }
-                        BatchOp::Put { .. } | BatchOp::Remove { .. } => true,
+                        BatchOp::Put { .. } | BatchOp::Remove { .. } | BatchOp::Expect { .. } => {
+                            true
+                        }
                     };
                     assert!(
                         agrees,
@@ -921,6 +923,201 @@ fn an_orphan_claiming_an_impossible_commit_is_rollback_evidence() {
          not an interrupted commit, and staying quiet about it means the \
          claim rule is only checking slots against each other"
     );
+}
+
+/// `Expect` is the read INSIDE the commit: it decides whether the writes
+/// beside it happen, and it costs nothing to ask.
+#[test]
+fn an_assertion_guards_the_writes_beside_it_and_stages_no_row() {
+    let mut host = fresh();
+    host.run(ClientOp::Insert {
+        id: 1,
+        value: arr(val(1)),
+    });
+    let before = host.engine.usage().0;
+    let io_before = host.io_count;
+
+    // An assertion that holds, alone: nothing to make durable, so no I/O
+    // at all and not one slot spent.
+    assert!(matches!(
+        host.batch(&[BatchOp::Expect {
+            id: 1,
+            value: Some(val(1)),
+        }]),
+        Driven::Done(Output::BatchDone {
+            rows: 0,
+            result: Ok(())
+        })
+    ));
+    assert_eq!(host.engine.usage().0, before);
+    assert_eq!(host.io_count, io_before, "an assertion is not a write");
+
+    // An assertion that fails refuses the WHOLE batch, names the row, and
+    // writes nothing — the same shape as every other reason a batch is
+    // refused.
+    match host.batch(&[
+        BatchOp::Expect {
+            id: 1,
+            value: Some(val(999)),
+        },
+        BatchOp::Insert {
+            id: 2,
+            value: val(2),
+        },
+    ]) {
+        Driven::Done(Output::BatchDone {
+            rows: 0,
+            result: Err(reject),
+        }) => {
+            assert_eq!(reject.at, 0);
+            assert_eq!(reject.error, DbError::Mismatch { id: 1 });
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        host.engine.usage().0,
+        before,
+        "a refused batch wrote nothing"
+    );
+    assert_eq!(host.io_count, io_before);
+    assert_eq!(got(&mut host, 2), None);
+
+    // Absence is assertable too, in both directions.
+    assert!(matches!(
+        host.batch(&[BatchOp::Expect { id: 7, value: None }]),
+        Driven::Done(Output::BatchDone { result: Ok(()), .. })
+    ));
+    match host.batch(&[BatchOp::Expect { id: 1, value: None }]) {
+        Driven::Done(Output::BatchDone { result: Err(r), .. }) => {
+            assert_eq!(r.error, DbError::Mismatch { id: 1 })
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // And when it holds, the writes beside it land as one commit.
+    assert!(matches!(
+        host.batch(&[
+            BatchOp::Expect {
+                id: 1,
+                value: Some(val(1)),
+            },
+            BatchOp::Update {
+                id: 1,
+                value: val(50),
+            },
+            BatchOp::Insert {
+                id: 2,
+                value: val(2),
+            },
+        ]),
+        Driven::Done(Output::BatchDone {
+            rows: 2,
+            result: Ok(())
+        })
+    ));
+    assert_eq!(got(&mut host, 1), Some(val(50).to_vec()));
+    assert_eq!(got(&mut host, 2), Some(val(2).to_vec()));
+}
+
+/// An assertion reads the state the batch's EARLIER ops would leave, like
+/// every other op in a batch — so a batch can check its own work.
+#[test]
+fn an_assertion_sees_what_its_predecessors_in_the_batch_did() {
+    let mut host = fresh();
+    let long = vec![b'L'; 3 * VALUE_LEN + 7];
+    assert!(matches!(
+        host.batch(&[
+            BatchOp::Expect { id: 5, value: None },
+            BatchOp::Insert {
+                id: 5,
+                value: long.as_slice()
+            },
+            // The row exists NOW, with the bytes just staged — and those
+            // bytes are not in the arena yet, so this reads the payload
+            // the batch is about to write.
+            BatchOp::Expect {
+                id: 5,
+                value: Some(long.as_slice()),
+            },
+            BatchOp::Delete { id: 5 },
+            BatchOp::Expect { id: 5, value: None },
+            BatchOp::Insert {
+                id: 5,
+                value: val(5),
+            },
+        ]),
+        Driven::Done(Output::BatchDone { result: Ok(()), .. })
+    ));
+    assert_eq!(got(&mut host, 5), Some(val(5).to_vec()));
+
+    // And an assertion about the state BEFORE those ops now fails,
+    // because the projection is what is checked.
+    match host.batch(&[
+        BatchOp::Insert {
+            id: 6,
+            value: val(6),
+        },
+        BatchOp::Expect { id: 6, value: None },
+    ]) {
+        Driven::Done(Output::BatchDone { result: Err(r), .. }) => {
+            assert_eq!(r.at, 1);
+            assert_eq!(r.error, DbError::Mismatch { id: 6 });
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(got(&mut host, 6), None, "the batch was refused whole");
+}
+
+/// Compare-and-set is atomic across a crash like any other commit: at
+/// every I/O boundary, either the assertion held and every write landed,
+/// or nothing did.
+#[test]
+fn a_guarded_commit_is_all_or_nothing_at_every_crash_boundary() {
+    for boundary in 0..10u64 {
+        for settle in 0..2u64 {
+            let ctx = format!("boundary={boundary} settle={settle}");
+            let mut host = fresh();
+            host.run(ClientOp::Insert {
+                id: 1,
+                value: arr(val(1)),
+            });
+            host.crash_after = Some(host.io_count + boundary);
+            let _ = host.batch(&[
+                BatchOp::Expect {
+                    id: 1,
+                    value: Some(val(1)),
+                },
+                BatchOp::Update {
+                    id: 1,
+                    value: val(2),
+                },
+                BatchOp::Insert {
+                    id: 9,
+                    value: val(9),
+                },
+            ]);
+            let mut disk = std::mem::take(&mut host.disk);
+            disk.crash(&mut crash_rng(0xCA5_5E7, boundary * 4 + settle));
+
+            let (mut host, _) = open(disk);
+            let landed = got(&mut host, 9).is_some();
+            assert_eq!(
+                got(&mut host, 1),
+                Some(if landed { val(2) } else { val(1) }.to_vec()),
+                "[{ctx}] a guarded commit landed HALF"
+            );
+            // Whatever happened, the guard still works afterwards: the
+            // assertion now describes whichever state survived.
+            let survivor = got(&mut host, 1).expect("row 1 survives either way");
+            assert!(matches!(
+                host.batch(&[BatchOp::Expect {
+                    id: 1,
+                    value: Some(&survivor),
+                }]),
+                Driven::Done(Output::BatchDone { result: Ok(()), .. })
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

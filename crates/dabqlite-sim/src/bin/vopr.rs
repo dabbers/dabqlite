@@ -48,6 +48,7 @@ struct Totals {
     batches: u64,
     batch_steps: u64,
     long_values: u64,
+    assertions: u64,
     migrations: u64,
     migration_attempts: u64,
     disk_full_recoveries: u64,
@@ -71,6 +72,7 @@ impl Totals {
         self.batches += s.batches;
         self.batch_steps += s.batch_steps;
         self.long_values += s.long_values;
+        self.assertions += s.assertions;
         self.migrations += s.migrations;
         self.migration_attempts += s.migration_attempts;
         self.disk_full_recoveries += s.disk_full_recoveries;
@@ -94,8 +96,9 @@ impl Totals {
              {} substring-search oracle checks, {} inspector agreements, \
              {} full-disk recovery episodes, {} salvage episodes, \
              {} deletes + {} updates, {} atomic batches carrying {} writes, \
-             {} values spanning more than one row slot (every one of them \
-             appended and crash-reconciled like any other commit)",
+             {} values spanning more than one row slot, {} compare-and-set \
+             guards that held (every one of them appended and \
+             crash-reconciled like any other commit)",
             self.migrations,
             self.migration_attempts,
             self.find_checks,
@@ -106,7 +109,8 @@ impl Totals {
             self.updates,
             self.batches,
             self.batch_steps,
-            self.long_values
+            self.long_values,
+            self.assertions
         );
         println!(
             "vopr: simulated operational time: {:.1} h ({:.1} h of device I/O + {} restart cycles at {}s)",

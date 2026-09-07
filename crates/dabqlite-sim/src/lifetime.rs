@@ -109,6 +109,8 @@ pub struct LifetimeStats {
     pub batch_steps: u64,
     /// Committed values that did not fit one row slot.
     pub long_values: u64,
+    /// Compare-and-set guards that held, letting their commit through.
+    pub assertions: u64,
     /// Successful legacy→current migrations (0 or 1 per lifetime).
     pub migrations: u64,
     /// Migration attempts, including ones ended by crash or EIO.
@@ -160,9 +162,26 @@ fn slots_for(len: usize) -> u64 {
 /// needed no new recovery machinery.
 #[derive(Debug, Clone)]
 enum Step {
-    Insert { id: u64, value: Vec<u8> },
-    Update { id: u64, value: Vec<u8> },
-    Delete { id: u64 },
+    Insert {
+        id: u64,
+        value: Vec<u8>,
+    },
+    Update {
+        id: u64,
+        value: Vec<u8>,
+    },
+    Delete {
+        id: u64,
+    },
+    /// A compare-and-set guard: what the row must hold for the rest of
+    /// the commit to happen. Generated to HOLD against the projection, so
+    /// a batch carrying one must still commit — if the engine ever
+    /// disagreed with the model about what a row holds, the batch would
+    /// come back refused and the soak would say so.
+    Expect {
+        id: u64,
+        value: Option<Vec<u8>>,
+    },
 }
 
 impl Step {
@@ -172,6 +191,8 @@ impl Step {
         match self {
             Step::Insert { value, .. } | Step::Update { value, .. } => slots_for(value.len()),
             Step::Delete { .. } => 1,
+            // Checked, never written.
+            Step::Expect { .. } => 0,
         }
     }
 
@@ -180,6 +201,10 @@ impl Step {
             Step::Insert { id, value } => dabqlite_core::BatchOp::Insert { id: *id, value },
             Step::Update { id, value } => dabqlite_core::BatchOp::Update { id: *id, value },
             Step::Delete { id } => dabqlite_core::BatchOp::Delete { id: *id },
+            Step::Expect { id, value } => dabqlite_core::BatchOp::Expect {
+                id: *id,
+                value: value.as_deref(),
+            },
         }
     }
 
@@ -189,6 +214,8 @@ impl Step {
         match self {
             Step::Insert { value, .. } | Step::Update { value, .. } => value.len() == VALUE_LEN,
             Step::Delete { .. } => true,
+            // There is no single-op input that asserts anything.
+            Step::Expect { .. } => false,
         }
     }
 
@@ -216,6 +243,9 @@ impl Step {
                 oracle.remove(id);
                 log.retain(|(k, _)| k != id);
             }
+            // An assertion changes nothing; it decides whether the rest
+            // of the commit happens.
+            Step::Expect { .. } => {}
         }
     }
 
@@ -230,12 +260,16 @@ impl Step {
             Step::Delete { id } => {
                 state.remove(id);
             }
+            Step::Expect { .. } => {}
         }
     }
 
     fn id(&self) -> u64 {
         match self {
-            Step::Insert { id, .. } | Step::Update { id, .. } | Step::Delete { id } => *id,
+            Step::Insert { id, .. }
+            | Step::Update { id, .. }
+            | Step::Delete { id }
+            | Step::Expect { id, .. } => *id,
         }
     }
 }
@@ -488,8 +522,21 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                         .expect("non-empty")
                 });
                 let step = match (existing, roll) {
-                    (Some(id), r) if r < 15 => Step::Delete { id },
-                    (Some(id), r) if r < 30 => Step::Update {
+                    // A guard on what the commit is about to change. It is
+                    // built from the projection, so it must HOLD — the
+                    // engine reads the same state, and a batch that came
+                    // back refused would mean the two disagree about what
+                    // a row contains.
+                    (Some(id), r) if r < 12 => Step::Expect {
+                        id,
+                        value: Some(projected[&id].clone()),
+                    },
+                    (None, r) if r < 12 => Step::Expect {
+                        id: rng.gen(),
+                        value: None,
+                    },
+                    (Some(id), r) if r < 25 => Step::Delete { id },
+                    (Some(id), r) if r < 40 => Step::Update {
                         id,
                         value: gen_value(&mut rng),
                     },
@@ -546,6 +593,9 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                         value: <[u8; VALUE_LEN]>::try_from(&value[..]).expect("row-width value"),
                     }),
                     Step::Delete { id } => host.run(ClientOp::Delete { id: *id }),
+                    Step::Expect { .. } => {
+                        unreachable!("an assertion never takes the single-op path")
+                    }
                 }
             };
             match classify(driven) {
@@ -564,6 +614,7 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                         match step {
                             Step::Delete { .. } => stats.deletes += 1,
                             Step::Update { .. } => stats.updates += 1,
+                            Step::Expect { .. } => stats.assertions += 1,
                             Step::Insert { .. } => {}
                         }
                         if step.slots() > 1 {

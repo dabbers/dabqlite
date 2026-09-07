@@ -221,6 +221,20 @@ pub enum Op {
     Delete { id: u64 },
     /// Delete a row if it is there; do nothing if it is not.
     Remove { id: u64 },
+    /// Assert what a row holds, and refuse the whole batch if it holds
+    /// anything else. `Some(v)`: the row must be live with exactly `v`.
+    /// `None`: the id must be absent.
+    ///
+    /// The read INSIDE the commit. A read-then-write — "take the job at
+    /// the head of the queue if it is still pending", "increment this
+    /// counter", "save if nobody else edited it" — is a `get` and then a
+    /// `put`, with a gap between them. An assertion in the same batch as
+    /// the writes it guards removes the gap: they are decided together,
+    /// and if the row is not what the caller read, nothing happens.
+    ///
+    /// Costs no row slot ([`Op::rows`] is 0), and a batch of nothing but
+    /// assertions that all hold performs no I/O at all.
+    Expect { id: u64, value: Option<Value> },
 }
 
 impl Op {
@@ -239,6 +253,17 @@ impl Op {
     pub fn remove(id: u64) -> Self {
         Op::Remove { id }
     }
+    /// Assert that `id` holds exactly `value`.
+    pub fn expect(id: u64, value: Value) -> Self {
+        Op::Expect {
+            id,
+            value: Some(value),
+        }
+    }
+    /// Assert that `id` holds nothing.
+    pub fn expect_absent(id: u64) -> Self {
+        Op::Expect { id, value: None }
+    }
 
     fn to_core(&self) -> BatchOp<'_> {
         match self {
@@ -256,6 +281,10 @@ impl Op {
             },
             Op::Delete { id } => BatchOp::Delete { id: *id },
             Op::Remove { id } => BatchOp::Remove { id: *id },
+            Op::Expect { id, value } => BatchOp::Expect {
+                id: *id,
+                value: value.as_ref().map(Value::as_bytes),
+            },
         }
     }
 
@@ -277,6 +306,8 @@ impl Op {
                 value.len().div_ceil(CORE_VALUE_LEN).max(1)
             }
             Op::Delete { .. } | Op::Remove { .. } => 1,
+            // An assertion is checked, not written.
+            Op::Expect { .. } => 0,
         }
     }
 }
@@ -336,6 +367,11 @@ pub enum Error {
     /// could contain it. Distinct from [`Error::ValueTooLong`] because
     /// the thing that is too long is the question, not the data.
     NeedleTooLong { len: usize, max: usize },
+    /// A batch asserted what a row held ([`Op::Expect`]) and it held
+    /// something else, so the batch was refused whole. Nothing was
+    /// written: the assertion is checked before any I/O. This is the
+    /// answer a compare-and-set gives when it loses.
+    Mismatch { id: u64 },
     /// The database is open in salvage mode with unreadable rows, and this
     /// question cannot be answered honestly. Rebuild to clear it.
     Degraded { quarantined: u64 },
@@ -398,6 +434,11 @@ impl core::fmt::Display for Error {
             Error::ValueTooLong { len, max } => {
                 write!(f, "value is {len} bytes; the maximum is {max}")
             }
+            Error::Mismatch { id } => write!(
+                f,
+                "row {id} does not hold what the batch expected, so nothing \
+                 was written"
+            ),
             Error::NeedleTooLong { len, max } => write!(
                 f,
                 "search needle is {len} bytes; no value may exceed {max}, \
@@ -470,6 +511,7 @@ impl From<DbError> for Error {
                 rows: rows as usize,
                 max: max as usize,
             },
+            DbError::Mismatch { id } => Error::Mismatch { id },
             DbError::ValueTooLong { len, max } => Error::ValueTooLong {
                 len: len as usize,
                 max: max as usize,

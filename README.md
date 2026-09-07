@@ -18,6 +18,13 @@ db.batch(&[
     Op::remove(99),                           // no-op if it is not there
 ])?;
 
+// Compare-and-set: the read INSIDE the commit. If row 3 is not what you
+// read, nothing happens — no gap between the check and the writes.
+db.batch(&[
+    Op::expect(3, Value::from_text("ready")?),
+    Op::put(3, Value::from_text("claimed")?),
+])?;
+
 let hits = db.find_text("ell")?;              // exact substring search
 let hosts = db.find_prefix(b"https://")?;     // ...or anchored: prefix/suffix/exact
 let newest = db.last(20)?;                    // 20 highest ids, 20 rows of work

@@ -87,6 +87,10 @@ pub enum DbError {
     },
     /// A row with this id already exists.
     DuplicateId { id: u64 },
+    /// A batch asserted what a row held (`BatchOp::Expect`) and it held
+    /// something else. Nothing was written: the assertion is checked
+    /// before any I/O, like every other reason a batch is refused.
+    Mismatch { id: u64 },
     /// No row with this id exists, so there is nothing to delete. Deleting
     /// an absent row is a caller mistake, not a silent no-op: the engine
     /// says so rather than burning a slot on a tombstone for nothing.
@@ -282,6 +286,24 @@ pub enum BatchOp<'a> {
     /// no row when there is nothing to remove, so a batch is not lost to
     /// one target that had already gone.
     Remove { id: u64 },
+    /// Assert what a row holds, and refuse the whole batch if it holds
+    /// anything else. `Some(bytes)` means the row must be live with
+    /// exactly those bytes; `None` means the id must be absent.
+    ///
+    /// This is the read INSIDE the commit — compare-and-set, and the
+    /// primitive that read-then-write needs to be safe. Without it, "take
+    /// the job at the head of the queue if it is still pending" is a
+    /// `get` followed by a `put`, correct only because this store admits
+    /// one writer; the moment anything else can write, there is a gap to
+    /// race in. An `Expect` closes it, because the check and the writes
+    /// it guards are one commit and are decided together.
+    ///
+    /// Costs no row slot: it stages nothing, and a batch of nothing but
+    /// assertions that all hold performs no I/O at all. It is checked
+    /// against the state the batch's EARLIER ops would leave, like every
+    /// other op here, so `expect absent; insert; expect present` reads as
+    /// it means.
+    Expect { id: u64, value: Option<&'a [u8]> },
 }
 
 /// Why a batch was refused, and where.
@@ -1987,6 +2009,30 @@ impl Engine {
                     error,
                 }),
             };
+            // An assertion stages nothing and costs no slot, so it is
+            // settled here, before anything is measured or reserved. It
+            // reads the state the batch's EARLIER ops would leave — a row
+            // one of them wrote is not in the arena yet, so its bytes come
+            // from the payload that will be staged for it.
+            if let BatchOp::Expect { id, value } = *op {
+                let mut assembled = [0u8; MAX_VALUE_LEN];
+                let held: Option<&[u8]> = match self.projected_live_row(self.batch.len(), id) {
+                    None => None,
+                    Some(row) => match self.batch.iter().position(|e| e.at() == row) {
+                        Some(k) => Some(payloads[k]),
+                        None => {
+                            let (rows, _) = self.value_extent(row);
+                            let len = self.assemble_from_arena(row, rows, &mut assembled);
+                            Some(&assembled[..len])
+                        }
+                    },
+                };
+                if held != value {
+                    self.batch.clear();
+                    return reject(i, DbError::Mismatch { id });
+                }
+                continue;
+            }
             // Slots are consumed by STAGED rows, not by ops: a `Remove` of
             // an absent id stages nothing, and a long value stages several.
             let row = base + staged_rows as u64;
@@ -1994,7 +2040,7 @@ impl Engine {
                 BatchOp::Insert { value, .. }
                 | BatchOp::Update { value, .. }
                 | BatchOp::Put { value, .. } => value,
-                BatchOp::Delete { .. } | BatchOp::Remove { .. } => &[][..],
+                BatchOp::Delete { .. } | BatchOp::Remove { .. } | BatchOp::Expect { .. } => &[][..],
             };
             if bytes.len() > MAX_VALUE_LEN {
                 self.batch.clear();
@@ -2090,6 +2136,8 @@ impl Engine {
                         None => continue,
                     }
                 }
+                // Settled above, before any slot was measured.
+                BatchOp::Expect { .. } => unreachable!("assertions stage nothing"),
             };
             payloads[self.batch.len()] = bytes;
             self.batch.push(effect);

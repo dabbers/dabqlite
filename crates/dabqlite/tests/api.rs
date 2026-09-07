@@ -522,6 +522,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             len: 4096,
             max: MAX_VALUE_LEN,
         },
+        Error::Mismatch { id: 12 },
     ];
     // Every variant must appear above. This match exists to break the
     // build when a new one is added: a variant with no case here is a
@@ -534,6 +535,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
         "Locked",
         "ValueTooLong",
         "NeedleTooLong",
+        "Mismatch",
         "Degraded",
         "Corrupt",
         "SchemaMismatch",
@@ -550,6 +552,7 @@ fn errors_are_all_displayable_and_say_something_useful() {
             Error::Locked { .. } => "Locked",
             Error::ValueTooLong { .. } => "ValueTooLong",
             Error::NeedleTooLong { .. } => "NeedleTooLong",
+            Error::Mismatch { .. } => "Mismatch",
             Error::Degraded { .. } => "Degraded",
             Error::Corrupt { .. } => "Corrupt",
             Error::SchemaMismatch { .. } => "SchemaMismatch",
@@ -939,6 +942,98 @@ fn a_batch_is_durable_as_a_unit_across_a_reopen() {
         "a clean reopen after a batch must not report lost data"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Compare-and-set: the read inside the commit.
+///
+/// Every read-then-write a sample application wrote — "take the job at
+/// the head of the queue if it is still pending", "increment this
+/// counter", "save if nobody else edited it" — was a `get` followed by a
+/// `put`, with a gap between them, correct only because this store admits
+/// one writer. `Op::expect` closes the gap: the check and the writes it
+/// guards are decided together, in one commit, and it costs no row slot
+/// to ask.
+#[test]
+fn a_batch_can_assert_what_a_row_holds_before_writing() {
+    let mut db = Db::in_memory_with(64).expect("open");
+    db.insert(1, Value::from_text("pending").unwrap()).unwrap();
+    let slots = db.stats().slots;
+
+    // An assertion is checked, not written: no slot, and a batch of
+    // nothing but assertions that hold is a no-op that succeeds.
+    assert_eq!(
+        Op::expect(1, Value::from_text("pending").unwrap()).rows(),
+        0
+    );
+    assert_eq!(Op::expect_absent(9).rows(), 0);
+    db.batch(&[
+        Op::expect(1, Value::from_text("pending").unwrap()),
+        Op::expect_absent(9),
+    ])
+    .expect("both assertions hold");
+    assert_eq!(db.stats().slots, slots, "an assertion spends nothing");
+
+    // Claim it, guarded. This is the whole operation, atomically.
+    db.batch(&[
+        Op::expect(1, Value::from_text("pending").unwrap()),
+        Op::put(1, Value::from_text("claimed").unwrap()),
+    ])
+    .expect("the row was still pending");
+    assert_eq!(db.get(1).unwrap().unwrap().text(), "claimed");
+
+    // A second claimant loses, and loses cleanly: the batch is refused
+    // whole, it names the row, and nothing was written.
+    let before = db.all().unwrap();
+    let e = db
+        .batch(&[
+            Op::expect(1, Value::from_text("pending").unwrap()),
+            Op::put(1, Value::from_text("claimed by someone else").unwrap()),
+            Op::insert(2, Value::from_text("side effect").unwrap()),
+        ])
+        .expect_err("the row is no longer pending");
+    match &e {
+        Error::BatchRejected { at, cause } => {
+            assert_eq!(*at, 0);
+            assert!(matches!(**cause, Error::Mismatch { id: 1 }), "{cause:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(db.all().unwrap(), before, "a lost race changes nothing");
+    assert!(db.get(2).unwrap().is_none());
+
+    // Absence is assertable in both directions, which is how "create it
+    // only if nobody has" is written without a separate `insert`.
+    db.batch(&[
+        Op::expect_absent(5),
+        Op::put(5, Value::from_text("mine").unwrap()),
+    ])
+    .expect("nobody had it");
+    assert!(matches!(
+        db.batch(&[Op::expect_absent(5), Op::put(5, Value::empty())]),
+        Err(Error::BatchRejected { at: 0, .. })
+    ));
+    assert_eq!(db.get(5).unwrap().unwrap().text(), "mine");
+
+    // It works on a value too long for one row slot, and the assertion
+    // compares the whole value rather than its head.
+    let long = Value::from_bytes(&[b'q'; 200]).unwrap();
+    let mut nearly = vec![b'q'; 200];
+    nearly[199] = b'Z';
+    db.insert(6, long.clone()).unwrap();
+    db.batch(&[Op::expect(6, long.clone()), Op::delete(6)])
+        .expect("the whole 200 bytes match");
+    db.insert(6, long.clone()).unwrap();
+    assert!(
+        matches!(
+            db.batch(&[
+                Op::expect(6, Value::from_bytes(&nearly).unwrap()),
+                Op::delete(6)
+            ]),
+            Err(Error::BatchRejected { .. })
+        ),
+        "one byte different in the last slot is different"
+    );
+    assert!(db.get(6).unwrap().is_some());
 }
 
 /// Reads take `&self`, so one open database can serve many readers at

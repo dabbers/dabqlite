@@ -282,6 +282,7 @@ workload's own checksum agreed every time that nothing was missing.
 | A fail-stop mid-batch | targeted | `batch.rs` | no staged effect survives to be applied twice by the next batch |
 | An interrupted batch at every length | exhaustive | `batch.rs` | never reported as lost acknowledged data |
 | Two complete commits stranded past the manifest | targeted | `batch.rs` | still reported as rollback evidence |
+| Compare-and-set (`BatchOp::Expect`): guard holds, guard fails, guard reads the batch's own earlier ops, guard over a multi-slot value | targeted + every soak cycle | `batch.rs`, `api.rs`, `lifetime.rs` | a guard that holds costs no slot and no I/O; a guard that fails refuses the batch whole, names the row, and writes nothing; a guarded commit is all-or-nothing at every crash boundary |
 | A LONE orphan claiming a commit longer than the format can describe | targeted | `batch.rs` | reported as rollback evidence by both the engine and the inspector — one slot agrees with itself, so the claim is also bounded by the longest commit that can exist |
 | A wide torn commit followed by a narrow one | targeted, 3 settles | `batch.rs` | no false alarm, and none on any later open |
 | An open leaves nothing past the manifest | pinned | `batch.rs` | `orphan_valid_rows` always describes THIS incarnation |

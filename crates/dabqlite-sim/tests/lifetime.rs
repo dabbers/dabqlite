@@ -115,6 +115,27 @@ fn every_lifetime_exercises_batches_and_long_values() {
     );
 }
 
+/// Compare-and-set guards must actually be issued in the soak, and every
+/// one of them must HOLD.
+///
+/// The soak builds each guard from its own projection of what a row
+/// contains, and the engine checks it against the arena. A guard that
+/// failed would come back as a refused batch and the harness would panic
+/// on an unexpected write result — so this floor is what makes that
+/// agreement a live check rather than a possibility.
+#[test]
+fn every_lifetime_exercises_compare_and_set() {
+    let cfg = LifetimeConfig::default();
+    let mut assertions = 0u64;
+    for seed in 0..16u64 {
+        assertions += run_lifetime(seed, &cfg).assertions;
+    }
+    assert!(
+        assertions > 30,
+        "only {assertions} compare-and-set guards across the sweep"
+    );
+}
+
 /// Corruption containment is part of the surface too: every cycle damages
 /// a committed row on a COPY of the disk and proves salvage keeps the
 /// rest reachable. A floor keeps that from silently switching itself off.
