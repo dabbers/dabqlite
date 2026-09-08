@@ -1043,6 +1043,7 @@ missing for a row it kept.
 | Every soak cycle, after every recovery | ~10k checks per 200 lifetimes | `lifetime.rs` | the same rows in a completely different order: a recovery that got the rows right and the ORDER wrong shows up here and nowhere else |
 | Paging | pinned | `value_order.rs` (both) | a page is bounded, the cursor advances, and paging returns exactly what scanning returns — in both directions |
 | A bound longer than any value can be | pinned | `value_order.rs` (facade) | refused by name, not answered with an empty page that looks like a result |
+| Descent routing costs the answer, not the index | 4,000 keys, ascending and descending starts | core `btree.rs` | a range start compares fewer than N/4 keys, and a full scan compares exactly N. Routing is the one part of a tree that can be wrong WITHOUT being wrong — the chain walk filters the extras, so a descent that ignored every separator returns identical rows and only the work differs. `range_probes` is the only thing that can tell them apart, and planting the mutant confirms it does |
 | The prefix upper bound at the top of the byte range | pinned | `value_order.rs` (facade) | an all-`0xff` prefix has no upper bound, which the naive "append `0xff`" version gets silently wrong |
 
 ## Catching a reader up

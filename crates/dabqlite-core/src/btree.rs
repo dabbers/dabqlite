@@ -59,6 +59,17 @@ pub struct BTreeIndex {
     len: u64,
     /// Negative space: the pool must never move (no allocation after init).
     pool_addr: usize,
+    /// Keys a range walk has compared against its bound since this index
+    /// was built.
+    ///
+    /// Descent routing is what makes a range scan cost the rows in range
+    /// rather than the whole index, and it is the one part of a tree that
+    /// can be wrong WITHOUT being wrong: descend too far left and the
+    /// chain walk filters the extra keys out, so the answer is identical
+    /// and only the work differs. A count is the only thing that can tell
+    /// the two apart, and unlike a clock it is the same number on every
+    /// machine.
+    probes: core::cell::Cell<u64>,
 }
 
 /// Pool size for a declared row capacity. See module docs for the bound
@@ -132,6 +143,7 @@ impl BTreeIndex {
             root: 0,
             len: 0,
             pool_addr,
+            probes: core::cell::Cell::new(0),
         };
         t.root = t.alloc_node();
         t
@@ -304,6 +316,14 @@ impl BTreeIndex {
         }
     }
 
+    /// Keys a range walk has compared against its bound since this index
+    /// was built. See the field: the only observable difference between a
+    /// descent that routed correctly and one that started at the leftmost
+    /// leaf.
+    pub fn range_probes(&self) -> u64 {
+        self.probes.get()
+    }
+
     pub fn for_each_from(&self, start: u64, f: impl FnMut(u64, u64) -> bool) {
         self.for_each_from_by(&numeric(start), f);
     }
@@ -342,6 +362,10 @@ impl BTreeIndex {
             assert!(steps <= self.used as u64, "leaf chain cycle");
             let n = self.node(id);
             for i in 0..n.len as usize {
+                // Counted: a descent that landed too far left shows up
+                // here as keys compared and thrown away, and nowhere
+                // else — the answer is identical either way.
+                self.probes.set(self.probes.get() + 1);
                 if probe(n.keys[i]) != Ordering::Less && !f(n.keys[i], n.vals[i]) {
                     return;
                 }
@@ -409,7 +433,10 @@ impl BTreeIndex {
             let n = self.node(id);
             for i in (0..n.len as usize).rev() {
                 // The bound only bites in the first leaf; every later one
-                // lies entirely below `start`.
+                // lies entirely below `start`. Counted for the same reason
+                // the ascending walk counts: routing is invisible in the
+                // answer and visible only here.
+                self.probes.set(self.probes.get() + 1);
                 if probe(n.keys[i]) != Ordering::Greater && !f(n.keys[i], n.vals[i]) {
                     return;
                 }
@@ -847,6 +874,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Descent routing has to be right, and being right is invisible in
+    /// the answer.**
+    ///
+    /// `for_each_from_by` filters the chain walk against the bound, so a
+    /// descent that ignored the separators entirely and started at the
+    /// leftmost leaf would return exactly the same rows — correct, and
+    /// linear in the whole index instead of in the answer. Nothing in an
+    /// equality assertion can see that. The probe count can, so it is
+    /// counted and asserted here.
+    #[test]
+    fn a_range_start_costs_the_answer_and_not_the_whole_index() {
+        const N: u64 = 4000;
+        let mut t = BTreeIndex::new(N * 2);
+        for k in 0..N {
+            t.insert(k, k);
+        }
+
+        // A scan starting near the TOP of the order.
+        let start = t.range_probes();
+        let mut seen = 0u64;
+        t.for_each_from(N - 10, |_, _| {
+            seen += 1;
+            true
+        });
+        let cost = t.range_probes() - start;
+        assert_eq!(seen, 10, "the answer itself must be right first");
+        assert!(
+            cost < N / 4,
+            "starting 10 keys from the end compared {cost} of {N} keys — the              descent is not routing, it is scanning and filtering"
+        );
+
+        // The mirror, downward from near the BOTTOM.
+        let start = t.range_probes();
+        let mut seen = 0u64;
+        t.for_each_down_from(9, |_, _| {
+            seen += 1;
+            true
+        });
+        let cost = t.range_probes() - start;
+        assert_eq!(seen, 10);
+        assert!(
+            cost < N / 4,
+            "a descending scan of the lowest 10 keys compared {cost} of {N}"
+        );
+
+        // And the counter is a real measurement, not a constant: a scan of
+        // everything costs every key.
+        let start = t.range_probes();
+        t.for_each_from(0, |_, _| true);
+        assert_eq!(
+            t.range_probes() - start,
+            N,
+            "a full scan compares every key exactly once"
+        );
     }
 
     #[test]
