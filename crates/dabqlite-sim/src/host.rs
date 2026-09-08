@@ -377,6 +377,7 @@ impl SimHost {
                     | Input::RangeRev { .. }
                     | Input::RangeByValue { .. }
                     | Input::Find { .. }
+                    | Input::FindAll { .. }
             ),
             "run_input takes client operations, not I/O completions"
         );
@@ -482,6 +483,37 @@ impl SimHost {
             }
         }
         // Pages arrive newest-first; the oracle scans forwards.
+        refs.reverse();
+        refs.into_iter().map(|r| self.whole(r)).collect()
+    }
+
+    /// Every row satisfying EVERY predicate, drained through pages, each
+    /// value whole and in the oracle's forward order.
+    ///
+    /// The compound form of [`SimHost::find_all_matching`]. It exists in
+    /// the simulator for the same reason the single-needle form does: a
+    /// conjunction has to be exact against the RECOVERED database after
+    /// every fault schedule, not only on a clean one.
+    pub fn find_all_predicates(
+        &mut self,
+        preds: &[dabqlite_core::Predicate<'_>],
+    ) -> Vec<(u64, Vec<u8>)> {
+        let mut refs = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match self.run_input(Input::FindAll {
+                needles: preds,
+                after,
+            }) {
+                Driven::Done(Output::FindDone { result: Ok(p) }) => p,
+                other => panic!("find_all_predicates: {other:?}"),
+            };
+            refs.extend_from_slice(&page.items[..page.count as usize]);
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
         refs.reverse();
         refs.into_iter().map(|r| self.whole(r)).collect()
     }

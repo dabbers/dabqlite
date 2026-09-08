@@ -884,6 +884,31 @@ pub fn run_lifetime(seed: u64, cfg: &LifetimeConfig) -> LifetimeStats {
                     stats.find_checks += 1;
                 }
             }
+            // Every PAIR of those needles, ANDed. A conjunction walks one
+            // chain and verifies against all of its predicates, so it can
+            // fail in a way no single-needle search can: by walking the
+            // wrong chain and calling the shortfall an answer. Riding it
+            // through the same recoveries, salvages and migrations as
+            // everything else is what makes that visible.
+            for (i, a) in needles.iter().enumerate() {
+                for b in needles.iter().skip(i) {
+                    let preds = [
+                        dabqlite_core::Predicate::contains(a),
+                        dabqlite_core::Predicate::contains(b),
+                    ];
+                    let want: Vec<(u64, Vec<u8>)> = log
+                        .iter()
+                        .filter(|(_, v)| preds.iter().all(|p| p.mode.holds(v, p.needle)))
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        host.find_all_predicates(&preds),
+                        want,
+                        "[{ctx}] compound search diverged for {a:?} AND {b:?}"
+                    );
+                    stats.find_checks += 1;
+                }
+            }
         }
         // A READER over the same disk, caught up incrementally rather
         // than reopened. Two things are checked and the second is the

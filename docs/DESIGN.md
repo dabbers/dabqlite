@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Ten of these have since been decided by building the thing. They are kept
+Eleven of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -602,6 +602,32 @@ part worth reading.
   where the caller sees the refusal), it writes nothing until the next
   commit, and a fault at any of its I/O boundaries leaves the durable
   bytes exactly as they were — swept and asserted, not argued.
+- **Whether a query can name more than one condition** — DECIDED: it can,
+  and naming a second one can make a search FASTER rather than only more
+  precise. `Db::find_and` takes a slice of predicates and answers their
+  conjunction. It is not a scan with a filter bolted on and it is not one
+  chain walk per condition: every match mode implies containment, so ANY
+  predicate's candidate chain is already a superset of the answer, and
+  the engine walks exactly one of them and verifies each candidate
+  against all of the predicates. Correctness therefore does not depend on
+  which chain is chosen — the bytes decide, as they always did — which
+  turns the choice into a pure cost question.
+  Which is the part worth recording. The first version picked the LONGEST
+  needle, which reads like selectivity and is not: a chain is keyed on a
+  needle's first three bytes, so "the quick brown fox" and "the" walk the
+  identical chain. The engine now MEASURES, peeking a bounded distance
+  down each candidate chain and walking the shortest — so a bookmark
+  store asking for "tagged rust AND tagged wasm" pays for whichever tag
+  is rarer, which is the tag a person added in order to narrow the
+  search. Because every choice returns the same rows, the only way to
+  hold this is a count rather than a clock: `Db::find_verifications`
+  reports how many rows a search verified, and the tests assert on it.
+  The conjunction stops at what the library can honestly serve. A
+  case-folded text match against a byte store is not a superset question
+  and cannot become a predicate without losing rows; a range over a field
+  the value order does not begin with is not one either. Both stay
+  application-side in the samples, with the reason written down next to
+  them.
 
 Still open:
 

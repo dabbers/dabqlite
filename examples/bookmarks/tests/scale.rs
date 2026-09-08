@@ -344,3 +344,92 @@ fn a_scan_of_the_whole_collection_is_the_price_of_every_ordered_query() {
     assert_eq!(all.len(), N);
     eprintln!("{N} bookmarks materialised in {scan_t:?} to answer LIMIT 20");
 }
+
+/// The review's last open item, closed: a tag query is served by the
+/// index instead of by materialising the whole collection.
+///
+/// This store used to answer "tagged rust AND wasm" with `list()` and a
+/// chain of Rust filters — every bookmark decoded to find the handful
+/// that matched. The library grew compound predicates, so the same
+/// question is now one chain walk over the RAREST of the tags named.
+/// The assertion is a count, not a clock: the library says how many rows
+/// a search verified, and that number is the same on every machine.
+#[test]
+fn a_tag_query_is_a_chain_walk_and_no_longer_the_whole_collection() {
+    const N: usize = 5000;
+    let mut s = Store::in_memory_with(N as u64 * 14).unwrap();
+    s.import(&dataset(N)).unwrap();
+
+    // `wideeee` is on every bookmark, `narrowww` on a quarter of them.
+    // Naming both must cost the NARROW one, not the wide one and not the
+    // collection.
+    let before = s.db().find_verifications();
+    let hits = s
+        .query(&bookmarks::Query {
+            tags: vec!["wideeee".into(), "narrowww".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let verified = s.db().find_verifications() - before;
+
+    assert_eq!(hits.len(), N / 4);
+    assert!(
+        verified <= (N / 4) as u64 + 8,
+        "a two-tag query verified {verified} rows for {} hits — it walked \
+         the wide tag, or the whole store",
+        hits.len()
+    );
+    // And the honest comparison: the scan it replaced touches every row.
+    assert!(
+        verified * 3 < N as u64,
+        "verified {verified} of {N}, which is not an index"
+    );
+    eprintln!(
+        "{N} bookmarks, two tags, {verified} rows verified for {} hits",
+        hits.len()
+    );
+}
+
+/// The parts of a query the library still cannot serve stay honest.
+///
+/// A case-insensitive text match and a date range are Rust filters over
+/// decoded fields, and pretending otherwise would lose rows. This pins
+/// that they still agree with the naive answer once the index has
+/// narrowed on the tags.
+#[test]
+fn the_filters_the_index_cannot_serve_still_agree_with_the_scan() {
+    const N: usize = 800;
+    let mut s = Store::in_memory_with(N as u64 * 14).unwrap();
+    let mut items = dataset(N);
+    // Mixed case, so a byte-exact index could not answer the text part.
+    for (i, it) in items.iter_mut().enumerate() {
+        it.title = format!("Article Number {i}");
+    }
+    s.import(&items).unwrap();
+
+    let q = bookmarks::Query {
+        text: Some("ARTICLE NUMBER 4".into()),
+        tags: vec!["narrowww".into()],
+        since: Some(1_700_000_000 + 100),
+        until: Some(1_700_000_000 + 600),
+        ..Default::default()
+    };
+    let got: Vec<u64> = s.query(&q).unwrap().into_iter().map(|b| b.id).collect();
+
+    // The same question, answered by decoding everything.
+    let want: Vec<u64> = s
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.matches("article number 4"))
+        .filter(|b| b.tags.contains(&"narrowww".to_string()))
+        .filter(|b| b.added >= 1_700_000_000 + 100 && b.added <= 1_700_000_000 + 600)
+        .map(|b| b.id)
+        .collect();
+
+    assert!(
+        !want.is_empty(),
+        "the fixture must actually match something"
+    );
+    assert_eq!(got, want);
+}

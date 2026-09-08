@@ -595,12 +595,22 @@ fn the_index_matches_bytes_the_user_never_typed_into_a_field() {
 }
 
 #[test]
-fn the_index_cannot_be_combined_with_anything_else() {
-    // LIMITATION. "bookmarks tagged `docs`, added in this window,
-    // mentioning `rust`, newest first, at most ten" is one SQL statement.
-    // Here it is a full scan with the whole predicate written in Rust:
-    // `find` cannot be intersected with a range, a tag, an ordering, or a
-    // limit.
+fn the_index_serves_the_tag_conjunction_and_we_still_own_the_rest() {
+    // This used to be the LIMITATION named `the_index_cannot_be_combined_
+    // with_anything_else`: "bookmarks tagged `docs`, added in this window,
+    // mentioning `rust`, newest first, at most ten" is one SQL statement,
+    // and here it was a full scan with the whole predicate in Rust.
+    //
+    // Half of it is the library's job now. A tag is delimited on both
+    // sides, so "has this tag" is a byte-exact substring question, and
+    // `find_and` answers a conjunction of them in one chain walk — see
+    // `scale.rs`, which pins the cost as a count.
+    //
+    // The other half is still ours, and honestly so: the text match is
+    // case-folded and a byte index cannot be a superset of that, and the
+    // date range and the ordering are over fields we invented inside a
+    // value. The answer must be identical either way, which is what this
+    // checks.
     let mut s = seeded();
     s.visit(2).unwrap();
     s.visit(2).unwrap();

@@ -28,19 +28,30 @@
 //! - **Separators are our idea.** `dabqlite` has no notion of a field, so
 //!   "the tag is exactly `rust`" is spelled `find("\x1erust\x1e")` — we
 //!   encode delimiters into the value and hope the user does not type one.
-//! - **A needle may not exceed [`VALUE_LEN`] = 16 bytes** ([`Db::find_page`]
-//!   refuses longer ones outright) even though a value may be 2048. So
-//!   the index can serve `find("kernel")` and cannot serve
-//!   `find("kernel-development")`.
 //! - **`find` is byte-exact**, so it is case-sensitive. Case-insensitive
-//!   search is a full scan in Rust.
-//! - **Ordering, limits and compound predicates are ours.** See
-//!   [`Store::query`], which is a scan and a sort, every time.
+//!   search is a full scan in Rust — a byte index cannot be a superset of
+//!   a case-folded question, so this one is ours until we store a folded
+//!   copy of the record.
+//! - **Ordering and limits are ours.** See [`Store::query`]: it truncates
+//!   after sorting, because `added`, `visits` and `title` are fields we
+//!   invented inside a value and the library orders by key or by value
+//!   bytes.
+//!
+//! Two entries left this list by being fixed in the library, and are kept
+//! here because the reason is the interesting part:
+//!
+//! - A needle used to be capped at [`VALUE_LEN`] = 16 bytes while a value
+//!   could be 2048, so the index served `find("kernel")` and never
+//!   `find("kernel-development")`. The ceilings are the same number now.
+//! - A tag conjunction used to be a full scan plus Rust filters, because
+//!   the index answered one needle and could not be combined with a
+//!   second. [`Db::find_and`] takes them together and walks whichever
+//!   measures rarest, which is what [`Store::query`] now does with tags.
 //!
 //! Each of those has a test named after it in `tests/bookmarks.rs`.
 
 use dabqlite::{
-    Db, Error as DbErr, FindCursor, MemoryStorage, Op, Snapshot, Stats, Storage, Value,
+    Db, Error as DbErr, FindCursor, MemoryStorage, Op, Predicate, Snapshot, Stats, Storage, Value,
     MAX_COMMIT_ROWS, MAX_VALUE_LEN, VALUE_LEN,
 };
 
@@ -952,15 +963,56 @@ impl<S: Storage> Store<S> {
     /// The compound query: substring AND tags AND a date range, ordered,
     /// limited.
     ///
-    /// Still a full scan plus Rust, and still the honest answer: the
-    /// library has one index, over the bytes of a value, and no way to
-    /// combine it with anything, order by anything, or stop early on
-    /// anything but its own newest-first chain.
+    /// The tag conjunction is now the library's job. A tag is stored
+    /// delimited on both sides, so "has this tag" is a byte-exact
+    /// substring question, and `find_and` answers a whole conjunction of
+    /// them in ONE chain walk — over whichever tag turns out to be
+    /// rarest, which is exactly the tag a person adds to narrow a search.
+    /// This used to be `list()` plus a chain of Rust filters, which read
+    /// every bookmark in the store to answer "rust AND wasm".
+    ///
+    /// What stays in Rust, and why:
+    ///
+    /// - The TEXT needle is matched case-insensitively against decoded
+    ///   fields, and the store holds the original bytes. A byte index
+    ///   cannot be a superset of a case-folded question, so folding it
+    ///   into a predicate would silently lose rows. Storing a folded copy
+    ///   of the record would fix it; that is an application decision, not
+    ///   a library gap.
+    /// - The date range and the ordering are over DECODED fields — the
+    ///   library's ordered index is over the value bytes, and `added` is
+    ///   not at the front of this record. Putting it there would make
+    ///   `range_by_value` answer the date range, at the cost of the url
+    ///   being the thing this store looks up by.
     pub fn query(&mut self, q: &Query) -> Result<Vec<Bookmark>, StoreError> {
         let needle = q.text.as_ref().map(|t| t.to_lowercase());
         let want: Vec<String> = q.tags.iter().map(|t| t.trim().to_lowercase()).collect();
-        let mut out: Vec<Bookmark> = self
-            .list()?
+        // One `\x1etag\x1e` probe per wanted tag. Empty tags are dropped
+        // rather than turned into a probe that matches every delimiter.
+        let probes: Vec<Vec<u8>> = want
+            .iter()
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                let mut p = Vec::with_capacity(t.len() + 2);
+                p.push(TS);
+                p.extend_from_slice(t.as_bytes());
+                p.push(TS);
+                p
+            })
+            .collect();
+        let candidates = if probes.is_empty() {
+            self.list()?
+        } else {
+            let preds: Vec<Predicate<'_>> = probes
+                .iter()
+                .map(|p| Predicate::contains(p.as_slice()))
+                .collect();
+            // The index narrows; the decoded tags still decide, because a
+            // record is bytes and the library was never told what a tag
+            // is.
+            self.gather(self.db.find_and(&preds)?, |_| true)?
+        };
+        let mut out: Vec<Bookmark> = candidates
             .into_iter()
             .filter(|b| needle.as_ref().is_none_or(|n| b.matches(n)))
             .filter(|b| want.iter().all(|t| b.tags.contains(t)))

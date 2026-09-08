@@ -333,6 +333,37 @@ impl TrigramIndex {
     /// `page` receives HEAD rows; the cursor tracks the chain by posting
     /// row, which is what makes a continuation resume in the chain instead
     /// of walking it again.
+    /// How many postings the candidate chain for `needle` holds, counted
+    /// up to `cap`.
+    ///
+    /// The number a compound search needs in order to CHOOSE which of its
+    /// predicates drives the walk. Every predicate's chain is a valid
+    /// superset of the answer, so any of them is correct and the cheapest
+    /// one is the one to walk. "Cheapest" has to be measured: a chain is
+    /// keyed on a needle's FIRST THREE BYTES, so a longer needle is not a
+    /// rarer trigram — "the-quick-brown-fox" and "the" walk exactly the
+    /// same chain, and picking by length would have been a guess dressed
+    /// up as a heuristic.
+    ///
+    /// Capped so that choosing costs a bounded peek rather than a full
+    /// walk of every chain it declines. Past `cap` postings the chains
+    /// are all expensive and the difference stops being worth measuring.
+    /// A needle too short to have a trigram has no chain at all and would
+    /// scan every row, so it reports the worst possible cost and is never
+    /// chosen over one that has a chain.
+    pub fn chain_len_capped(&self, needle: &[u8], cap: u32) -> u32 {
+        if needle.len() < 3 {
+            return u32::MAX;
+        }
+        let mut slot = self.head(tri_key(&needle[0..3]));
+        let mut n = 0u32;
+        while slot != NIL && n < cap {
+            n += 1;
+            slot = self.next[slot as usize];
+        }
+        n
+    }
+
     pub fn find_page<M: Fn(u64) -> bool, H: Fn(u64) -> Option<u64>>(
         &self,
         needle: &[u8],
@@ -469,6 +500,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The chain peek is a real count of the chain it names, capped —
+    /// which is what makes "walk the cheapest condition" a measurement
+    /// and not a hope.
+    #[test]
+    fn the_chain_peek_counts_the_chain_it_names() {
+        let mut t = TrigramIndex::new(64);
+        // "rare" appears once; "abc" appears in every row.
+        for row in 0..30u64 {
+            t.insert(row, &value(b"abcabcabc"));
+        }
+        t.insert(30, &value(b"rare-abc"));
+
+        // Naive count of a chain, by walking it with no cap at all.
+        let walk = |needle: &[u8]| t.chain_len_capped(needle, u32::MAX);
+
+        // Every row holds "abc"; only one holds "rar".
+        assert_eq!(walk(b"rar"), 1);
+        assert_eq!(walk(b"rare-abc"), 1, "only the first trigram keys it");
+        assert_eq!(walk(b"abc"), 31);
+        // A trigram nothing holds has an empty chain, which is the
+        // cheapest possible answer and still a correct superset.
+        assert_eq!(walk(b"zzz"), 0);
+
+        // The cap truncates rather than lying about the direction.
+        assert_eq!(t.chain_len_capped(b"abc", 4), 4);
+        assert_eq!(t.chain_len_capped(b"rar", 4), 1);
+        assert_eq!(t.chain_len_capped(b"abc", 0), 0);
+
+        // A needle with no trigram has no chain: it reports the worst
+        // possible cost, because searching it means scanning every row.
+        assert_eq!(walk(b"ab"), u32::MAX);
+        assert_eq!(walk(b""), u32::MAX);
+        assert_eq!(t.chain_len_capped(b"ab", 4), u32::MAX);
+    }
+
+    /// A chain is keyed on the FIRST THREE BYTES, so needle length is not
+    /// a proxy for selectivity. This is the fact that made picking the
+    /// longest needle a guess.
+    #[test]
+    fn a_longer_needle_is_not_a_rarer_chain() {
+        let mut t = TrigramIndex::new(64);
+        for row in 0..20u64 {
+            t.insert(row, &value(b"the quick brown"));
+        }
+        t.insert(20, &value(b"zqx"));
+        assert_eq!(
+            t.chain_len_capped(b"the quick brown", u32::MAX),
+            t.chain_len_capped(b"the", u32::MAX),
+            "the same first trigram is the same chain, whatever the length"
+        );
+        assert!(
+            t.chain_len_capped(b"zqx", u32::MAX) < t.chain_len_capped(b"the quick brown", u32::MAX),
+            "the short needle is the cheap one here"
+        );
     }
 
     #[test]

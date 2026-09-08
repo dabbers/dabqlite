@@ -4,7 +4,7 @@ An embeddable, schema-compiled record store with a declared memory ceiling, a
 deterministic core, and a web-native execution model.
 
 ```rust
-use dabqlite::{Db, Op, Value};
+use dabqlite::{Db, Op, Predicate, Value};
 
 let mut db = Db::open("./mydb")?;             // or Db::in_memory()
 db.put(1, Value::from_text("hello")?)?;       // insert or replace, atomically
@@ -27,6 +27,10 @@ db.batch(&[
 
 let hits = db.find_text("ell")?;              // exact substring search
 let hosts = db.find_prefix(b"https://")?;     // ...or anchored: prefix/suffix/exact
+let both = db.find_and(&[                     // ...or several conditions, ANDed,
+    Predicate::contains(b"\x1erust\x1e"),     // in ONE walk over whichever of
+    Predicate::contains(b"\x1ewasm\x1e"),     // them measures rarest
+])?;
 let newest = db.last(20)?;                    // 20 highest ids, 20 rows of work
 let blob = db.snapshot()?.to_bytes();         // move it anywhere
 Db::restore("./copy", &Snapshot::from_bytes(&blob)?)?;
@@ -48,7 +52,9 @@ the OPFS backend (step 2).** One table with insert, update, delete and get;
 ordered range scans in both directions; scans in VALUE order, so an
 application whose real key is a byte string gets key-ordered ranges and
 prefix scans off an index instead of a scan and a sort; substring search
-that can be anchored to either end or both; values of any length up to 2
+that can be anchored to either end or both, and combined — several
+conditions ANDed in one index walk over whichever of them measures
+rarest; values of any length up to 2
 KiB; atomic
 multi-write batches, with compare-and-set inside them; lock-free readers
 alongside the single writer, and reads that take `&self`, catching up on

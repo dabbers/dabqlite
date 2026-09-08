@@ -92,8 +92,8 @@ pub mod vorder;
 pub use blob::{BlobAllocator, BlobError, BlobHandle, BlobStats, BLOB_HARD_MAX};
 pub use engine::{
     BatchOp, BatchReject, Capacities, DbError, Engine, FileId, FindPage, Input, Match, Output,
-    RangePage, RecoveryReport, RowRef, ValueWindow, WriteBuf, FIND_PAGE, MAX_VALUE_LEN, RANGE_PAGE,
-    WINDOW_LEN,
+    Predicate, RangePage, RecoveryReport, RowRef, ValueWindow, WriteBuf, FIND_PAGE, MAX_VALUE_LEN,
+    RANGE_PAGE, WINDOW_LEN,
 };
 pub use layout::{
     MAX_COMMIT_ROWS, ROW_SIZE, SB_COPIES, SB_COPY_SIZE, SB_ZONE_SIZE, SCHEMA_HASH, VALUE_LEN,

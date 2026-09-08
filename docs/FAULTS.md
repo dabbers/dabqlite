@@ -541,6 +541,40 @@ arbitrarily corrupted index can only make queries slower, never wrong.
 | The compiled surface (`:find`) | codegen tests + wrapper pins | `queries.rs` (codegen), `query_surface.rs` | `WHERE value LIKE $1` compiles ONLY against a column annotated `@index(trigram)` — the finite operation space contains only operations the declared indexes can serve; wrong kinds and un-annotated LIKE are refused by name |
 | Index annotations vs the version gate | hash pin | codegen `schema.rs` | `@index(trigram)` does NOT change `SCHEMA_HASH`: indexes are derived state, so declaring one never bricks existing files or forces a migration — pinned by test |
 
+## Compound predicates (several conditions, one chain walk)
+
+`Db::find_and` answers a conjunction. It leans on one fact: every match
+mode implies containment, so ANY predicate's candidate chain is already a
+superset of the answer. The engine walks exactly ONE of them and verifies
+each candidate against ALL of the predicates against real arena bytes —
+so a compound search is exact for the same reason a single-needle search
+is, and no choice of chain can make it wrong.
+
+That reduces chain selection to a pure cost question, and cost questions
+are where an untested heuristic hides. The first version picked the
+longest needle, which sounds like selectivity and is not: a chain is
+keyed on a needle's FIRST THREE BYTES, so `"the quick brown fox"` and
+`"the"` walk the same chain. It now measures — a bounded peek down each
+candidate chain, walk the shortest. Because every choice returns the same
+rows, only a COUNT can tell them apart, so `Db::find_verifications` is
+public and the tests assert on it rather than on a clock.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Conjunction vs scan-and-filter | 6 seeds × 120 rounds of inserts/updates/deletes × 16 predicate pairs | `compound.rs` (facade) | identical rows in identical ORDER to "read every live row, check every condition with `Match::holds`" — the oracle is the already-tested single-needle scan, not a second search |
+| One predicate == the search it generalises | 7 needles × 4 match modes | `compound.rs` | `find_and(&[p])` equals `find_matching(p)` exactly — the compound path is not a second implementation of the simple one |
+| Mixed match modes in one conjunction | pinned | `compound.rs` | `Prefix` AND `Contains` AND `Suffix` narrow together; a contradictory `Exact` empties the answer instead of confusing it |
+| No conditions at all | pinned | `compound.rs` | every live row, which is what a query with no `WHERE` means — not an error, not an empty page |
+| Needles too short for a trigram | alone, paired with a long needle, and in pairs | `compound.rs` | exact either way; a chainless needle never turns an indexed search into a scan |
+| Cost: the cheapest condition wins | 2,000 rows, one rare needle among a universal one | `compound.rs` | the compound search verifies ≤ 8 rows where the common needle alone verifies ≥ 2,000 — a count, identical on every machine. Predicate ORDER does not change it |
+| The chain peek is a real measurement | forged chains, capped and uncapped | core `trigram.rs` | counts the chain it names, truncates at the cap, and reports the worst possible cost for a needle with no trigram; a longer needle is pinned as NOT a rarer chain |
+| Paging | 300 rows, multi-page answer | `compound.rs` | paging returns exactly what draining returns, in order, and terminates |
+| Whole values, not head slots | needles straddling a slot seam and living slots deep | `compound.rs` | predicates are checked against the ASSEMBLED value |
+| An impossible needle | at and past `MAX_VALUE_LEN` | `compound.rs` | refused by name for whichever predicate is at fault; legal at the limit exactly |
+| Committed state, across a reopen | batch + snapshot/load | `compound.rs` | the same answer from the rebuilt index as from the written one |
+| Every soak cycle, after every recovery | every PAIR of that cycle's needles, ~200 lifetimes | `lifetime.rs` | a conjunction is exact against the RECOVERED database after crashes, salvage episodes, full disks and migrations — a compound search can fail in a way a single-needle one cannot, by walking the wrong chain and calling the shortfall an answer |
+| The application it was missing for | 5,000 bookmarks, two tags | bookmarks `scale.rs` | a two-tag query verifies ~N/4 rows instead of decoding all N; the case-folded text match and the date range stay Rust filters and are pinned to agree with the naive scan |
+
 ## ACID (design §5: stated per-target, verified per-letter)
 
 Consolidated in `acid.rs`; most evidence also lives distributed through the

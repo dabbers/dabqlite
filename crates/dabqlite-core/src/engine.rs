@@ -255,6 +255,34 @@ impl RowRef {
     }
 }
 
+/// One condition of a compound search: a needle and how it is compared.
+///
+/// Several of these are ANDed. The index still narrows on ONE of them —
+/// any row satisfying a predicate contains that predicate's needle, so
+/// that needle's candidate chain is a superset of the answer — and every
+/// candidate is then verified against ALL of them. So a compound search
+/// costs one chain walk, not one per condition, and is exact for the same
+/// reason a single-needle search is: the bytes decide, not the index.
+///
+/// Which chain gets walked is measured, not guessed: the cheapest one
+/// wins, which is why naming a second condition can make a search FASTER
+/// rather than only more precise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Predicate<'a> {
+    pub needle: &'a [u8],
+    pub mode: Match,
+}
+
+impl<'a> Predicate<'a> {
+    /// The needle must appear somewhere in the value.
+    pub fn contains(needle: &'a [u8]) -> Self {
+        Predicate {
+            needle,
+            mode: Match::Contains,
+        }
+    }
+}
+
 /// How a substring search compares its needle against a value.
 ///
 /// The index accelerates all four identically — any value that starts
@@ -567,6 +595,18 @@ pub enum Input<'a> {
         /// How the needle is compared — anywhere in the value by default,
         /// or anchored to one or both ends.
         mode: Match,
+        after: Option<FindCursor>,
+    },
+    /// Client: substring search for rows satisfying EVERY predicate.
+    ///
+    /// The compound query an application otherwise writes as a scan plus
+    /// a filter — "this text AND this tag" — done in one chain walk with
+    /// the same exactness and the same bounded page.
+    ///
+    /// An empty predicate list matches everything, which is what "no
+    /// conditions" means.
+    FindAll {
+        needles: &'a [Predicate<'a>],
         after: Option<FindCursor>,
     },
 }
@@ -1448,6 +1488,7 @@ impl Engine {
             | Input::Range { .. }
             | Input::RangeRev { .. }
             | Input::RangeByValue { .. }
+            | Input::FindAll { .. }
             | Input::Find { .. } => self.read(input),
         }
     }
@@ -1485,7 +1526,8 @@ impl Engine {
                 needle,
                 mode,
                 after,
-            } => self.on_find(needle, mode, after),
+            } => self.on_find(&[Predicate { needle, mode }], after),
+            Input::FindAll { needles, after } => self.on_find(needles, after),
             other => panic!("Engine::read takes reads, not {other:?}"),
         }
     }
@@ -3338,20 +3380,20 @@ impl Engine {
         Output::RangeDone { result }
     }
 
-    fn on_find(&self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> Output {
-        if needle.len() > MAX_VALUE_LEN {
+    fn on_find(&self, preds: &[Predicate<'_>], after: Option<FindCursor>) -> Output {
+        if let Some(p) = preds.iter().find(|p| p.needle.len() > MAX_VALUE_LEN) {
             // Longer than any value can be, so it cannot match anything.
             // Saying so is more useful than an empty page that looks like
             // a real answer.
             return Output::FindDone {
                 result: Err(DbError::ValueTooLong {
-                    len: needle.len() as u32,
+                    len: p.needle.len() as u32,
                     max: MAX_VALUE_LEN as u32,
                 }),
             };
         }
         let result = match self.state {
-            State::Ready | State::Degraded => Ok(self.find_page(needle, mode, after)),
+            State::Ready | State::Degraded => Ok(self.find_page(preds, after)),
             State::New
             | State::InitWriteSb { .. }
             | State::InitFsyncSb
@@ -3391,10 +3433,29 @@ impl Engine {
     /// bytes, so results are exact regardless of index state — the index
     /// can only make this slower, never wrong. Committed state only:
     /// like the btree, the trigram index is updated at the commit point.
-    fn find_page(&self, needle: &[u8], mode: Match, after: Option<FindCursor>) -> FindPage {
+    fn find_page(&self, preds: &[Predicate<'_>], after: Option<FindCursor>) -> FindPage {
         let mut rows = [0u64; FIND_PAGE];
+        // The index narrows on ONE predicate. Any row satisfying a
+        // predicate contains that predicate's needle — every match mode
+        // implies containment — so ANY predicate's chain is a superset of
+        // the answer and any choice is exact. Which one to walk is
+        // therefore a pure cost question, and it is MEASURED rather than
+        // guessed: a chain is keyed on a needle's first three bytes, so
+        // needle length says nothing about how many candidates it will
+        // hand back. Peeking at each chain is bounded by `CHAIN_PEEK`, so
+        // choosing costs less than the page it saves. A needle shorter
+        // than a trigram has no chain and reports the worst cost; if none
+        // of them has one the walk falls back to a scan, bounded by the
+        // row count and still exact.
+        const CHAIN_PEEK: u32 = 4096;
+        let chain = preds
+            .iter()
+            .map(|p| p.needle)
+            .filter(|n| n.len() >= 3)
+            .min_by_key(|n| self.trigram.chain_len_capped(n, CHAIN_PEEK))
+            .unwrap_or(&[]);
         let (n, next) = self.trigram.find_page(
-            needle,
+            chain,
             after,
             &mut rows,
             |row| {
@@ -3408,7 +3469,11 @@ impl Engine {
                 let off = (row as usize) * ROW_SIZE;
                 match decode_row(&self.arena[off..off + ROW_SIZE]) {
                     Some(slot) if slot.record().is_some() => {
-                        if needle.is_empty() && mode == Match::Contains {
+                        // Nothing to check: every row is a match.
+                        if preds
+                            .iter()
+                            .all(|p| p.needle.is_empty() && p.mode == Match::Contains)
+                        {
                             return true;
                         }
                         // Match against the WHOLE value, not the head slot: a
@@ -3417,7 +3482,10 @@ impl Engine {
                         let (rows, _) = self.value_extent(row);
                         let mut value = [0u8; MAX_VALUE_LEN];
                         let len = self.assemble_from_arena(row, rows, &mut value);
-                        mode.holds(&value[..len], needle)
+                        // ALL of them: the index only narrowed, the bytes
+                        // decide, and one chain walk answers the whole
+                        // conjunction.
+                        preds.iter().all(|p| p.mode.holds(&value[..len], p.needle))
                     }
                     // A tombstone or a continuation indexes nothing and
                     // matches nothing.

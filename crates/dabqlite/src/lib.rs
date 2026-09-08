@@ -62,7 +62,9 @@ use dabqlite_host::Host;
 /// is only ever this big?" is a question a caller should not have to
 /// answer by experiment.
 pub use dabqlite_core::RANGE_PAGE;
-pub use dabqlite_core::{DbError as EngineError, FindCursor, Match, RecoveryReport, VALUE_LEN};
+pub use dabqlite_core::{
+    DbError as EngineError, FindCursor, Match, Predicate, RecoveryReport, VALUE_LEN,
+};
 
 // The backends, re-exported so that `Db<S>` can actually be WRITTEN DOWN by
 // a caller. Without these a database could only ever be a local binding
@@ -1691,6 +1693,62 @@ impl<S: Storage> Db<S> {
         self.find_page_matching(needle, Match::Contains, after)
     }
 
+    /// Every row satisfying EVERY predicate — the compound query an
+    /// application otherwise writes as a scan plus a filter.
+    ///
+    /// "This text AND this tag" was a full scan and a chain of Rust
+    /// filters in every sample that wanted it. It is one chain walk here:
+    /// any row satisfying a predicate contains that predicate's needle,
+    /// so each predicate's candidate chain is a superset of the answer,
+    /// and the index narrows on whichever chain MEASURES cheapest —
+    /// picking the rarest condition is the whole benefit of naming
+    /// several. Every candidate is then verified against all of the
+    /// predicates. Exact for the same reason a single-needle search is —
+    /// the bytes decide, not the index — and the page is bounded the same
+    /// way.
+    ///
+    /// An empty predicate list matches everything, which is what "no
+    /// conditions" means.
+    pub fn find_and(&self, preds: &[Predicate<'_>]) -> Result<Vec<Row>, Error> {
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let (rows, next) = self.find_page_and(preds, after)?;
+            out.extend(rows);
+            match next {
+                Some(c) => after = Some(c),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One bounded page of [`Db::find_and`], plus where to continue.
+    pub fn find_page_and(
+        &self,
+        preds: &[Predicate<'_>],
+        after: Option<FindCursor>,
+    ) -> Result<(Vec<Row>, Option<FindCursor>), Error> {
+        use dabqlite_core::Input;
+        if let Some(p) = preds.iter().find(|p| p.needle.len() > MAX_VALUE_LEN) {
+            return Err(Error::NeedleTooLong {
+                len: p.needle.len(),
+                max: MAX_VALUE_LEN,
+            });
+        }
+        match self.h().read(Input::FindAll {
+            needles: preds,
+            after,
+        }) {
+            Output::FindDone { result: Ok(page) } => {
+                let items: Vec<dabqlite_core::RowRef> = page.items[..page.count as usize].to_vec();
+                let next = page.next;
+                Ok((self.rows_from(&items)?, next))
+            }
+            Output::FindDone { result: Err(e) } => Err(e.into()),
+            other => unreachable!("find returned {other:?}"),
+        }
+    }
+
     /// One bounded page in any [`Match`] mode.
     pub fn find_page_matching(
         &self,
@@ -1864,6 +1922,20 @@ impl<S: Storage> Db<S> {
                 Err(err)
             }
         }
+    }
+
+    /// Rows a substring search has verified against their value bytes
+    /// since this handle opened.
+    ///
+    /// The work the trigram index did NOT save: every candidate its chain
+    /// handed back had to be read and checked, because the index only
+    /// narrows and the bytes decide. Counting them is how a test can hold
+    /// the claim that a compound search picks its cheapest condition —
+    /// the answer is the same either way, so only this number shows which
+    /// chain was walked, and a count is the same on every machine where a
+    /// stopwatch is not.
+    pub fn find_verifications(&self) -> u64 {
+        self.h().engine.find_verifications()
     }
 
     /// Row slots the value-ordered index's comparator has read since this
