@@ -1255,6 +1255,18 @@ impl Engine {
         self.extent_walks.get()
     }
 
+    /// Postings walked while CHOOSING which chain a substring search
+    /// should walk.
+    ///
+    /// Zero for a single-needle search and for a resumed page, because
+    /// neither has a choice to make. The results are identical whether
+    /// or not the peek happened, so this counter is the only thing that
+    /// can tell "measured the options" from "paid for a decision it
+    /// already knew".
+    pub fn chain_peek_steps(&self) -> u64 {
+        self.trigram.peek_steps()
+    }
+
     /// Row slots the value-ordered index's comparator has read. See
     /// `value_cmp_slots`.
     pub fn value_cmp_slots(&self) -> u64 {
@@ -3447,13 +3459,40 @@ impl Engine {
         // than a trigram has no chain and reports the worst cost; if none
         // of them has one the walk falls back to a scan, bounded by the
         // row count and still exact.
+        //
+        // Measured only when there is a CHOICE. A single-needle search —
+        // which is every `Input::Find`, the overwhelmingly common case —
+        // has exactly one chain it could walk, so peeking down it would
+        // be pure added cost on the hot path for an answer already known.
+        // The same goes for a resumed page: the cursor carries the chain
+        // position, so the chain was chosen when the search began and
+        // re-deciding it now would change nothing but the bill.
         const CHAIN_PEEK: u32 = 4096;
-        let chain = preds
-            .iter()
-            .map(|p| p.needle)
-            .filter(|n| n.len() >= 3)
-            .min_by_key(|n| self.trigram.chain_len_capped(n, CHAIN_PEEK))
-            .unwrap_or(&[]);
+        let mut candidates = preds.iter().map(|p| p.needle).filter(|n| n.len() >= 3);
+        let chain = match (candidates.next(), candidates.next()) {
+            // Nothing with a trigram: the walk is a scan, still exact.
+            (None, _) => &[][..],
+            // Exactly one chain it could walk, so there is nothing to
+            // decide. This is every `Input::Find`, which is the common
+            // case by a wide margin.
+            (Some(only), None) => only,
+            // Resuming: the cursor carries a position in the chain the
+            // search already chose, so re-deciding would change the bill
+            // and nothing else.
+            (Some(first), Some(_)) if after.is_some() => first,
+            (Some(first), Some(second)) => {
+                let mut best = first;
+                let mut best_cost = self.trigram.chain_len_capped(first, CHAIN_PEEK);
+                for n in core::iter::once(second).chain(candidates) {
+                    let cost = self.trigram.chain_len_capped(n, CHAIN_PEEK);
+                    if cost < best_cost {
+                        best = n;
+                        best_cost = cost;
+                    }
+                }
+                best
+            }
+        };
         let (n, next) = self.trigram.find_page(
             chain,
             after,

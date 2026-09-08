@@ -1924,6 +1924,17 @@ impl<S: Storage> Db<S> {
         }
     }
 
+    /// Postings walked while CHOOSING which chain a substring search
+    /// should walk, since this handle opened.
+    ///
+    /// A compound search measures its options; a single-needle one has
+    /// no options, and a resumed page's chain was settled when the
+    /// search began. Both must therefore cost nothing here, and since
+    /// the answers are identical either way, only this count can say so.
+    pub fn find_chain_peeks(&self) -> u64 {
+        self.h().engine.chain_peek_steps()
+    }
+
     /// Rows a substring search has verified against their value bytes
     /// since this handle opened.
     ///

@@ -441,3 +441,73 @@ fn a_short_needle_never_wins_the_chain_over_a_real_one() {
     );
     assert_eq!(ids(db.find_and(&preds).unwrap()), oracle(&db, &preds));
 }
+
+/// **Choosing costs nothing when there is nothing to choose.**
+///
+/// Measuring the chains is what makes a compound search pick the rarest
+/// condition, and it is pure overhead in the two cases where the choice
+/// is already made: a single-needle search has exactly one chain, and a
+/// resumed page's chain was settled by its cursor. Both return the same
+/// rows whether or not the peek happened, so only a count can tell the
+/// difference — and a peek added to every ordinary `find` would be a
+/// regression nothing else in this suite could see.
+#[test]
+fn a_search_with_no_choice_to_make_does_not_pay_for_one() {
+    let mut db = db(8192);
+    for id in 0..1500u64 {
+        db.insert(
+            id,
+            Value::from_text(&format!("common-prefix item-{id} tail-marker")).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // The single-needle search the library has always had.
+    let before = db.find_chain_peeks();
+    assert_eq!(db.find_text("common-prefix").unwrap().len(), 1500);
+    assert_eq!(
+        db.find_chain_peeks() - before,
+        0,
+        "an ordinary find measured chains it had no choice between"
+    );
+
+    // One predicate through the compound surface is the same thing.
+    let before = db.find_chain_peeks();
+    db.find_and(&[Predicate::contains(b"common-prefix")])
+        .unwrap();
+    assert_eq!(db.find_chain_peeks() - before, 0);
+
+    // Two predicates: now there IS a choice, and it is measured.
+    let preds = [
+        Predicate::contains(b"common-prefix"),
+        Predicate::contains(b"tail-marker"),
+    ];
+    let before = db.find_chain_peeks();
+    let (first, cursor) = db.find_page_and(&preds, None).expect("first page");
+    let choosing = db.find_chain_peeks() - before;
+    assert!(!first.is_empty());
+    assert!(
+        choosing > 0,
+        "a two-predicate search chose a chain without measuring anything"
+    );
+
+    // ...once, at the start. Every later page resumes into the chain the
+    // first one picked, so re-deciding would change the bill and nothing
+    // else.
+    let mut after = cursor;
+    let before = db.find_chain_peeks();
+    let mut pages = 0;
+    while let Some(c) = after {
+        let (_, next) = db.find_page_and(&preds, Some(c)).expect("page");
+        after = next;
+        pages += 1;
+        assert!(pages < 500, "paging did not terminate");
+    }
+    assert!(pages > 1, "the answer must actually span pages");
+    assert_eq!(
+        db.find_chain_peeks() - before,
+        0,
+        "{pages} resumed pages re-measured a chain their cursor had already \
+         chosen"
+    );
+}

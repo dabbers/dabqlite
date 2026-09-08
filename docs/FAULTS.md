@@ -567,6 +567,7 @@ public and the tests assert on it rather than on a clock.
 | No conditions at all | pinned | `compound.rs` | every live row, which is what a query with no `WHERE` means — not an error, not an empty page |
 | Needles too short for a trigram | alone, paired with a long needle, and in pairs | `compound.rs` | exact either way; a chainless needle never turns an indexed search into a scan |
 | Cost: the cheapest condition wins | 2,000 rows, one rare needle among a universal one | `compound.rs` | the compound search verifies ≤ 8 rows where the common needle alone verifies ≥ 2,000 — a count, identical on every machine. Predicate ORDER does not change it |
+| Choosing costs nothing when there is no choice | 1,500 rows, single needle and resumed pages | `compound.rs` | a one-predicate search and every page after the first peek at ZERO chains. The results are identical whether or not the peek happened, so a peek added to every ordinary `find` would be a regression nothing else in the suite could see |
 | The chain peek is a real measurement | forged chains, capped and uncapped | core `trigram.rs` | counts the chain it names, truncates at the cap, and reports the worst possible cost for a needle with no trigram; a longer needle is pinned as NOT a rarer chain |
 | Paging | 300 rows, multi-page answer | `compound.rs` | paging returns exactly what draining returns, in order, and terminates |
 | Whole values, not head slots | needles straddling a slot seam and living slots deep | `compound.rs` | predicates are checked against the ASSEMBLED value |

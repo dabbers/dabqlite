@@ -96,6 +96,8 @@ pub struct TrigramIndex {
     len: u64,
     table_addr: usize,
     next_addr: usize,
+    /// Postings walked to CHOOSE a chain. See `peek_steps`.
+    peeks: core::cell::Cell<u64>,
 }
 
 impl TrigramIndex {
@@ -123,6 +125,7 @@ impl TrigramIndex {
             len: 0,
             table_addr,
             next_addr,
+            peeks: core::cell::Cell::new(0),
         }
     }
 
@@ -361,7 +364,22 @@ impl TrigramIndex {
             n += 1;
             slot = self.next[slot as usize];
         }
+        self.peeks.set(self.peeks.get() + n as u64);
         n
+    }
+
+    /// Postings walked while CHOOSING which chain to search, since this
+    /// index was built.
+    ///
+    /// Choosing is only worth anything when there is a choice. A
+    /// single-needle search has exactly one chain it could walk, and a
+    /// resumed page's chain was fixed by its cursor — measuring either
+    /// would be work added to the hot path for an answer already known,
+    /// and it would be invisible, because the results are identical
+    /// whether or not the peek happened. This counter is what makes it
+    /// visible.
+    pub fn peek_steps(&self) -> u64 {
+        self.peeks.get()
     }
 
     pub fn find_page<M: Fn(u64) -> bool, H: Fn(u64) -> Option<u64>>(
