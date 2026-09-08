@@ -199,12 +199,112 @@ async fn a_second_sync_handle_on_the_same_file_is_refused() {
         "a second sync access handle was granted — the browser's \
          single-writer guarantee does not hold as designed"
     );
+    // And the refusal says what actually happened. `NoModification\
+    // AllowedError` requires knowing the whole OPFS locking model to
+    // interpret; "another tab has this open" is something an application
+    // can put on the screen.
+    let message = match second {
+        Err(e) => e.as_string().unwrap_or_default(),
+        Ok(_) => unreachable!("just asserted it was refused"),
+    };
+    assert!(
+        message.contains("another tab or worker already has this database open"),
+        "the second-tab refusal is unexplained: {message}"
+    );
 
     // Releasing the first hands the lock over, exactly like flock.
     first.raw().close();
     let third = opfs::acquire(dir, SUPERBLOCK_FILE).await;
     assert!(third.is_ok(), "the lock was not released on close");
     third.expect("third").raw().close();
+}
+
+/// **The multi-tab question, asked of the platform instead of the spec.**
+///
+/// Design §10 leaves "multi-tab coordination mechanism in the browser"
+/// open. The whole vocabulary available is three sync-access-handle
+/// modes, and they are not three levels of permission — they are three
+/// different EXCLUSION rules. Which combinations a real browser grants
+/// decides what a second tab can be, so this measures all nine rather
+/// than quoting the specification at the problem.
+///
+/// The result is the reason the library takes `readwrite` and stops
+/// there: it is the only mode under which the PLATFORM guarantees one
+/// writer, and a second tab holding a reader is not compatible with it.
+/// Sharing the file at all means giving that guarantee up and rebuilding
+/// it in application code, which is a decision with evidence behind it
+/// now rather than an assumption.
+#[wasm_bindgen_test]
+async fn the_platform_decides_what_a_second_tab_can_be() {
+    use dabqlite_web::opfs::AccessMode::{ReadOnly, ReadWrite, ReadWriteUnsafe};
+
+    let dir = "dabqlite-modes";
+    let _ = opfs::remove_dir(dir).await;
+    // The file has to exist before a read-only handle can be taken.
+    {
+        let seed = opfs::acquire(dir, SUPERBLOCK_FILE).await.expect("seed");
+        seed.write_at(&[1, 2, 3, 4], 0).expect("seed write");
+        seed.flush().expect("seed flush");
+    }
+
+    // (held, then requested) -> granted?
+    let cases = [
+        (ReadWrite, ReadWrite, false),
+        (ReadWrite, ReadOnly, false),
+        (ReadWrite, ReadWriteUnsafe, false),
+        (ReadOnly, ReadWrite, false),
+        (ReadOnly, ReadOnly, true),
+        (ReadOnly, ReadWriteUnsafe, false),
+        (ReadWriteUnsafe, ReadWrite, false),
+        (ReadWriteUnsafe, ReadOnly, false),
+        (ReadWriteUnsafe, ReadWriteUnsafe, true),
+    ];
+    for (held, wanted, granted) in cases {
+        let first = opfs::acquire_in(dir, SUPERBLOCK_FILE, held)
+            .await
+            .unwrap_or_else(|e| panic!("holding {held:?}: {e:?}"));
+        let second = opfs::acquire_in(dir, SUPERBLOCK_FILE, wanted).await;
+        assert_eq!(
+            second.is_ok(),
+            granted,
+            "holding {held:?}, a second {wanted:?} handle was \
+             {} — the platform's exclusion rules are not what the \
+             multi-tab decision was made on",
+            if second.is_ok() { "granted" } else { "refused" }
+        );
+        drop(second);
+        drop(first);
+    }
+
+    // The consequence, stated as its own assertion because it is the
+    // whole answer: a reader CANNOT coexist with the writer's lock.
+    // "Readers alongside the writer" in a browser therefore costs the
+    // platform-enforced single-writer guarantee, whatever else it buys.
+    let writer = opfs::acquire_in(dir, SUPERBLOCK_FILE, ReadWrite)
+        .await
+        .expect("writer");
+    assert!(
+        opfs::acquire_in(dir, SUPERBLOCK_FILE, ReadOnly)
+            .await
+            .is_err(),
+        "a reader was granted alongside the writer — if this ever passes, \
+         the browser reader story changes and §10 should be revisited"
+    );
+    drop(writer);
+
+    // And a read-only handle really is read-only: the platform refuses
+    // the write, so a reader cannot damage what it is reading even if a
+    // caller asks it to.
+    let reader = opfs::acquire_in(dir, SUPERBLOCK_FILE, ReadOnly)
+        .await
+        .expect("reader");
+    let mut buf = [0u8; 4];
+    assert_eq!(reader.read_at(&mut buf, 0).expect("read"), 4);
+    assert_eq!(buf, [1, 2, 3, 4], "a read-only handle still reads");
+    assert!(
+        reader.write_at(&[9], 0).is_err(),
+        "a read-only handle accepted a write"
+    );
 }
 
 /// **A handle that goes out of scope releases the lock.**

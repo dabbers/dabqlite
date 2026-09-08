@@ -12,7 +12,7 @@
 use alloc::format;
 use alloc::string::String;
 
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -200,24 +200,110 @@ async fn storage_root() -> Result<FileSystemDirectoryHandle, JsValue> {
 }
 
 async fn handle_for(dir: &FileSystemDirectoryHandle, name: &str) -> Result<OpfsHandle, JsValue> {
+    handle_for_in(dir, name, AccessMode::ReadWrite).await
+}
+
+async fn handle_for_in(
+    dir: &FileSystemDirectoryHandle,
+    name: &str,
+    mode: AccessMode,
+) -> Result<OpfsHandle, JsValue> {
     let file: FileSystemFileHandle = JsFuture::from(
         dir.get_file_handle_with_options(name, &create_option::<FileSystemGetFileOptions>()),
     )
     .await
     .map_err(|e| annotate(e, &format!("opening {name}")))?
     .unchecked_into();
-    let handle = JsFuture::from(file.create_sync_access_handle())
+    // `createSyncAccessHandle(options)` is reached by reflection for the
+    // same reason the read/write options are: the typed binding has been
+    // renamed across web-sys releases, while the shape is fixed by the
+    // spec. The no-argument call and the `{ mode: "readwrite" }` call are
+    // defined to be the same thing, so this has one path, not two.
+    let opts = Object::new();
+    let _ = Reflect::set(
+        &opts,
+        &JsValue::from_str("mode"),
+        &JsValue::from_str(mode.as_str()),
+    );
+    let create: Function = Reflect::get(&file, &JsValue::from_str("createSyncAccessHandle"))?
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("dabqlite: createSyncAccessHandle is not callable"))?;
+    let promise: js_sys::Promise = create
+        .call1(&file, &opts)
+        .map_err(|e| annotate(e, &format!("locking {name} for {}", mode.as_str())))?
+        .unchecked_into();
+    let handle = JsFuture::from(promise)
         .await
-        .map_err(|e| annotate(e, &format!("locking {name}")))?;
+        .map_err(|e| annotate(e, &format!("locking {name} for {}", mode.as_str())))?;
     Ok(OpfsHandle(handle.unchecked_into()))
+}
+
+/// The access mode a sync access handle is opened in — the browser's
+/// entire multi-tab vocabulary (design §10, "multi-tab coordination").
+///
+/// The three modes are not three levels of permission; they are three
+/// different EXCLUSION rules, and which combinations the platform grants
+/// decides what a second tab can do. `dabqlite` takes `ReadWrite`, which
+/// is the strongest: the platform itself guarantees one writer, the same
+/// way `flock` does on POSIX (§2). The others exist here so the trade
+/// can be measured against a real browser rather than argued from the
+/// specification — see `opfs_browser.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// Exclusive: no other handle of any mode, in any tab. The default,
+    /// and the library's single-writer lock.
+    ReadWrite,
+    /// Shared between readers, but refused while a `ReadWrite` handle
+    /// exists anywhere.
+    ReadOnly,
+    /// Shared between writers, with NO exclusion at all — the platform
+    /// stops protecting the file and something else has to.
+    ReadWriteUnsafe,
+}
+
+impl AccessMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            AccessMode::ReadWrite => "readwrite",
+            AccessMode::ReadOnly => "read-only",
+            AccessMode::ReadWriteUnsafe => "readwrite-unsafe",
+        }
+    }
+}
+
+/// `acquire`, in a chosen access mode. The measurement instrument for
+/// the multi-tab question: what the platform grants, asked of the
+/// platform.
+pub async fn acquire_in(dir: &str, name: &str, mode: AccessMode) -> Result<OpfsHandle, JsValue> {
+    let dir_handle = directory(dir).await?;
+    handle_for_in(&dir_handle, name, mode).await
 }
 
 /// Keep the DOMException, add what we were doing — a bare
 /// `NoModificationAllowedError` is otherwise a mystery to debug.
+///
+/// And name the one that is not a defect at all. A refused sync access
+/// handle is overwhelmingly the SECOND TAB, not a broken browser: the
+/// platform is enforcing "one writer, always" (§2) exactly as intended,
+/// and a caller who is told `NoModificationAllowedError` has to already
+/// know the whole OPFS locking model to work that out. A caller told
+/// "another tab or worker already has this database open" can put a
+/// message on the screen.
 fn annotate(err: JsValue, what: &str) -> JsValue {
+    let name = err
+        .dyn_ref::<js_sys::Error>()
+        .map(|e| String::from(e.name()))
+        .unwrap_or_default();
     let message = match err.dyn_ref::<js_sys::Error>() {
         Some(e) => String::from(e.message()),
         None => format!("{err:?}"),
     };
+    if name == "NoModificationAllowedError" {
+        return JsValue::from_str(&format!(
+            "dabqlite: {what}: another tab or worker already has this \
+             database open — one writer at a time is the guarantee, and \
+             the browser is enforcing it ({message})"
+        ));
+    }
     JsValue::from_str(&format!("dabqlite: {what}: {message}"))
 }

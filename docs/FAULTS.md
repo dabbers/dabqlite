@@ -667,6 +667,8 @@ confirm the one remaining assumption: that real OPFS behaves as modeled.
 | A handle DROPPED rather than closed | real browser | same | the lock is released. It was not: a sync access handle is released only by `close()`, so a dropped `OpfsHandle` held its file for the life of the worker with nothing left able to release it, and every retry returned `NoModificationAllowedError` — indistinguishable to an application from a lost database |
 | A whole database dropped without `close()` | real browser | same | openable again. `?` never reaches `close()`, so this is every error path in every caller, not an exotic case |
 | A HALF-acquired database (`open_dir` refused on its second file) | real browser | same | the handle it already took is released. Leaking it wedged a file the failed open never used, so the retry failed for a different reason than the original — a refusal turning into a brick |
+| **All nine sync-access-handle mode combinations** | real browser | same | the platform's exclusion rules, measured rather than quoted: `readwrite` excludes everything, `read-only` shares only with `read-only`, `readwrite-unsafe` shares only with `readwrite-unsafe`. The load-bearing cell is `readwrite` × `read-only` — REFUSED — which is why a browser reader cannot coexist with the writer and why §10 decides multi-tab the way it does. A browser that starts granting it fails this test rather than passing silently |
+| The refusal a second tab actually sees | real browser | same | "another tab or worker already has this database open" — `NoModificationAllowedError` needs the whole OPFS locking model to interpret, and a refusal that cannot be explained to a user is a bug report waiting to happen |
 
 Honesty notes:
 
@@ -683,6 +685,14 @@ Honesty notes:
   different words; cross-browser runs are a known gap, listed below.
 - Safari incognito has no OPFS at all (§8.1). The IndexedDB fallback is
   not built yet — also listed below.
+- **A browser cannot have readers alongside its writer**, and this is the
+  platform's rule, not a gap here: a `read-only` handle is refused while
+  a `readwrite` one exists (measured above). The POSIX backend's
+  lock-free readers have no browser equivalent at any price the platform
+  sets. Multi-tab reading is served by snapshots instead — byte-identical
+  images the writing tab hands over, which the receiving tabs open in
+  memory and can index, scan and search, at the cost of a copy. §10
+  records the reasoning.
 
 ## Single-writer enforcement (design §2: one writer, always)
 

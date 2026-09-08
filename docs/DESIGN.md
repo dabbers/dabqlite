@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Eleven of these have since been decided by building the thing. They are kept
+Twelve of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -628,6 +628,49 @@ part worth reading.
   the value order does not begin with is not one either. Both stay
   application-side in the samples, with the reason written down next to
   them.
+- **Multi-tab coordination mechanism in the browser** — DECIDED by
+  measuring the platform rather than reading the specification at it. The
+  entire vocabulary available is three sync-access-handle modes, and they
+  are not three levels of permission but three EXCLUSION rules. All nine
+  combinations are now asserted against real Chromium
+  (`the_platform_decides_what_a_second_tab_can_be`):
+
+  | held \ requested | `readwrite` | `read-only` | `readwrite-unsafe` |
+  |---|---|---|---|
+  | `readwrite` | refused | refused | refused |
+  | `read-only` | refused | GRANTED | refused |
+  | `readwrite-unsafe` | refused | refused | GRANTED |
+
+  The load-bearing cell is `readwrite` × `read-only`: **refused**. A
+  reader cannot coexist with the writer's handle, so "readers alongside
+  the writer", which is exactly what the POSIX backend gives for free,
+  is not available in a browser at any price the platform sets. Sharing
+  the file at all means every participant using `readwrite-unsafe`, which
+  removes the platform's protection entirely and puts "one writer,
+  always" (§2) — the premise the whole commit protocol rests on — into
+  application code holding a Web Lock. A hung tab, a lock released early,
+  or a handle taken without one, and two writers are appending to the
+  same file with nothing to stop them.
+
+  So: the writer takes `readwrite` and the second tab is REFUSED, which
+  is the same answer the POSIX backend gives and the only one where the
+  platform, not a convention, enforces the premise. What changed is the
+  refusal itself. `NoModificationAllowedError` requires knowing the OPFS
+  locking model to interpret; the error now says "another tab or worker
+  already has this database open", which an application can put on the
+  screen.
+
+  Multi-tab READING is served by what the design already had rather than
+  by a second live handle: a snapshot is a byte-identical image (§8.1),
+  so the writing tab can hand its state to any number of others, and each
+  of them opens it in memory and reads at memory speed with no locking
+  question at all. That is strictly more capable than a read-only handle
+  would have been — those tabs can index, scan and search their copy —
+  and it costs a copy, which is the honest trade.
+
+  Revisit if the platform changes: the test asserts the refusals, so a
+  browser that starts granting `readwrite` × `read-only` fails it rather
+  than passing silently.
 
 Still open:
 
@@ -635,7 +678,6 @@ Still open:
   1.25x (tighter, more free lists).
 - `BLOB_HARD_MAX` exact value.
 - Page size, and whether it is fixed or schema-declared.
-- Multi-tab coordination mechanism in the browser.
 
 ## 11. Prior art to read before building
 
