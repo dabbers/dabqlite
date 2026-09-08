@@ -25,11 +25,41 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants
 
-      # --test-workspace true is load-bearing: without it cargo-mutants runs
-      # only the mutated package's own tests, and the killing power of this
-      # project lives in the dabqlite-sim / dabqlite-host integration suites.
+      # The test SCOPE is the whole point of this job. cargo-mutants scopes
+      # tests to the mutated package by default, and the killing power of
+      # this project lives in the dabqlite-sim and dabqlite-host integration
+      # suites — mutating the core and running only the core's unit tests
+      # tests a fraction of what exists and reports a clean bill of health
+      # for it.
+      #
+      # `--test-workspace true` is supposed to say that and is IGNORED by
+      # cargo-mutants 27.1.0 (verified: the emitted command is still
+      # `cargo test --package=dabqlite-core`). It is left in for the day
+      # that is fixed, and the scope is stated a second way that the tool
+      # actually honours: extra `--package` flags passed straight through
+      # to `cargo test`, which accepts any number of them.
       - name: Mutate the core against the full suite
-        run: cargo mutants --package dabqlite-core --test-workspace true --timeout 300 --no-shuffle -vV
+        run: |
+          cargo mutants --package dabqlite-core --test-workspace true \
+            --timeout 300 --no-shuffle -vV \
+            --cargo-test-arg --package=dabqlite \
+            --cargo-test-arg --package=dabqlite-sim \
+            --cargo-test-arg --package=dabqlite-host
+
+      # A gate that stopped gating looks exactly like a gate that passes.
+      # This one went unnoticed until a mutant that three integration
+      # suites kill was reported as MISSED. The baseline log records the
+      # command that actually ran, so assert on it rather than on the
+      # flag we asked for.
+      - name: The suite that ran really was the whole suite
+        if: always()
+        run: |
+          for pkg in dabqlite dabqlite-sim dabqlite-host; do
+            grep -q -- "--package=$pkg" mutants.out/log/baseline.log || {
+              echo "mutation testing ran without $pkg's tests; the scope flags stopped working"
+              exit 1
+            }
+          done
 
       - name: Upload results
         if: always()

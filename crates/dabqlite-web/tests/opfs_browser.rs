@@ -207,6 +207,90 @@ async fn a_second_sync_handle_on_the_same_file_is_refused() {
     third.expect("third").raw().close();
 }
 
+/// **A handle that goes out of scope releases the lock.**
+///
+/// The browser's single-writer guarantee is a per-file exclusive sync
+/// access handle, which is `flock` with one difference that matters: a
+/// process losing a file descriptor releases `flock`, and a worker
+/// losing an `OpfsHandle` used to release NOTHING. The lock stayed held
+/// by an object nobody could reach, for the life of the worker, and
+/// every retry came back `NoModificationAllowedError` — which to an
+/// application is indistinguishable from "the database is gone".
+///
+/// A database is dropped rather than closed by any error path in any
+/// caller, so this is the ordinary case, not the exotic one.
+#[wasm_bindgen_test]
+async fn dropping_a_handle_releases_the_browsers_single_writer_lock() {
+    let dir = "dabqlite-drop-lock";
+    let _ = opfs::remove_dir(dir).await;
+
+    {
+        let _held = opfs::acquire(dir, SUPERBLOCK_FILE).await.expect("first");
+        assert!(
+            opfs::acquire(dir, SUPERBLOCK_FILE).await.is_err(),
+            "the lock is not exclusive while held"
+        );
+    }
+    let again = opfs::acquire(dir, SUPERBLOCK_FILE).await;
+    assert!(
+        again.is_ok(),
+        "a dropped handle kept the lock — the file is unopenable for the          life of this worker, with nothing left to close it"
+    );
+}
+
+/// The same property at the level a caller actually uses: a whole
+/// database dropped without `close()` must be openable again.
+#[wasm_bindgen_test]
+async fn a_database_dropped_without_closing_can_be_opened_again() {
+    let dir = "dabqlite-drop-open";
+    let _ = opfs::remove_dir(dir).await;
+
+    {
+        let _storage = opfs::open_dir(dir).await.expect("first open");
+    }
+    let second = opfs::open_dir(dir).await;
+    assert!(
+        second.is_ok(),
+        "dropping a database wedged its own files; close() cannot be the          only way out, because an error path never reaches it"
+    );
+    second.expect("second").close();
+}
+
+/// **A half-acquired database releases what it took.**
+///
+/// `open_dir` takes three handles in sequence. If the second one is
+/// refused — another worker holds it, or the platform says no — the
+/// first was already acquired, and leaking it wedged a file that the
+/// failed open never even used. The retry then failed for a DIFFERENT
+/// reason than the original, on a file the caller had no idea was
+/// involved.
+///
+/// This reproduces it exactly: hold the rows file, watch `open_dir`
+/// fail, release it, and demand that the retry succeed.
+#[wasm_bindgen_test]
+async fn a_half_acquired_database_does_not_wedge_the_files_it_took() {
+    let dir = "dabqlite-partial";
+    let _ = opfs::remove_dir(dir).await;
+    let rows_name = rows_file_name(dabqlite_core::SCHEMA_HASH);
+
+    // Somebody else holds the rows file. `open_dir` reaches it second,
+    // by which time it is already holding the superblock.
+    let blocker = opfs::acquire(dir, &rows_name).await.expect("blocker");
+    assert!(
+        opfs::open_dir(dir).await.is_err(),
+        "open_dir should be refused while another handle holds a file"
+    );
+
+    // The blocker goes away. Nothing else should still be held.
+    drop(blocker);
+    let recovered = opfs::open_dir(dir).await;
+    assert!(
+        recovered.is_ok(),
+        "the failed open kept the superblock, so the database can never be          opened again in this worker — a refusal turned into a brick"
+    );
+    recovered.expect("recovered").close();
+}
+
 /// Flush is the commit point's durability primitive. At minimum, flushed
 /// bytes must be visible to a freshly acquired handle — the property
 /// recovery depends on. (Whether they survive a killed tab is the

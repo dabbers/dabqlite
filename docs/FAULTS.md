@@ -664,6 +664,9 @@ confirm the one remaining assumption: that real OPFS behaves as modeled.
 | Write past EOF on real OPFS | real browser | same | the gap really is zero-filled — the assumption the out-of-order superblock layout rests on, asked of the platform instead of assumed |
 | Reads clamping at EOF on real OPFS | real browser | same | past-EOF reads return empty, straddling reads return the tail — the shared contract, verified on the platform |
 | Second sync access handle on an open file | real browser | same | refused by the platform, granted again after `close()` — the browser's `flock` (design §2, §8.1), needing no election protocol for the single-tab case |
+| A handle DROPPED rather than closed | real browser | same | the lock is released. It was not: a sync access handle is released only by `close()`, so a dropped `OpfsHandle` held its file for the life of the worker with nothing left able to release it, and every retry returned `NoModificationAllowedError` — indistinguishable to an application from a lost database |
+| A whole database dropped without `close()` | real browser | same | openable again. `?` never reaches `close()`, so this is every error path in every caller, not an exotic case |
+| A HALF-acquired database (`open_dir` refused on its second file) | real browser | same | the handle it already took is released. Leaking it wedged a file the failed open never used, so the retry failed for a different reason than the original — a refusal turning into a brick |
 
 Honesty notes:
 
@@ -925,6 +928,22 @@ owns that outcome (the disk, as always, recovers as from a crash).
   fix's own flaw (rewriting the valid copy in place). Two engine defects,
   found by the same suite that had been green for weeks — coverage is a
   function of schedules explored, which is why the soak exists.
+
+**A gate that stopped gating looks exactly like a gate that passes.** Two
+have been caught here, and both were silent:
+
+- The CI workflow file stopped parsing — an unquoted `": "` inside a job
+  `name:` — so no CI ran at all for several commits while the badge said
+  nothing. Now pinned by a test that parses the workflow.
+- The scheduled mutation-testing job ran only the core's own unit tests.
+  `--test-workspace true` is ignored by cargo-mutants 27.1.0 (the emitted
+  command is still `cargo test --package=dabqlite-core`), so the sim and
+  host integration suites — where nearly all of the killing power lives —
+  were not judging any mutant. Found because a mutant that three suites
+  kill was reported MISSED. The scope is now stated in a form the tool
+  honours, and a step afterwards greps the baseline log for the packages
+  that were supposed to be in it: the job asserts what RAN, not what was
+  asked for.
 
 ## Simulated-time accounting (how to read soak numbers)
 

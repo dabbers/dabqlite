@@ -105,3 +105,39 @@ fn ci_runs_the_sample_application_tests() {
         "ci.yml no longer runs the sample application test suites"
     );
 }
+
+/// **Mutation testing has to run the suites that do the killing.**
+///
+/// cargo-mutants scopes tests to the mutated package by default. Nearly
+/// all of this project's killing power lives in `dabqlite-sim` and
+/// `dabqlite-host` — the crash sweeps, the lifetime soak, the equivalence
+/// suites — so mutating the core and running only the core's unit tests
+/// grades a fraction of what exists and reports a clean bill of health
+/// for it.
+///
+/// The workflow said `--test-workspace true`, which is exactly what that
+/// means and which cargo-mutants 27.1.0 ignores: the command it actually
+/// emits is still `cargo test --package=dabqlite-core`. It was found
+/// because a mutant three integration suites kill came back MISSED. The
+/// scope is now also stated as pass-through `--package` flags, and the
+/// job greps the baseline log afterwards to assert what RAN rather than
+/// what was asked for.
+///
+/// This test guards the intent, so a "tidy-up" that drops the redundant
+/// form fails here instead of quietly halving the grade.
+#[test]
+fn mutation_testing_is_scoped_to_the_whole_suite() {
+    let m = std::fs::read_to_string(workflows_dir().join("mutants.yml")).expect("mutants.yml");
+    for pkg in ["dabqlite", "dabqlite-sim", "dabqlite-host"] {
+        assert!(
+            m.contains(&format!("--cargo-test-arg --package={pkg}")),
+            "mutants.yml no longer widens the test scope to {pkg}; mutants \
+             would be graded by the core's unit tests alone"
+        );
+    }
+    assert!(
+        m.contains("mutants.out/log/baseline.log"),
+        "mutants.yml no longer checks WHICH suite actually ran — the flag \
+         being present is not evidence the tool honoured it"
+    );
+}

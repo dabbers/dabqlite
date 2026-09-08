@@ -37,6 +37,32 @@ impl OpfsHandle {
     }
 }
 
+/// **Releasing the handle releases the browser's single-writer lock.**
+///
+/// The lock IS the handle (§8.1), which makes it `flock` with one
+/// difference that used to matter enormously: a process losing a file
+/// descriptor releases `flock`, and a worker losing an `OpfsHandle`
+/// released nothing at all. The lock stayed held by an object nothing
+/// could reach for the life of the worker, and every retry came back
+/// `NoModificationAllowedError` — which to an application is not a
+/// refusal, it is "the database is gone".
+///
+/// Two ordinary paths hit it. A database dropped instead of closed —
+/// which is every error path in every caller, because `?` does not call
+/// `close()`. And a HALF-acquired database: `open_dir` takes three
+/// handles in sequence, so a refusal on the second leaked the first,
+/// wedging a file the failed open never used and making the retry fail
+/// for a different reason than the original.
+///
+/// `close()` is idempotent by spec, so [`OpfsStorage::close`] still
+/// works and still means "release NOW" rather than "release at the end
+/// of the scope".
+impl Drop for OpfsHandle {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// `{ at: n }` — the positional option both `read` and `write` take.
 /// Built by reflection rather than the typed setters, which have been
 /// renamed across web-sys releases; the shape is fixed by the spec.
@@ -115,10 +141,13 @@ pub async fn open_dir(dir: &str) -> Result<OpfsStorage<OpfsHandle>, JsValue> {
 }
 
 impl OpfsStorage<OpfsHandle> {
-    /// Release every handle — and with them the browser's single-writer
-    /// lock, so another worker (or a later `open_dir`) can take over.
-    /// Dropping without closing leaves the locks held until the worker
-    /// itself goes away.
+    /// Release every handle NOW — and with them the browser's
+    /// single-writer lock, so another worker (or a later `open_dir`) can
+    /// take over without waiting for this one to go out of scope.
+    ///
+    /// Dropping releases them too (see `Drop for OpfsHandle`); this is
+    /// the explicit form, for handing a database over at a point the
+    /// caller chooses rather than at the end of a binding's life.
     pub fn close(&self) {
         self.superblock.0.close();
         self.rows.0.close();

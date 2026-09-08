@@ -38,6 +38,16 @@
 //! `flock` gives the POSIX backend (design §2: "one writer, always"),
 //! enforced by the platform rather than by convention — and, like
 //! `flock`, released when the holder goes away.
+//!
+//! "When the holder goes away" is the part that had to be built rather
+//! than assumed. `flock` is released by the kernel when the last
+//! descriptor closes; a sync access handle is released only by
+//! `close()`, so a handle merely DROPPED kept its lock for the life of
+//! the worker with nothing left able to release it. Every retry then
+//! returned `NoModificationAllowedError`, which an application cannot
+//! tell apart from a lost database. `OpfsHandle` closes on drop, so the
+//! two backends now behave the same way for the same reason: an error
+//! path that never reaches `close()` still gives the lock back.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
