@@ -499,3 +499,73 @@ fn a_shared_value_in_the_middle_of_the_order_is_not_split_by_a_separator() {
     assert_eq!(db.range_by_value_rev(b"", b"").unwrap().len(), 120);
     assert_eq!(db.prefix(b"mmm").unwrap().len(), 40);
 }
+
+/// **A prefix scan, one page at a time.**
+///
+/// The materialising form is fine for a listing; an application with a
+/// real workload wants a page. "The oldest pending job" should read one
+/// page, not every pending job — which is the review note that produced
+/// `prefix_page`.
+#[test]
+fn a_prefix_scan_pages_and_the_pages_are_the_whole_answer() {
+    let mut db = db(4096);
+    // Three prefixes, one of them far larger than a page.
+    for i in 0..60u64 {
+        db.put(
+            i,
+            Value::from_vec(format!("a/{i:03}").into_bytes()).unwrap(),
+        )
+        .unwrap();
+    }
+    for i in 0..3u64 {
+        db.put(
+            100 + i,
+            Value::from_vec(format!("b/{i:03}").into_bytes()).unwrap(),
+        )
+        .unwrap();
+    }
+    // And the boundary value itself: "a" sorts inside [a/, a0) but is NOT
+    // under the prefix "a/", so it is the row a paged scan can trip on.
+    db.put(200, Value::from_bytes(b"a").unwrap()).unwrap();
+    db.put(201, Value::from_bytes(b"a0").unwrap()).unwrap();
+
+    for prefix in [&b"a/"[..], b"b/", b"a", b"", b"zzz"] {
+        let whole = got(db.prefix(prefix).unwrap());
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let (page, next) = db.prefix_page(prefix, cursor).unwrap();
+            assert!(page.len() <= dabqlite::RANGE_PAGE, "page too long");
+            // An empty page means the prefix is exhausted, never "this
+            // page happened to be all boundary values".
+            assert!(
+                !page.is_empty() || next.is_none(),
+                "an empty page with more to come would strand a caller"
+            );
+            paged.extend(got(page));
+            pages += 1;
+            assert!(pages <= 30, "the cursor is not making progress");
+            match next {
+                Some(n) => cursor = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(
+            paged,
+            whole,
+            "prefix {:?}: paging is not the same answer as scanning",
+            String::from_utf8_lossy(prefix)
+        );
+        assert!(
+            paged.iter().all(|(_, v)| v.starts_with(prefix)),
+            "prefix {:?}: a row that does not start with it came back",
+            String::from_utf8_lossy(prefix)
+        );
+    }
+    // The first page of the big prefix really is a page, not the set.
+    let (first, next) = db.prefix_page(b"a/", None).unwrap();
+    assert_eq!(first.len(), dabqlite::RANGE_PAGE);
+    assert!(next.is_some());
+    assert_eq!(got(first)[0].1, b"a/000".to_vec(), "and it is the head");
+}

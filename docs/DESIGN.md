@@ -399,7 +399,7 @@ optional and should be treated as such.
 
 ## 10. Open decisions
 
-Nine of these have since been decided by building the thing. They are kept
+Ten of these have since been decided by building the thing. They are kept
 here with the reasoning rather than deleted, because the reasoning is the
 part worth reading.
 
@@ -489,6 +489,29 @@ part worth reading.
   An assertion stages no row, so a batch of nothing but assertions
   performs no I/O at all.
 
+- **Which end `find` returns first** — DECIDED: newest, and it stays
+  newest, because the request behind the complaint was for something
+  else. A job queue wants the OLDEST match (the head of a FIFO), so it
+  has to reverse `find`'s whole result — materialising exactly what
+  `find_page` exists to avoid. The obvious fix is an ascending walk, and
+  it is the wrong one twice over. Mechanically it costs a `prev` link per
+  posting slot — `rows * TRIGRAMS_PER_ROW` more `u32`s, 64 MB at a
+  million rows, doubling a pool whose whole virtue is that its bound is
+  arithmetic. And conceptually it is `find` being asked to be an ordered
+  secondary index, which substring search is not: a one-byte needle
+  matches that byte anywhere in the record, so even with an order it
+  answers the wrong question.
+  The ordered index over VALUE bytes IS an ordered secondary index. Put
+  the state first and the sort key right behind it and "the oldest
+  PENDING job" is a prefix scan reading ONE page — exact, because a
+  prefix is anchored where a substring is not; ordered, because byte
+  order is the order; and bounded, because it is a page. The job queue's
+  own exploration file now ends with that query answered instead of with
+  a list of ways `find` cannot answer it.
+  What the episode DID produce: `prefix_page`, because the paged form was
+  missing and a queue cannot use a listing that materialises every
+  match; and `RANGE_PAGE` exported, because an application that pages
+  should not have to discover the page size by experiment.
 - **Whether a generation number identifies a commit** — DECIDED, the hard
   way: it does NOT, and recovery cannot assume it does. A commit whose
   superblock writes were torn is never acknowledged, so the next

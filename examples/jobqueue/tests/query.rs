@@ -2,7 +2,9 @@
 //!
 //! This is the one query a job queue actually needs, and the reason the
 //! worker in `src/lib.rs` still finds its head positionally. These are the
-//! things I tried, re-tried against the reworked `find`.
+//! things I tried, re-tried against the reworked `find` — and then
+//! against the ordered index over VALUE bytes, which is the one that
+//! actually answers it.
 
 use dabqlite::{Db, Error, Op, Value, MAX_VALUE_LEN, VALUE_LEN};
 use jobqueue::{Job, CLAIMED, PENDING};
@@ -42,11 +44,15 @@ fn find_cannot_express_a_field_equality() {
 /// answer the question. This is the closest thing to a "where state = ?"
 /// index, and the cost is the tag bytes plus the risk above.
 ///
-/// The result order changed: `find` is now documented NEWEST FIRST, and it
-/// is. For a FIFO queue that is the wrong end — the head of the queue is
-/// the oldest match — so the queue has to reverse the whole result, which
-/// means materialising all of it, which is exactly what `find_page` exists
-/// to avoid.
+/// The result order is NEWEST FIRST, and for a FIFO queue that is the
+/// wrong end — the head of the queue is the OLDEST match — so a queue
+/// built on this has to reverse the whole result, materialising all of
+/// it, which is exactly what `find_page` exists to avoid.
+///
+/// That is not a defect in `find` to be fixed; it is `find` being asked
+/// to be an ordered secondary index, which it is not. See
+/// `the_value_ordered_index_is_the_state_index_find_was_never_going_to_be`
+/// below for the query this test wanted, answered properly.
 #[test]
 fn a_multi_byte_state_tag_is_the_closest_thing_to_an_index_and_it_is_newest_first() {
     let mut db = Db::in_memory_with(65_536).unwrap();
@@ -165,4 +171,92 @@ fn a_needle_may_be_as_long_as_a_value() {
         .map(|(id, _)| id)
         .collect();
     assert_eq!(exact, vec![2], "only one IS it");
+}
+
+/// **The query this file was written to look for, answered.**
+///
+/// Every attempt above bends `find` into a secondary index and every one
+/// of them fails in a different way: a one-byte needle matches the byte
+/// anywhere, a distinctive tag costs bytes and still collides in
+/// principle, and the order is newest-first when a queue wants oldest.
+/// They fail because substring search is not an ordered index and no
+/// amount of care makes it one.
+///
+/// The ordered index over VALUE bytes IS one. Put the state first and the
+/// id right behind it, and "the oldest PENDING job" is a prefix scan that
+/// reads ONE page: exact (no collisions — a prefix is anchored, unlike a
+/// substring), ordered (FIFO within the state, because the id follows the
+/// state), and bounded (a page, not the match set).
+#[test]
+fn the_value_ordered_index_is_the_state_index_find_was_never_going_to_be() {
+    // [state | id, big-endian | payload]. Big-endian because byte order
+    // IS the order: the index compares bytes, so a little-endian id would
+    // sort by its least significant byte first and FIFO would be noise.
+    let row = |state: u8, id: u64, payload: &[u8]| {
+        let mut b = vec![state];
+        b.extend_from_slice(&id.to_be_bytes());
+        b.extend_from_slice(payload);
+        Value::from_vec(b).unwrap()
+    };
+    let mut db = Db::in_memory_with(65_536).unwrap();
+    for id in 1..=40u64 {
+        // Payloads that would collide with a one-byte state needle, so
+        // this is the same trap `find_cannot_express_a_field_equality`
+        // walks into.
+        let payload = vec![if id % 2 == 0 { PENDING } else { CLAIMED }; 30];
+        let state = if id % 3 == 0 { CLAIMED } else { PENDING };
+        db.insert(id, row(state, id, &payload)).unwrap();
+    }
+
+    // One page, and it is the HEAD of the queue.
+    let (page, _) = db.prefix_page(&[PENDING], None).unwrap();
+    assert!(!page.is_empty());
+    let head = page[0].1.as_bytes();
+    assert_eq!(head[0], PENDING);
+    assert_eq!(
+        u64::from_be_bytes(head[1..9].try_into().unwrap()),
+        1,
+        "the oldest pending job, first, from one page"
+    );
+
+    // The whole set, in FIFO order, and exact: no payload byte collides
+    // its way in, because a prefix is anchored where a substring is not.
+    let pending: Vec<u64> = db
+        .prefix(&[PENDING])
+        .unwrap()
+        .into_iter()
+        .map(|(_, v)| u64::from_be_bytes(v.as_bytes()[1..9].try_into().unwrap()))
+        .collect();
+    let expected: Vec<u64> = (1..=40u64).filter(|id| id % 3 != 0).collect();
+    assert_eq!(pending, expected, "every pending job, oldest first");
+
+    // Which `find` cannot do at either end: it matches payload bytes...
+    let found = db.find(&[CLAIMED]).unwrap();
+    assert!(
+        found.len() > 40 - expected.len(),
+        "find matched payload bytes as well as state bytes: {} hits",
+        found.len()
+    );
+    // ...and hands back the newest first when the queue wants the oldest.
+    let anchored = db.find_prefix(&[PENDING]).unwrap();
+    assert_eq!(
+        anchored.first().map(|(id, _)| *id),
+        Some(40),
+        "even anchored, find is newest-first"
+    );
+
+    // Claiming the head moves it out of the pending prefix and into the
+    // claimed one, and the next call returns the next job — no scan, no
+    // reversal, no materialised match set.
+    let (id, _) = (1u64, ());
+    let payload = vec![PENDING; 30];
+    db.put(id, row(CLAIMED, id, &payload)).unwrap();
+    let (page, _) = db.prefix_page(&[PENDING], None).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(page[0].1.as_bytes()[1..9].try_into().unwrap()),
+        2,
+        "the queue advanced"
+    );
+    // And the page is a PAGE: bounded, whatever the match set costs.
+    assert!(page.len() <= dabqlite::RANGE_PAGE);
 }

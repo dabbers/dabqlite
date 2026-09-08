@@ -54,6 +54,14 @@
 use dabqlite_core::{BatchOp, Capacities, DbError, Output, VALUE_LEN as CORE_VALUE_LEN};
 use dabqlite_host::Host;
 
+/// Rows in one page of any paged scan — range, value-ordered range,
+/// prefix or substring search.
+///
+/// Exported because an application that pages needs to size a buffer, and
+/// because "is this page short because the scan ended, or because a page
+/// is only ever this big?" is a question a caller should not have to
+/// answer by experiment.
+pub use dabqlite_core::RANGE_PAGE;
 pub use dabqlite_core::{DbError as EngineError, FindCursor, Match, RecoveryReport, VALUE_LEN};
 
 // The backends, re-exported so that `Db<S>` can actually be WRITTEN DOWN by
@@ -1474,22 +1482,50 @@ impl<S: Storage> Db<S> {
     /// incremented and the `0xff` tail dropped — and when the prefix is
     /// all `0xff` (or empty) there is no upper bound at all.
     pub fn prefix(&self, prefix: &[u8]) -> Result<Vec<Row>, Error> {
-        let hi = prefix_upper_bound(prefix);
         let mut out = Vec::new();
         let mut cursor = None;
         loop {
-            let (page, next) = self.range_page_by_value(prefix, &hi, cursor)?;
-            for row in page {
-                // The upper bound is exclusive in spirit but the scan is
-                // inclusive, so the boundary value itself is filtered here
-                // rather than by a second, subtler bound.
-                if row.1.as_bytes().starts_with(prefix) {
-                    out.push(row);
-                }
-            }
+            let (page, next) = self.prefix_page(prefix, cursor)?;
+            out.extend(page);
             match next {
                 Some(n) => cursor = Some(n),
                 None => return Ok(out),
+            }
+        }
+    }
+
+    /// One bounded page of the rows whose value starts with `prefix`,
+    /// plus where to continue.
+    ///
+    /// The paged form of [`Db::prefix`], and the one an application with
+    /// a real workload wants: "the oldest pending job", "the first screen
+    /// of everything under `session/`" is a page, not a match set. A job
+    /// queue that had to materialise every pending job to look at the
+    /// first one was the review note that produced this.
+    ///
+    /// An empty result means the prefix is exhausted — never "this page
+    /// happened to be all boundary values". That case can only arise at
+    /// the very end of the range, so at most one extra page is read to
+    /// resolve it, and the work per call stays bounded.
+    pub fn prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<u64>,
+    ) -> Result<(Vec<Row>, Option<u64>), Error> {
+        let hi = prefix_upper_bound(prefix);
+        let mut cursor = after;
+        loop {
+            let (page, next) = self.range_page_by_value(prefix, &hi, cursor)?;
+            let kept: Vec<Row> = page
+                .into_iter()
+                // The upper bound is inclusive but a prefix range is
+                // half-open, so the boundary value itself is filtered
+                // here rather than by a second, subtler bound.
+                .filter(|(_, v)| v.as_bytes().starts_with(prefix))
+                .collect();
+            match (kept.is_empty(), next) {
+                (true, Some(n)) => cursor = Some(n),
+                _ => return Ok((kept, next)),
             }
         }
     }
