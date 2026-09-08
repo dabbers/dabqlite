@@ -1866,6 +1866,19 @@ impl<S: Storage> Db<S> {
         }
     }
 
+    /// Row slots the value-ordered index's comparator has read since this
+    /// handle opened.
+    ///
+    /// What maintaining that order costs, as a count rather than a clock.
+    /// The index compares by dereferencing, so the number is proportional
+    /// to how much of a value is shared with its neighbours in the order —
+    /// inherent to a byte order, and exactly the kind of cost that grows
+    /// quietly. Exposed so a test can hold the SHAPE of it: a ratio
+    /// between two workloads is the same number on every machine.
+    pub fn value_index_slots_compared(&self) -> u64 {
+        self.h().engine.value_cmp_slots()
+    }
+
     /// True when this database was opened in salvage mode and some rows
     /// could not be verified.
     pub fn is_degraded(&self) -> bool {

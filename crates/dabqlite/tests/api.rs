@@ -1841,3 +1841,146 @@ fn the_largest_id_is_a_question_you_can_ask() {
         assert_eq!(db.max_id(), Some(id * 7), "after inserting {}", id * 7);
     }
 }
+
+/// **Every point a crash can land in the compaction swap, swept.**
+///
+/// `compact` builds a copy in a staging directory and swaps it in with
+/// two renames. The states a crash can leave behind are enumerable —
+/// which directories exist — and each has exactly one correct
+/// resolution. One of them was pinned before; the others were argued for
+/// in a doc comment.
+///
+/// Argued for is not tested. The job queue's SIGKILL harness was supposed
+/// to reach these by luck, and its own tally says it never did: 8
+/// compactions across 130 kill cycles, 0 interrupted. Coverage that
+/// depends on a race landing in a millisecond window is not coverage, so
+/// the states are constructed instead.
+#[cfg(unix)]
+#[test]
+fn a_crash_at_every_point_of_the_compaction_swap_resolves_one_way() {
+    use dabqlite::FileDb;
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dst = to.join(entry.file_name());
+            if entry.file_type().expect("file_type").is_dir() {
+                copy_dir(&entry.path(), &dst);
+            } else {
+                std::fs::copy(entry.path(), &dst).expect("copy");
+            }
+        }
+    }
+    fn ids_in(dir: &std::path::Path) -> Vec<u64> {
+        let db: FileDb = Db::open_with(dir, 512).expect("open must resolve any swap state");
+        let mut ids: Vec<u64> = db
+            .all()
+            .expect("scan")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    let root = scratch("swapstates");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let live_ids: Vec<u64> = (0..40u64).filter(|i| i % 4 == 0).collect();
+
+    // Two reference directories: the database BEFORE compaction (with
+    // dead weight) and the compacted copy. Both hold the same rows —
+    // which is the point: whichever one a crash leaves behind, the DATA
+    // is right, and that is what every state below asserts.
+    let original = root.join("original");
+    {
+        let mut db: FileDb = Db::open_with(&original, 512).expect("open");
+        for i in 0..40u64 {
+            db.insert(i, Value::from_text(&format!("v{i}")).unwrap())
+                .unwrap();
+        }
+        for i in 0..40u64 {
+            if !live_ids.contains(&i) {
+                assert!(db.remove(i).unwrap());
+            }
+        }
+        assert!(db.stats().dead > 0, "the workload must leave dead weight");
+    }
+    let compacted = root.join("compacted");
+    copy_dir(&original, &compacted);
+    {
+        let mut db: FileDb = Db::open_with(&compacted, 512).expect("open");
+        db.compact().expect("compact");
+        assert_eq!(db.stats().dead, 0);
+    }
+
+    // (label, which directory sits at `live` / `.retired` / `.compacting`)
+    let states: &[(
+        &str,
+        Option<&std::path::Path>,
+        Option<&std::path::Path>,
+        bool,
+    )] = &[
+        ("staging built, no rename yet", Some(&original), None, true),
+        ("between the two renames", None, Some(&original), true),
+        (
+            "after the second rename",
+            Some(&compacted),
+            Some(&original),
+            false,
+        ),
+        (
+            "after the retired copy was dropped",
+            Some(&compacted),
+            None,
+            false,
+        ),
+        (
+            "crash mid-swap, staging already gone",
+            None,
+            Some(&original),
+            false,
+        ),
+    ];
+    for (label, live, retired, staging) in states {
+        let dir = root.join("db");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(root.join(".compacting"));
+        let _ = std::fs::remove_dir_all(root.join(".retired"));
+        // The sibling names are derived from the live path, so build the
+        // state around `root/db`.
+        let staging_dir = root.join("db.compacting");
+        let retired_dir = root.join("db.retired");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(&retired_dir);
+        if let Some(src) = live {
+            copy_dir(src, &dir);
+        }
+        if let Some(src) = retired {
+            copy_dir(src, &retired_dir);
+        }
+        if *staging {
+            copy_dir(&compacted, &staging_dir);
+        }
+
+        assert_eq!(ids_in(&dir), live_ids, "{label}: the rows are wrong");
+        assert!(
+            !staging_dir.exists(),
+            "{label}: a half-built copy was left behind"
+        );
+        assert!(
+            !retired_dir.exists(),
+            "{label}: the retired copy was left behind"
+        );
+        // And it is still a working database, not just a readable one.
+        {
+            let mut db: FileDb = Db::open_with(&dir, 512).expect("reopen");
+            db.insert(999, Value::from_text("after").unwrap())
+                .expect("still writable");
+        }
+        let mut expect = live_ids.clone();
+        expect.push(999);
+        assert_eq!(ids_in(&dir), expect, "{label}: the write did not stick");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

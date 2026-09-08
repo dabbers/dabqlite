@@ -304,6 +304,61 @@ pub fn decode_row(bytes: &[u8]) -> Option<RowSlot> {
     decoded
 }
 
+/// Field accessors for a row whose checksum has ALREADY been verified.
+///
+/// Every row in the engine's arena got there one of two ways: it was
+/// encoded into the arena by the write path, or it was copied in after
+/// `decode_row` accepted it. There is no third way, and rows are never
+/// rewritten in place — so an arena row is verified by construction, and
+/// re-verifying it on every access is not more safety. It is the same
+/// safety paid for repeatedly.
+///
+/// That repetition is not theoretical. The value-ordered index compares
+/// by dereferencing, so ONE comparison of two 2 KiB values that share a
+/// prefix walks 256 rows, and going through `decode_row` re-checksummed
+/// every one of them (twice, in debug builds, which also run the
+/// reference codec). Measured: inserting identical 2 KiB values ran at
+/// a fifth of the rate of values that differ in their first byte, and
+/// the whole difference was CRC32 over bytes nothing could have changed.
+///
+/// These accessors read the same generated offsets `decode_row` reads —
+/// the schema is still the single source of layout truth, and the
+/// codegen equivalence suite still pins it — they simply do not repeat
+/// the checksum. Use them ONLY on arena rows; anything arriving from
+/// storage goes through `decode_row`, always.
+pub mod verified {
+    use super::{records, RowKind, ROW_SIZE, VALUE_LEN};
+
+    /// The row's kind, or `None` for a byte no kind uses.
+    pub fn kind(row: &[u8]) -> Option<RowKind> {
+        debug_assert_eq!(row.len(), ROW_SIZE);
+        RowKind::from_byte(row[records::RECORDS_KIND_OFFSET])
+    }
+
+    /// The primary key.
+    pub fn id(row: &[u8]) -> u64 {
+        debug_assert_eq!(row.len(), ROW_SIZE);
+        u64::from_le_bytes(
+            row[records::RECORDS_COL_ID_OFFSET..records::RECORDS_COL_ID_OFFSET + 8]
+                .try_into()
+                .expect("fixed slice"),
+        )
+    }
+
+    /// The bytes this row carries, without the slot's padding — borrowed
+    /// from the arena rather than copied out of it.
+    pub fn payload(row: &[u8]) -> &[u8] {
+        debug_assert_eq!(row.len(), ROW_SIZE);
+        let len = (row[records::RECORDS_LEN_OFFSET] & !records::RECORDS_LEN_MORE) as usize;
+        // A verified row cannot declare more than a slot holds; clamp
+        // anyway, because this function's whole job is to not re-verify
+        // and a slice panic is a worse failure than a short read.
+        let len = len.min(VALUE_LEN);
+        let at = records::RECORDS_COL_VALUE_OFFSET;
+        &row[at..at + len]
+    }
+}
+
 /// The hand-written row codec, kept as an independent oracle for the
 /// schema-compiled one (two implementations, permanently cross-checked:
 /// in debug builds on every call above, and exhaustively in the codegen

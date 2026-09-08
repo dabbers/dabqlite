@@ -975,6 +975,16 @@ pub struct Engine {
     /// a value is linear in its length" is a property worth testing
     /// directly rather than by wall clock.
     extent_walks: core::cell::Cell<u64>,
+    /// Row slots read by the value-ordered index's comparator.
+    ///
+    /// The one number that says what maintaining that order costs. It
+    /// compares by dereferencing, so an insert's cost is proportional to
+    /// how much of a value it shares with its neighbours in the order —
+    /// inherent to a byte order, and exactly the kind of cost that grows
+    /// quietly. Counted rather than timed, because a ratio between two
+    /// counts is the same on every machine and a ratio between two clocks
+    /// is not.
+    value_cmp_slots: core::cell::Cell<u64>,
     /// Head rows whose value spans more than one slot. Zero is the fast
     /// path for reads: a value occupies exactly one row, so nothing has
     /// to be looked ahead for (`value_extent`). Search does not depend on
@@ -1127,6 +1137,7 @@ impl Engine {
             find_verifications: core::cell::Cell::new(0),
             extent_memo: core::cell::Cell::new((u64::MAX, 0, 0)),
             extent_walks: core::cell::Cell::new(0),
+            value_cmp_slots: core::cell::Cell::new(0),
             salvage: false,
             quarantined: 0,
             arena,
@@ -1202,6 +1213,12 @@ impl Engine {
     /// value should cost ONE of these, not k.
     pub fn extent_walks(&self) -> u64 {
         self.extent_walks.get()
+    }
+
+    /// Row slots the value-ordered index's comparator has read. See
+    /// `value_cmp_slots`.
+    pub fn value_cmp_slots(&self) -> u64 {
+        self.value_cmp_slots.get()
     }
 
     /// The readable values, ascending by row. The basis of a rebuild:
@@ -3740,11 +3757,13 @@ impl Engine {
         let mut at = 0usize;
         for r in head_row..head_row + rows {
             let off = (r as usize) * ROW_SIZE;
-            let slot = decode_row(&self.arena[off..off + ROW_SIZE])
-                .expect("a row already accepted into the arena must decode");
-            let n = slot.len as usize;
-            out[at..at + n].copy_from_slice(&slot.value[..n]);
-            at += n;
+            // `verified`, not `decode_row`: these rows are in the arena,
+            // so they are verified by construction (see that module).
+            // Assembling a 2 KiB value re-checksummed 128 rows, on every
+            // commit that wrote one and on every read that returned one.
+            let payload = crate::layout::verified::payload(&self.arena[off..off + ROW_SIZE]);
+            out[at..at + payload.len()].copy_from_slice(payload);
+            at += payload.len();
         }
         at
     }
@@ -4054,8 +4073,11 @@ impl Engine {
             ..
         } = self;
         let bound = limit.max(*row_count);
+        let counter = &self.value_cmp_slots;
         by_value.insert_by(row, row, &|stored| {
-            crate::vorder::order(arena, bound, stored, row)
+            let (ord, slots) = crate::vorder::order_counted(arena, bound, stored, row);
+            counter.set(counter.get() + slots);
+            ord
         });
     }
 

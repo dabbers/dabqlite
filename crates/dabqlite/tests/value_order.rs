@@ -569,3 +569,77 @@ fn a_prefix_scan_pages_and_the_pages_are_the_whole_answer() {
     assert!(next.is_some());
     assert_eq!(got(first)[0].1, b"a/000".to_vec(), "and it is the head");
 }
+
+/// **What the ordered index costs to MAINTAIN, held to a bound.**
+///
+/// The index compares by dereferencing, so an insert costs a comparison
+/// proportional to how much of a value is shared with its neighbours in
+/// the order. That is inherent to a byte order and not a defect — but it
+/// is exactly the kind of cost that grows quietly, so it is measured.
+///
+/// COUNTED, not timed: row slots read by the comparator. A ratio between
+/// two counts is the same number on every machine, where a ratio between
+/// two clocks is a statement about the box.
+///
+/// The regression this guards against is a real one, caught by a sample's
+/// throughput test. The comparator read rows through the checksummed
+/// decoder, so comparing two 2 KiB values re-verified hundreds of rows
+/// that could not have changed — every arena row is verified when it
+/// enters and rows are never rewritten in place. Inserting identical long
+/// values ran at a fifth of the rate of values differing in their first
+/// byte; it now runs at the same rate.
+#[test]
+fn maintaining_the_order_costs_what_the_values_share_and_no_more() {
+    fn slots_read(n: u64, big: usize, make: impl Fn(u64) -> Vec<u8>) -> u64 {
+        let mut db = db(65_536);
+        for id in 0..n {
+            let mut v = make(id);
+            v.resize(big, 0x22);
+            db.put(id, Value::from_vec(v).unwrap()).unwrap();
+        }
+        db.value_index_slots_compared()
+    }
+
+    const N: u64 = 300;
+    let big = dabqlite::MAX_VALUE_LEN;
+    // Differ in the first byte: one slot of each decides every
+    // comparison, so the count is about two slots per comparison.
+    let early = slots_read(N, big, |i| i.to_be_bytes().to_vec());
+    // Identical: every comparison walks both values whole before the id
+    // decides. The worst case there is, and the bound below is the shape
+    // of the cost, not a wish.
+    let same = slots_read(N, big, |_| Vec::new());
+
+    let per_value = big / dabqlite::VALUE_LEN;
+    assert!(
+        early < N * per_value as u64,
+        "values differing at byte 0 read {early} slots for {N} inserts — that \
+         is more than one whole value each, so the comparator is not \
+         stopping at the first difference"
+    );
+    assert!(
+        same > early,
+        "identical values ({same}) did not cost more than early-differing \
+         ones ({early}); the measurement is not measuring anything"
+    );
+    // And the worst case is bounded BY THE VALUE'S LENGTH, which is what
+    // "proportional to what the values share" means: a comparison that
+    // stops at byte 0 reads one slot of each, one that never stops reads
+    // every slot of each, and the ratio between them is the value's slot
+    // count. Measured at exactly that. The band is there because the two
+    // workloads build differently shaped trees and so make slightly
+    // different numbers of comparisons — not because the relationship is
+    // approximate.
+    assert!(
+        same <= early * per_value as u64,
+        "identical values cost {same} slots against {early} — MORE than the \
+         length of a value times the early-differing case, so the comparator \
+         is reading slots the comparison did not ask for"
+    );
+    assert!(
+        same * 2 >= early * per_value as u64,
+        "identical values cost {same} slots against {early}, far less than \
+         the length of a value times it — the comparison is being skipped \
+         somewhere, which would mean the order is not over whole values"
+    );
+}

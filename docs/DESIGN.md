@@ -466,6 +466,23 @@ part worth reading.
   a dereference for this one. Nothing structural changed, so the pool
   bound, the invariant checker and the existing mutation surface cover
   both.
+  What it costs to MAINTAIN is worth stating, because it is the one
+  number an application can feel. An insert costs a comparison
+  proportional to how much of a value is shared with its neighbours in the
+  order. Measured against no index at all: about 6% for long values that
+  differ in their first bytes — the shape the index exists for, a key at
+  the front of the record — and about double for values identical over
+  their whole length, which is the worst case there is. Short values pay
+  under a fifth.
+  Getting there needed one fix worth recording. The comparator read rows
+  through the checksummed decoder, so comparing two 2 KiB values
+  re-verified hundreds of rows that could not have changed — every arena
+  row is verified when it enters and rows are never rewritten in place, so
+  the checksum was the same safety paid for repeatedly. Reading through
+  `layout::verified` instead made identical long values as cheap as ones
+  differing at byte 0, a 6x improvement, and the property "the index does
+  not care WHERE two values differ nearly as much as it cares that they
+  do" is now a test rather than an observation.
   The order is value bytes, then id, then row. The id breaks a tie
   between records holding the same bytes, and it is the tie-break rather
   than the row because it is the only one a caller can predict: rows are

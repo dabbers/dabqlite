@@ -1064,3 +1064,26 @@ data loss wearing recovery's clothes.
 | A damaged last row (bit rot at the manifest edge) | exhaustive | `faults.rs` | still refused — damage is not a ghost, and is never routed around |
 | A stranded continuation as the last committed row | pinned | `inspect.rs` | still refused, and the inspector still agrees |
 | A manifest naming rows the file does not have | soak | `lifetime.rs` | opens on the newest manifest the file can support, with `rollback_evidence` set: an operator can act on "some of your data is gone" and cannot act on a database that will not open |
+
+## Compaction, interrupted
+
+`compact` builds a copy in a staging directory and swaps it in with two
+renames. The states a crash can leave behind are enumerable — which
+directories exist — and each has exactly one correct resolution. One of
+them used to be pinned; the rest were argued for in a doc comment.
+
+Argued for is not tested. A sample's SIGKILL harness was meant to reach
+these by luck and its own tally says it never did: 8 compactions across
+130 kill cycles, 0 interrupted, on every box tried. Coverage that depends
+on a race landing in a millisecond window fails for the wrong reason on a
+fast machine and passes for the wrong reason on a slow one. So the states
+are constructed instead.
+
+| Scenario | Mode | Suite | Guarantee |
+|---|---|---|---|
+| Staging built, neither rename done | constructed | `api.rs` | the ORIGINAL database, staging discarded |
+| Between the two renames (live gone, retired present) | constructed | `api.rs` | the original put back, staging discarded |
+| After the second rename, retired not yet dropped | constructed | `api.rs` | the compacted copy, retired dropped |
+| After the retired copy was dropped | constructed | `api.rs` | the compacted copy, unchanged |
+| Live gone and staging already gone | constructed | `api.rs` | the original put back |
+| Every one of the above | constructed | `api.rs` | no stray directory survives, and the database is still WRITABLE afterwards — not merely readable |

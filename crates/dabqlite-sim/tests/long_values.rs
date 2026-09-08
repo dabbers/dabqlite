@@ -752,3 +752,42 @@ fn a_batch_of_long_values_is_bounded_by_the_commit_not_the_op_count() {
     assert_eq!(host.io_count, io_before);
     assert_eq!(host.get_bytes(0), None, "nothing may be written");
 }
+
+/// **A long value costs ONE commit's fsyncs, whatever its length.**
+///
+/// The job-queue sample asserts this by timing, which is the wrong
+/// instrument: wall-clock mixes the fsyncs with the row writes and with
+/// the index work, so the number moves whenever any of those move and
+/// nobody can tell which. Here it is counted instead, which is what the
+/// claim actually says.
+#[test]
+fn a_value_of_any_length_costs_the_same_two_fsyncs() {
+    let caps = Capacities {
+        rows: (MAX_COMMIT_ROWS as u64 * 2 + 16).max(CAPS.rows),
+    };
+    let mut baseline = None;
+    for slots in [1usize, 2, 8, 32, 64, MAX_VALUE_LEN / VALUE_LEN] {
+        let mut host = SimHost::new(caps, SimDisk::new(), None);
+        host.open();
+        let before = (host.n_fsyncs, host.n_writes);
+        let value = payload(slots as u64, slots * VALUE_LEN);
+        assert_eq!(put(&mut host, 1, value), Ok(slots as u64));
+        let fsyncs = host.n_fsyncs - before.0;
+        let writes = host.n_writes - before.1;
+
+        // Two: the rows, then the superblock that names them.
+        assert_eq!(fsyncs, 2, "{slots} slots cost {fsyncs} fsyncs");
+        match baseline {
+            None => baseline = Some(fsyncs),
+            Some(b) => assert_eq!(fsyncs, b, "{slots} slots changed the fsync count"),
+        }
+        // Writes DO scale with slots — one per row plus the superblock
+        // pair — and saying so is the other half of an honest claim. It
+        // is the fsyncs that are shared, not the I/O.
+        assert_eq!(
+            writes,
+            slots as u64 + 2,
+            "{slots} slots: one write per row plus the superblock pair"
+        );
+    }
+}

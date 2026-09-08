@@ -29,8 +29,8 @@
 
 use core::cmp::Ordering;
 
-use crate::layout::{decode_row, RowKind};
-use crate::{MAX_COMMIT_ROWS, ROW_SIZE, VALUE_LEN};
+use crate::layout::{verified, RowKind};
+use crate::{MAX_COMMIT_ROWS, ROW_SIZE};
 
 /// A value's bytes, one slot at a time, straight out of the arena.
 ///
@@ -60,30 +60,59 @@ impl<'a> RunReader<'a> {
         }
     }
 
-    /// The next slot's payload, or `None` at the end of the run.
-    fn next_slot(&mut self) -> Option<([u8; VALUE_LEN], usize)> {
+    /// The next slot's payload, BORROWED from the arena, or `None` at the
+    /// end of the run.
+    ///
+    /// Read through [`verified`] rather than `decode_row`: these rows are
+    /// verified by construction (see that module), and one comparison of
+    /// two long values walks hundreds of them. Copying and re-checksumming
+    /// each one made an index insert five times slower for values that
+    /// share a prefix — which is exactly the shape a key-at-the-front
+    /// record has.
+    fn next_slot(&mut self) -> Option<&'a [u8]> {
         if self.row >= self.row_count || self.steps as usize >= MAX_COMMIT_ROWS {
             return None;
         }
         let off = (self.row as usize) * ROW_SIZE;
-        let slot = decode_row(&self.arena[off..off + ROW_SIZE])?;
+        let row = self.arena.get(off..off + ROW_SIZE)?;
+        let kind = verified::kind(row)?;
         if self.started {
-            if slot.kind != RowKind::Chunk || slot.id != self.id {
+            if kind != RowKind::Chunk || verified::id(row) != self.id {
                 return None;
             }
         } else {
             // The head of a run is the record itself; a tombstone holds no
             // value at all and compares as empty.
-            if slot.kind == RowKind::Tombstone {
+            if kind == RowKind::Tombstone {
                 return None;
             }
-            self.id = slot.id;
+            self.id = verified::id(row);
             self.started = true;
         }
         self.row += 1;
         self.steps += 1;
-        Some((slot.value, slot.len as usize))
+        Some(verified::payload(row))
     }
+}
+
+/// [`order`], reporting how many row slots the comparison read.
+///
+/// The count is what makes the index's maintenance cost measurable
+/// without a clock: it is proportional to how much of a value is shared
+/// with its neighbours in the order, so a ratio between two workloads is
+/// the same number on every machine. See `Engine::value_cmp_slots`.
+pub fn order_counted(arena: &[u8], row_count: u64, a: u64, b: u64) -> (Ordering, u64) {
+    if a == b {
+        return (Ordering::Equal, 0);
+    }
+    let mut ra = RunReader::new(arena, row_count, a);
+    let mut rb = RunReader::new(arena, row_count, b);
+    let bytes = cmp_with(&mut ra, &mut rb);
+    let slots = (ra.steps + rb.steps) as u64;
+    let ord = bytes
+        .then_with(|| id_at(arena, a).cmp(&id_at(arena, b)))
+        .then(a.cmp(&b));
+    (ord, slots)
 }
 
 /// Compare the value stored at `a` against the value stored at `b`.
@@ -93,11 +122,16 @@ pub fn cmp_runs(arena: &[u8], row_count: u64, a: u64, b: u64) -> Ordering {
     }
     let mut ra = RunReader::new(arena, row_count, a);
     let mut rb = RunReader::new(arena, row_count, b);
-    let (mut ca, mut cb) = (([0u8; VALUE_LEN], 0usize), ([0u8; VALUE_LEN], 0usize));
+    cmp_with(&mut ra, &mut rb)
+}
+
+/// The byte comparison itself, over two readers already positioned.
+fn cmp_with<'a>(ra: &mut RunReader<'a>, rb: &mut RunReader<'a>) -> Ordering {
+    let (mut ca, mut cb): (&[u8], &[u8]) = (&[], &[]);
     let (mut ia, mut ib) = (0usize, 0usize);
     let (mut ea, mut eb) = (false, false);
     loop {
-        if ia == ca.1 && !ea {
+        if ia == ca.len() && !ea {
             match ra.next_slot() {
                 Some(c) => {
                     ca = c;
@@ -106,7 +140,7 @@ pub fn cmp_runs(arena: &[u8], row_count: u64, a: u64, b: u64) -> Ordering {
                 None => ea = true,
             }
         }
-        if ib == cb.1 && !eb {
+        if ib == cb.len() && !eb {
             match rb.next_slot() {
                 Some(c) => {
                     cb = c;
@@ -115,15 +149,15 @@ pub fn cmp_runs(arena: &[u8], row_count: u64, a: u64, b: u64) -> Ordering {
                 None => eb = true,
             }
         }
-        match (ia < ca.1, ib < cb.1) {
+        match (ia < ca.len(), ib < cb.len()) {
             // Both exhausted: equal bytes, equal length.
             (false, false) => return Ordering::Equal,
             // A prefix sorts before what extends it.
             (false, true) => return Ordering::Less,
             (true, false) => return Ordering::Greater,
             (true, true) => {
-                let n = (ca.1 - ia).min(cb.1 - ib);
-                match ca.0[ia..ia + n].cmp(&cb.0[ib..ib + n]) {
+                let n = (ca.len() - ia).min(cb.len() - ib);
+                match ca[ia..ia + n].cmp(&cb[ib..ib + n]) {
                     Ordering::Equal => {
                         ia += n;
                         ib += n;
@@ -140,7 +174,7 @@ pub fn cmp_run_bytes(arena: &[u8], row_count: u64, row: u64, needle: &[u8]) -> O
     let mut r = RunReader::new(arena, row_count, row);
     let mut at = 0usize;
     loop {
-        let Some((chunk, len)) = r.next_slot() else {
+        let Some(chunk) = r.next_slot() else {
             // The value ended. It is a prefix of the needle unless the
             // needle ended too.
             return if at < needle.len() {
@@ -149,6 +183,7 @@ pub fn cmp_run_bytes(arena: &[u8], row_count: u64, row: u64, needle: &[u8]) -> O
                 Ordering::Equal
             };
         };
+        let len = chunk.len();
         if len == 0 {
             continue;
         }
@@ -169,8 +204,8 @@ pub fn cmp_run_bytes(arena: &[u8], row_count: u64, row: u64, needle: &[u8]) -> O
 /// The id stored in a row, for the order's tie-break.
 fn id_at(arena: &[u8], row: u64) -> u64 {
     let off = (row as usize) * ROW_SIZE;
-    match arena.get(off..off + ROW_SIZE).and_then(decode_row) {
-        Some(slot) => slot.id,
+    match arena.get(off..off + ROW_SIZE) {
+        Some(row) => verified::id(row),
         None => 0,
     }
 }
@@ -202,6 +237,7 @@ pub fn order(arena: &[u8], row_count: u64, a: u64, b: u64) -> Ordering {
 mod tests {
     use super::*;
     use crate::layout::encode_row;
+    use crate::VALUE_LEN;
     use alloc::vec;
     use alloc::vec::Vec;
 
