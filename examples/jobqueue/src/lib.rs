@@ -33,12 +33,22 @@
 //!   enqueue watermark and the commit watermark. There is no separate
 //!   place to put metadata, so metadata is a row and the application has
 //!   to carve ids out of the user key space to hold it.
-//! * **Batch packing by SLOT COST.** [`MAX_COMMIT_ROWS`] is 128 *row slots*, not
-//!   128 operations, and a 2 KiB value eats all 128 by itself. So every
-//!   caller that builds a batch has to compute `len.div_ceil(VALUE_LEN)`
-//!   per operation and stop before the budget runs out — see
-//!   [`slot_cost`] and [`Queue::enqueue`]. The library does this
-//!   arithmetic privately in its own rebuild path and does not expose it.
+//! * **Batch packing by SLOT COST.** [`MAX_COMMIT_ROWS`] counts *row
+//!   slots*, not operations, and a 2 KiB value costs 128 of them. So
+//!   every caller that builds a batch has to compute
+//!   `len.div_ceil(VALUE_LEN)` per operation and stop before the budget
+//!   runs out — see [`slot_cost`] and [`Queue::enqueue`]. The library
+//!   does this arithmetic privately in its own rebuild path and does not
+//!   expose it.
+//!
+//!   The budget itself stopped being the problem. It was 128 slots, the
+//!   exact cost of one maximum-length value, so a full-size job could
+//!   never land in the same commit as the watermark that names it — an
+//!   ATOMICITY ceiling wearing a size ceiling's clothes, which this crate
+//!   worked around by holding a slot back. Format v6 widened the commit
+//!   span to two bytes: a commit is 1024 slots, a value is at most 128,
+//!   and the largest job leaves 896 slots for whatever has to land with
+//!   it.
 //!
 //! What is NOT hand-rolled any more, and used to be:
 //!

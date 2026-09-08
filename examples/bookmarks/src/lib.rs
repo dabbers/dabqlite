@@ -581,9 +581,12 @@ impl<S: Storage> Store<S> {
     /// Add a set of bookmarks as ONE commit — an import that either
     /// happens or does not.
     ///
-    /// Bounded by [`MAX_COMMIT_ROWS`] = 128 ROW SLOTS, and a typical bookmark is
-    /// nine of them, so about thirteen bookmarks plus the id counter. Past
-    /// that the library refuses with [`dabqlite::Error::BatchTooLong`],
+    /// Bounded by [`MAX_COMMIT_ROWS`] = 1024 ROW SLOTS, and a typical
+    /// bookmark is nine of them, so about a hundred bookmarks plus the id
+    /// counter. It was thirteen when a commit was 128 slots; format v6
+    /// widened the commit span to two bytes and this got the whole
+    /// difference. Past the budget the library refuses with
+    /// [`dabqlite::Error::BatchTooLong`],
     /// which says how many slots were needed and how many there are — the
     /// message that used to read "database is full at capacity 64".
     pub fn add_many(&mut self, items: &[NewBookmark]) -> Result<Vec<u64>, StoreError> {
