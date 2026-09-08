@@ -903,6 +903,11 @@ mod tests {
         let cost = t.range_probes() - start;
         assert_eq!(seen, 10, "the answer itself must be right first");
         assert!(
+            cost >= seen,
+            "a key cannot be returned without being compared: {cost} \
+             comparisons for {seen} keys means the counter is not counting"
+        );
+        assert!(
             cost < N / 4,
             "starting 10 keys from the end compared {cost} of {N} keys — the              descent is not routing, it is scanning and filtering"
         );
@@ -917,8 +922,23 @@ mod tests {
         let cost = t.range_probes() - start;
         assert_eq!(seen, 10);
         assert!(
+            cost >= seen,
+            "the descending walk returned {seen} keys after {cost} \
+             comparisons; the counter is not counting"
+        );
+        assert!(
             cost < N / 4,
             "a descending scan of the lowest 10 keys compared {cost} of {N}"
+        );
+
+        // Both directions, bounded exactly: a walk of everything downward
+        // compares every key once, the same way the ascending one does.
+        let start = t.range_probes();
+        t.for_each_down_from(N - 1, |_, _| true);
+        assert_eq!(
+            t.range_probes() - start,
+            N,
+            "a full descending scan compares every key exactly once"
         );
 
         // And the counter is a real measurement, not a constant: a scan of
